@@ -1,0 +1,9 @@
+[package]
+name = "ethornell-audio"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ethornell-core = { path = "../ethornell-core" }
+kira.workspace = true
+serde.workspace = true

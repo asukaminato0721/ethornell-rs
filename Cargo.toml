@@ -1,0 +1,38 @@
+[workspace]
+members = [
+  "crates/ethornell-core",
+  "crates/ethornell-archive",
+  "crates/ethornell-image",
+  "crates/ethornell-script",
+  "crates/ethornell-vm",
+  "crates/ethornell-render",
+  "crates/ethornell-audio",
+  "crates/ethornell-app",
+  "crates/ethornell-cli",
+  "crates/na_mpeg2_decoder",
+  "crates/na_wmv_player",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = ""
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+byteorder = "1"
+encoding_rs = "0.8"
+wgpu = "0.19"
+winit = { version = "0.29", features = ["rwh_05"] }
+kira = "0.8"
+pollster = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+bytemuck = { version = "1", features = ["derive"] }
+ab_glyph = "0.2"

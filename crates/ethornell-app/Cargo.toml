@@ -1,0 +1,17 @@
+[package]
+name = "ethornell-app"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ethornell-core = { path = "../ethornell-core" }
+ethornell-archive = { path = "../ethornell-archive" }
+ethornell-image = { path = "../ethornell-image" }
+ethornell-render = { path = "../ethornell-render" }
+ethornell-audio = { path = "../ethornell-audio" }
+ethornell-script = { path = "../ethornell-script" }
+ethornell-vm = { path = "../ethornell-vm" }
+ab_glyph.workspace = true
+pollster.workspace = true
+tracing.workspace = true
+winit.workspace = true

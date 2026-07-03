@@ -1,0 +1,274 @@
+use byteorder::{LittleEndian, ReadBytesExt};
+use ethornell_core::{EthornellError, Result};
+use serde::Serialize;
+use std::io::Cursor;
+use std::path::Path;
+
+mod cbg;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ImageFormat {
+    CompressedBg,
+    RawBgiImage,
+    Png,
+    Jpeg,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CbgMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub bpp: u32,
+    pub version: Option<u32>,
+    pub intermediate_length: Option<u32>,
+    pub encoded_length: Option<u32>,
+    pub key: Option<u32>,
+    pub checksum: Option<u32>,
+    pub xor_check: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageInfo {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bpp: Option<u32>,
+    pub format: ImageFormat,
+    pub cbg: Option<CbgMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+pub fn detect_image_format(buf: &[u8]) -> ImageFormat {
+    if buf.starts_with(b"CompressedBG___") {
+        ImageFormat::CompressedBg
+    } else if buf.starts_with(b"\x89PNG\r\n\x1a\n") {
+        ImageFormat::Png
+    } else if buf.starts_with(b"\xff\xd8\xff") {
+        ImageFormat::Jpeg
+    } else if looks_like_raw_bgi_image(buf) {
+        ImageFormat::RawBgiImage
+    } else {
+        ImageFormat::Unknown
+    }
+}
+
+pub fn decode_image(data: &[u8]) -> Result<DecodedImage> {
+    match detect_image_format(data) {
+        ImageFormat::CompressedBg => decode_cbg(data),
+        ImageFormat::RawBgiImage => decode_raw_bgi_image(data),
+        ImageFormat::Png | ImageFormat::Jpeg => decode_standard_image(data),
+        format => Err(EthornellError::UnsupportedFormat(format!(
+            "image decode unsupported for {format:?}"
+        ))),
+    }
+}
+
+pub fn decode_cbg(data: &[u8]) -> Result<DecodedImage> {
+    cbg::decode_cbg(data)
+}
+
+pub fn decode_cbg_to_png(data: &[u8], output: &Path) -> Result<()> {
+    let image = decode_cbg(data)?;
+    write_rgba_png(&image, output)
+}
+
+pub fn write_rgba_png(image: &DecodedImage, output: &Path) -> Result<()> {
+    if image.rgba.len() != image.width as usize * image.height as usize * 4 {
+        return Err(EthornellError::Parse(format!(
+            "RGBA buffer length mismatch: {} != {}x{}x4",
+            image.rgba.len(),
+            image.width,
+            image.height
+        )));
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    image::save_buffer_with_format(
+        output,
+        &image.rgba,
+        image.width,
+        image.height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|err| EthornellError::Other(format!("write PNG {}: {err}", output.display())))
+}
+
+fn decode_standard_image(data: &[u8]) -> Result<DecodedImage> {
+    let image = image::load_from_memory(data)
+        .map_err(|err| EthornellError::UnsupportedFormat(format!("standard image decode: {err}")))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok(DecodedImage {
+        width,
+        height,
+        rgba: image.into_raw(),
+    })
+}
+
+fn looks_like_raw_bgi_image(buf: &[u8]) -> bool {
+    if buf.len() < 16 {
+        return false;
+    }
+    let mut cursor = Cursor::new(buf);
+    let Ok(width) = cursor.read_u16::<LittleEndian>() else {
+        return false;
+    };
+    let Ok(height) = cursor.read_u16::<LittleEndian>() else {
+        return false;
+    };
+    let Ok(bpp) = cursor.read_u32::<LittleEndian>() else {
+        return false;
+    };
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return false;
+    }
+    let pixel_bytes = match bpp {
+        24 => 3usize,
+        32 => 4usize,
+        _ => return false,
+    };
+    let expected = 16usize.saturating_add(width as usize * height as usize * pixel_bytes);
+    expected == buf.len()
+}
+
+fn decode_raw_bgi_image(data: &[u8]) -> Result<DecodedImage> {
+    let mut cursor = Cursor::new(data);
+    let width = cursor.read_u16::<LittleEndian>()? as u32;
+    let height = cursor.read_u16::<LittleEndian>()? as u32;
+    let bpp = cursor.read_u32::<LittleEndian>()?;
+    if !matches!(bpp, 24 | 32) {
+        return Err(EthornellError::UnsupportedFormat(format!(
+            "raw BGI image bpp {bpp} is not implemented"
+        )));
+    }
+    let pixel_bytes = (bpp / 8) as usize;
+    let pixels = &data[16..];
+    let expected = width as usize * height as usize * pixel_bytes;
+    if pixels.len() != expected {
+        return Err(EthornellError::Parse(format!(
+            "raw BGI image size mismatch: got {}, expected {expected}",
+            pixels.len()
+        )));
+    }
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for pixel in pixels.chunks_exact(pixel_bytes) {
+        let b = pixel[0];
+        let g = pixel[1];
+        let r = pixel[2];
+        let a = if pixel_bytes == 4 { pixel[3] } else { 0xff };
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+    Ok(DecodedImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+pub fn probe_image(buf: &[u8]) -> Result<ImageInfo> {
+    let format = detect_image_format(buf);
+    if format == ImageFormat::CompressedBg {
+        let cbg = parse_cbg_metadata(buf)?;
+        Ok(ImageInfo {
+            width: Some(cbg.width),
+            height: Some(cbg.height),
+            bpp: Some(cbg.bpp),
+            format,
+            cbg: Some(cbg),
+        })
+    } else if format == ImageFormat::RawBgiImage {
+        let mut cursor = Cursor::new(buf);
+        Ok(ImageInfo {
+            width: Some(cursor.read_u16::<LittleEndian>()? as u32),
+            height: Some(cursor.read_u16::<LittleEndian>()? as u32),
+            bpp: Some(cursor.read_u32::<LittleEndian>()?),
+            format,
+            cbg: None,
+        })
+    } else {
+        Ok(ImageInfo {
+            width: None,
+            height: None,
+            bpp: None,
+            format,
+            cbg: None,
+        })
+    }
+}
+
+pub fn parse_cbg_metadata(buf: &[u8]) -> Result<CbgMetadata> {
+    if !buf.starts_with(b"CompressedBG___") {
+        return Err(EthornellError::UnsupportedFormat(
+            "missing CompressedBG___ header".into(),
+        ));
+    }
+    if buf.len() < 0x30 {
+        return Err(EthornellError::Parse(
+            "truncated CompressedBG header".into(),
+        ));
+    }
+
+    let mut cursor = Cursor::new(&buf[0x10..0x30]);
+    let width = cursor.read_u16::<LittleEndian>()? as u32;
+    let height = cursor.read_u16::<LittleEndian>()? as u32;
+    let bpp = cursor.read_u32::<LittleEndian>()?;
+    let _unk = cursor.read_u64::<LittleEndian>()?;
+    let intermediate_length = cursor.read_u32::<LittleEndian>()?;
+    let key = cursor.read_u32::<LittleEndian>()?;
+    let encoded_length = cursor.read_u32::<LittleEndian>()?;
+    let checksum = cursor.read_u8()? as u32;
+    let xor_check = cursor.read_u8()? as u32;
+    let version = cursor.read_u16::<LittleEndian>()? as u32;
+
+    Ok(CbgMetadata {
+        width,
+        height,
+        bpp,
+        version: Some(version),
+        intermediate_length: Some(intermediate_length),
+        encoded_length: Some(encoded_length),
+        key: Some(key),
+        checksum: Some(checksum),
+        xor_check: Some(xor_check),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_unknown_image() {
+        assert_eq!(detect_image_format(b"hello"), ImageFormat::Unknown);
+    }
+
+    #[test]
+    fn parses_cbg_metadata() {
+        let mut data = vec![0u8; 0x30];
+        data[..16].copy_from_slice(b"CompressedBG___\0");
+        data[0x10..0x12].copy_from_slice(&640u16.to_le_bytes());
+        data[0x12..0x14].copy_from_slice(&480u16.to_le_bytes());
+        data[0x14..0x18].copy_from_slice(&32u32.to_le_bytes());
+        data[0x20..0x24].copy_from_slice(&123u32.to_le_bytes());
+        data[0x24..0x28].copy_from_slice(&0x4567u32.to_le_bytes());
+        data[0x28..0x2c].copy_from_slice(&456u32.to_le_bytes());
+        data[0x2c] = 7;
+        data[0x2d] = 9;
+        data[0x2e..0x30].copy_from_slice(&2u16.to_le_bytes());
+
+        let meta = parse_cbg_metadata(&data).unwrap();
+        assert_eq!(meta.width, 640);
+        assert_eq!(meta.height, 480);
+        assert_eq!(meta.bpp, 32);
+        assert_eq!(meta.version, Some(2));
+        assert_eq!(meta.encoded_length, Some(456));
+    }
+}

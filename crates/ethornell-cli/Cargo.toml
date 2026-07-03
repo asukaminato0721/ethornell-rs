@@ -1,0 +1,21 @@
+[package]
+name = "ethornell-cli"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "ethornell"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ethornell-core = { path = "../ethornell-core" }
+ethornell-archive = { path = "../ethornell-archive" }
+ethornell-image = { path = "../ethornell-image" }
+ethornell-script = { path = "../ethornell-script" }
+ethornell-vm = { path = "../ethornell-vm" }
+ethornell-audio = { path = "../ethornell-audio" }
+ethornell-app = { path = "../ethornell-app" }

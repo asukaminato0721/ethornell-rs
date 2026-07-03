@@ -1,0 +1,10 @@
+[package]
+name = "ethornell-script"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ethornell-core = { path = "../ethornell-core" }
+serde.workspace = true
+byteorder.workspace = true
+encoding_rs.workspace = true
