@@ -1,5 +1,7 @@
-use ethornell_script::bcs::{parse_bcs, BcsCommand, BcsValue};
-use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
+use ethornell_script::bcs::BcsSymbol;
+use ethornell_script::bcs::{parse_bcs, BcsCommand, BcsProgram, BcsValue};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ScenarioAction {
@@ -40,33 +42,123 @@ pub(crate) enum ScenarioAction {
     ClearSprite,
     LoadScript {
         file: String,
+        symbol: Option<String>,
+        transfer: ScriptTransfer,
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptTransfer {
+    Call,
+    Jump,
+}
+
+#[derive(Debug)]
 pub(crate) struct ScenarioPlayback {
-    actions: VecDeque<ScenarioAction>,
+    program: BcsProgram,
+    address_to_pc: HashMap<u32, usize>,
+    pc: usize,
+    operand_stack: Vec<BcsValue>,
+    memory: BcsMemory,
+    globals: BTreeMap<i32, BcsValue>,
+    call_stack: Vec<usize>,
+    pending_arg_count: Option<usize>,
+    resolved_symbol: Option<ResolvedSymbol>,
+    decoder: ScenarioActionBuilder,
     wait_frames: u32,
     waiting_for_input: bool,
+    completed: bool,
+    wait_return_ready: bool,
+    awaiting_external_script: Option<PendingExternalScript>,
+    external_call_stack: Vec<ExternalBcsFrame>,
+}
+
+#[derive(Debug)]
+struct ExternalBcsFrame {
+    program: BcsProgram,
+    address_to_pc: HashMap<u32, usize>,
+    pc: usize,
+    operand_stack: Vec<BcsValue>,
+    memory: BcsMemory,
+    call_stack: Vec<usize>,
+    pending_arg_count: Option<usize>,
+    resolved_symbol: Option<ResolvedSymbol>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingExternalScript {
+    symbol: Option<String>,
+    transfer: ScriptTransfer,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedSymbol {
+    Local(u32),
+    External {
+        file: String,
+        symbol: Option<String>,
+    },
+}
+
+/// The BURIKO core VM stores locals in an addressable frame, not in a map of
+/// compiler variable offsets. Keeping the frame explicit lets the same opcode
+/// path serve library scripts and scenario scripts.
+#[derive(Debug, Default)]
+struct BcsMemory {
+    pointer: i32,
+    values: BTreeMap<i32, BcsValue>,
+}
+
+impl BcsMemory {
+    fn read(&self, address: i32) -> BcsValue {
+        self.values
+            .get(&address)
+            .cloned()
+            .unwrap_or(BcsValue::Int(0))
+    }
+
+    fn write(&mut self, address: i32, value: BcsValue) {
+        self.values.insert(address, value);
+    }
 }
 
 impl ScenarioPlayback {
     pub(crate) fn from_bcs(bytes: &[u8]) -> Option<Self> {
-        let program = parse_bcs(bytes)?;
-        let mut builder = ScenarioActionBuilder::default();
-        for command in &program.commands {
-            builder.observe(command);
+        Self::from_program(parse_bcs(bytes)?)
+    }
+
+    fn from_program(program: BcsProgram) -> Option<Self> {
+        if program.commands.is_empty() {
+            return None;
         }
-        let actions = builder.actions.into();
+        let address_to_pc = program
+            .commands
+            .iter()
+            .enumerate()
+            .map(|(pc, command)| (command.addr, pc))
+            .collect();
         Some(Self {
-            actions,
+            program,
+            address_to_pc,
+            pc: 0,
+            operand_stack: Vec::new(),
+            memory: BcsMemory::default(),
+            globals: BTreeMap::new(),
+            call_stack: Vec::new(),
+            pending_arg_count: None,
+            resolved_symbol: None,
+            decoder: ScenarioActionBuilder::default(),
             wait_frames: 0,
             waiting_for_input: false,
+            completed: false,
+            wait_return_ready: false,
+            awaiting_external_script: None,
+            external_call_stack: Vec::new(),
         })
     }
 
-    pub(crate) fn action_count(&self) -> usize {
-        self.actions.len()
+    pub(crate) fn instruction_count(&self) -> usize {
+        self.program.commands.len()
     }
 
     pub(crate) fn is_waiting_for_input(&self) -> bool {
@@ -74,25 +166,65 @@ impl ScenarioPlayback {
     }
 
     pub(crate) fn append_bcs(&mut self, bytes: &[u8]) -> Option<usize> {
-        let program = parse_bcs(bytes)?;
-        let mut builder = ScenarioActionBuilder::default();
-        for command in &program.commands {
-            builder.observe(command);
+        self.append_program(parse_bcs(bytes)?)
+    }
+
+    fn append_program(&mut self, program: BcsProgram) -> Option<usize> {
+        let command_count = program.commands.len();
+        let pending = self.awaiting_external_script.take()?;
+        let mut next = Self::from_program(program)?;
+        if let Some(symbol) = pending.symbol.as_deref() {
+            let address = next
+                .program
+                .symbols
+                .iter()
+                .find(|candidate| candidate.name == symbol)
+                .map(|candidate| candidate.addr)?;
+            next.pc = next.address_to_pc.get(&address).copied()?;
         }
-        let added = builder.actions.len();
-        self.actions.extend(builder.actions);
-        Some(added)
+        if pending.transfer == ScriptTransfer::Call {
+            self.external_call_stack.push(ExternalBcsFrame {
+                program: std::mem::replace(&mut self.program, next.program),
+                address_to_pc: std::mem::replace(&mut self.address_to_pc, next.address_to_pc),
+                pc: std::mem::replace(&mut self.pc, next.pc),
+                operand_stack: std::mem::take(&mut self.operand_stack),
+                memory: std::mem::take(&mut self.memory),
+                call_stack: std::mem::take(&mut self.call_stack),
+                pending_arg_count: self.pending_arg_count.take(),
+                resolved_symbol: self.resolved_symbol.take(),
+            });
+        } else {
+            self.program = next.program;
+            self.address_to_pc = next.address_to_pc;
+            self.pc = next.pc;
+            self.operand_stack.clear();
+            self.memory = BcsMemory::default();
+            self.call_stack.clear();
+            self.pending_arg_count = None;
+            self.resolved_symbol = None;
+        }
+        self.operand_stack = next.operand_stack;
+        self.memory = next.memory;
+        self.call_stack = next.call_stack;
+        self.pending_arg_count = next.pending_arg_count;
+        self.completed = false;
+        Some(command_count)
+    }
+
+    pub(crate) fn cancel_external_script(&mut self) {
+        self.awaiting_external_script = None;
     }
 
     pub(crate) fn tick(&mut self, input_advance: bool) -> (Option<ScenarioAction>, bool) {
         let mut input_consumed = false;
 
-        loop {
+        for _ in 0..2_048 {
             if self.waiting_for_input {
                 if !input_advance {
                     return (None, input_consumed);
                 }
                 self.waiting_for_input = false;
+                self.wait_return_ready = true;
                 input_consumed = true;
             }
 
@@ -101,25 +233,460 @@ impl ScenarioPlayback {
                 return (None, input_consumed);
             }
 
-            let Some(action) = self.actions.pop_front() else {
+            if self.completed {
+                return (None, input_consumed);
+            }
+
+            if !self.decoder.actions.is_empty() {
+                let action = self.decoder.actions.remove(0);
+                match action {
+                    ScenarioAction::Wait { frames } => {
+                        self.wait_frames = frames;
+                        return (None, input_consumed);
+                    }
+                    ScenarioAction::WaitForInput => {
+                        if input_advance {
+                            input_consumed = true;
+                            continue;
+                        }
+                        self.waiting_for_input = true;
+                        return (None, input_consumed);
+                    }
+                    action => return (Some(action), input_consumed),
+                }
+            }
+
+            let Some(command) = self.program.commands.get(self.pc).cloned() else {
+                self.completed = true;
                 return (None, input_consumed);
             };
-            match action {
-                ScenarioAction::Wait { frames } => {
-                    self.wait_frames = frames;
-                    return (None, input_consumed);
-                }
-                ScenarioAction::WaitForInput => {
-                    if input_advance {
-                        input_consumed = true;
-                        continue;
-                    }
-                    self.waiting_for_input = true;
-                    return (None, input_consumed);
-                }
-                action => return (Some(action), input_consumed),
-            }
+            self.pc += 1;
+            self.trace_command(&command);
+            self.execute_command(&command);
         }
+
+        tracing::warn!(
+            pc = self.pc,
+            "BCS VM instruction budget exhausted for one frame"
+        );
+        (None, input_consumed)
+    }
+
+    fn execute_command(&mut self, command: &BcsCommand) {
+        match command.name {
+            Some("push_dword" | "push_string") => {
+                self.operand_stack.extend(command.args.iter().cloned());
+            }
+            Some("push_offset") => {
+                let resolved = self.resolved_symbol.take();
+                self.operand_stack
+                    .extend(
+                        command
+                            .args
+                            .iter()
+                            .cloned()
+                            .map(|value| match (&resolved, value) {
+                                (Some(ResolvedSymbol::Local(base)), BcsValue::Addr(offset)) => {
+                                    BcsValue::Addr(base.wrapping_add(offset as u32) as i32)
+                                }
+                                (_, value) => value,
+                            }),
+                    );
+            }
+            Some("push_base_offset") => {
+                self.operand_stack
+                    .extend(command.args.iter().map(|value| match value {
+                        BcsValue::BaseOffset(offset) => {
+                            BcsValue::MemoryAddr(self.memory.pointer.wrapping_sub(*offset))
+                        }
+                        value => value.clone(),
+                    }));
+            }
+            Some("nargs") => {
+                self.pending_arg_count = command
+                    .args
+                    .iter()
+                    .filter_map(value_i32)
+                    .last()
+                    .and_then(|value| usize::try_from(value).ok());
+            }
+            Some("jmp") => self.jump_to_stack_address(),
+            Some("jc") => {
+                let target = command
+                    .args
+                    .iter()
+                    .rev()
+                    .find_map(value_i32)
+                    .unwrap_or_else(|| self.pop_address());
+                let condition = self.pop_i32();
+                if condition != 0 {
+                    self.jump_to(target);
+                }
+            }
+            Some("call") => {
+                let target = self.pop_address();
+                self.call_stack.push(self.pc);
+                self.jump_to(target);
+            }
+            Some("ret") => {
+                if let Some(return_pc) = self.call_stack.pop() {
+                    self.pc = return_pc;
+                } else if let Some(frame) = self.external_call_stack.pop() {
+                    self.program = frame.program;
+                    self.address_to_pc = frame.address_to_pc;
+                    self.pc = frame.pc;
+                    self.operand_stack = frame.operand_stack;
+                    self.memory = frame.memory;
+                    self.call_stack = frame.call_stack;
+                    self.pending_arg_count = frame.pending_arg_count;
+                    self.resolved_symbol = frame.resolved_symbol;
+                } else {
+                    self.completed = true;
+                }
+            }
+            Some("get_stack_pointer" | "load_base") => self
+                .operand_stack
+                .push(BcsValue::MemoryAddr(self.memory.pointer)),
+            Some("set_stack_pointer" | "store_base") => {
+                self.memory.pointer = self.pop_i32();
+            }
+            Some("write_mem_copy" | "move") => {
+                let value = self.operand_stack.pop().unwrap_or(BcsValue::Int(0));
+                let address = self.pop_memory_address();
+                self.memory.write(address, value.clone());
+                self.operand_stack.push(value);
+            }
+            Some("write_mem" | "move_arg") => {
+                let address = self.pop_memory_address();
+                let value = self.operand_stack.pop().unwrap_or(BcsValue::Int(0));
+                self.memory.write(address, value);
+            }
+            Some("read_mem" | "load") => {
+                let address = self.pop_memory_address();
+                self.operand_stack.push(self.memory.read(address));
+            }
+            Some("global_set") => {
+                let mut args = self.take_pending_args();
+                let (index, value) = if args.len() >= 2 {
+                    let value = args.pop().unwrap_or(BcsValue::Int(0));
+                    let index = args.pop().and_then(|value| value_i32(&value)).unwrap_or(0);
+                    (index, value)
+                } else {
+                    let value = self.operand_stack.pop().unwrap_or(BcsValue::Int(0));
+                    (self.pop_i32(), value)
+                };
+                self.globals.insert(index, value);
+            }
+            Some("global_get") => {
+                let args = self.take_pending_args();
+                let index = args
+                    .last()
+                    .and_then(value_i32)
+                    .unwrap_or_else(|| self.pop_i32());
+                self.operand_stack.push(
+                    self.globals
+                        .get(&index)
+                        .cloned()
+                        .unwrap_or(BcsValue::Int(0)),
+                );
+            }
+            Some(
+                "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shl" | "shr"
+                | "sar",
+            ) => {
+                self.execute_binary_operator(command.name.unwrap_or_default());
+            }
+            Some("not" | "bool_zero") => {
+                let value = self.pop_i32();
+                let value = if command.name == Some("not") {
+                    !value
+                } else {
+                    i32::from(value == 0)
+                };
+                self.operand_stack.push(BcsValue::Int(value));
+            }
+            Some("ternary") => {
+                let false_value = self.operand_stack.pop().unwrap_or(BcsValue::Int(0));
+                let true_value = self.operand_stack.pop().unwrap_or(BcsValue::Int(0));
+                let condition = self.pop_i32();
+                self.operand_stack.push(if condition != 0 {
+                    true_value
+                } else {
+                    false_value
+                });
+            }
+            Some("sin" | "cos") => {
+                let angle = self.pop_i32() as f64 / 65_536.0;
+                let value = if command.name == Some("sin") {
+                    angle.sin()
+                } else {
+                    angle.cos()
+                };
+                self.operand_stack
+                    .push(BcsValue::Int((value * 65_536.0) as i32));
+            }
+            Some("eq" | "neq" | "leq" | "geq" | "lt" | "gt" | "bool_and" | "bool_or") => {
+                self.execute_comparison(command.name.unwrap_or_default());
+            }
+            Some("source_line" | "cmd0xe3" | "cmd0xe2" | "end_if") => {
+                let _ = self.take_pending_args();
+            }
+            Some("check_translator_note") => {
+                let _ = self.take_pending_args();
+                self.operand_stack.push(BcsValue::Int(0));
+            }
+            Some("reg_exception_handler") => {
+                let _ = self.pop_address();
+            }
+            Some("unreg_exception_handler") => {}
+            Some("resolve_symbol") => self.resolve_symbol(),
+            // Reverse trace in main shows 0xE5 feeds `eq 0` before `_WaitReturnValued`.
+            // Treat it as the most recent wait result until the native ABI is fully recovered.
+            _ if command.opcode == 0x0e5 => {
+                let _ = self.take_pending_args();
+                self.operand_stack
+                    .push(BcsValue::Int(i32::from(std::mem::take(
+                        &mut self.wait_return_ready,
+                    ))));
+            }
+            _ => self.invoke_engine_command(command),
+        }
+    }
+
+    fn trace_command(&self, command: &BcsCommand) {
+        if std::env::var_os("DEBUG").is_none() {
+            return;
+        }
+        tracing::info!(
+            target: "bcs_vm",
+            pc = self.pc.saturating_sub(1),
+            addr = format_args!("0x{:08X}", command.addr),
+            opcode = format_args!("0x{:03X}", command.opcode),
+            name = command.name.unwrap_or("unknown"),
+            stack_depth = self.operand_stack.len(),
+            local_count = self.memory.values.len(),
+            call_depth = self.call_stack.len(),
+            external_call_depth = self.external_call_stack.len(),
+            "BCS VM execute"
+        );
+    }
+
+    fn invoke_engine_command(&mut self, command: &BcsCommand) {
+        if matches!(command.opcode, 0x0f0 | 0x0f3) {
+            self.invoke_external_script(command.opcode);
+            return;
+        }
+        let args = if command.opcode == 0x1c {
+            self.take_script_call_context()
+        } else {
+            self.take_pending_args()
+        };
+        self.decoder.observe_invocation(command, &args);
+        if self
+            .decoder
+            .actions
+            .iter()
+            .any(|action| matches!(action, ScenarioAction::LoadScript { .. }))
+        {
+            // Script transfer opcodes are handled above; legacy observations
+            // remain action-only and must not create an incomplete request.
+        }
+    }
+
+    fn resolve_symbol(&mut self) {
+        let Some(symbol_value) = self.operand_stack.pop() else {
+            return;
+        };
+        let external_file = self.operand_stack.last().and_then(|value| match value {
+            BcsValue::Str(file) if looks_like_script_name(file) => Some(file.clone()),
+            _ => None,
+        });
+        if let Some(file) = external_file {
+            self.operand_stack.pop();
+            let symbol = match symbol_value {
+                BcsValue::Str(symbol) => Some(symbol),
+                BcsValue::Int(0) | BcsValue::Addr(0) => None,
+                _ => None,
+            };
+            self.resolved_symbol = Some(ResolvedSymbol::External { file, symbol });
+            return;
+        }
+
+        let BcsValue::Str(symbol) = symbol_value else {
+            self.resolved_symbol = None;
+            return;
+        };
+        self.resolved_symbol = self
+            .program
+            .symbols
+            .iter()
+            .find(|candidate| candidate.name == symbol)
+            .map(|candidate| ResolvedSymbol::Local(candidate.addr));
+        if self.resolved_symbol.is_none() {
+            tracing::warn!(symbol, "BCS local symbol missing from resolver table");
+        }
+    }
+
+    fn invoke_external_script(&mut self, opcode: u32) {
+        let target = match self.resolved_symbol.take() {
+            Some(ResolvedSymbol::External { file, symbol }) => Some((file, symbol)),
+            _ => {
+                let args = self.take_script_jump_context();
+                let file = strings(&args)
+                    .into_iter()
+                    .find(|text| looks_like_script_name(text))
+                    .map(str::to_string);
+                file.map(|file| (file, None))
+            }
+        };
+        let Some((file, symbol)) = target else {
+            tracing::warn!(
+                opcode = format_args!("0x{opcode:03X}"),
+                "BCS script transfer target missing"
+            );
+            return;
+        };
+        // Both external-script forms preserve the caller. `main` provides the
+        // minimal proof for F3: its entry executes `F3 MakerLogo` and the very
+        // next instruction is `ret`, which returns control to title._bp.
+        let transfer = ScriptTransfer::Call;
+        self.awaiting_external_script = Some(PendingExternalScript {
+            symbol: symbol.clone(),
+            transfer,
+        });
+        self.decoder.actions.push(ScenarioAction::LoadScript {
+            file,
+            symbol,
+            transfer,
+        });
+    }
+
+    fn take_pending_args(&mut self) -> Vec<BcsValue> {
+        let Some(count) = self.pending_arg_count.take() else {
+            return Vec::new();
+        };
+        let split = self.operand_stack.len().saturating_sub(count);
+        self.operand_stack.split_off(split)
+    }
+
+    fn take_script_call_context(&mut self) -> Vec<BcsValue> {
+        let Some(function_index) = self
+            .operand_stack
+            .iter()
+            .rposition(|value| matches!(value, BcsValue::Str(text) if text.starts_with('_')))
+        else {
+            return Vec::new();
+        };
+        let start = self
+            .operand_stack
+            .iter()
+            .take(function_index)
+            .rposition(|value| matches!(value, BcsValue::Str(text) if text.ends_with(".txt")))
+            .map(|index| (index + 2).min(function_index))
+            .unwrap_or_else(|| function_index.saturating_sub(40));
+        self.operand_stack.split_off(start)
+    }
+
+    fn take_script_jump_context(&mut self) -> Vec<BcsValue> {
+        if self.pending_arg_count.is_some() {
+            return self.take_pending_args();
+        }
+        let Some(script_index) = self.operand_stack.iter().rposition(
+            |value| matches!(value, BcsValue::Str(text) if looks_like_script_name(text)),
+        ) else {
+            return Vec::new();
+        };
+        if self.operand_stack.len().saturating_sub(script_index) > 4 {
+            return Vec::new();
+        }
+        self.operand_stack.split_off(script_index)
+    }
+
+    fn jump_to_stack_address(&mut self) {
+        let address = self.pop_address();
+        self.jump_to(address);
+    }
+
+    fn jump_to(&mut self, address: i32) {
+        let address = address as u32;
+        if let Some(pc) = self.address_to_pc.get(&address).copied() {
+            self.pc = pc;
+        } else {
+            tracing::warn!(
+                address = format_args!("0x{address:08X}"),
+                "BCS VM jump target missing"
+            );
+            self.completed = true;
+        }
+    }
+
+    fn pop_address(&mut self) -> i32 {
+        self.operand_stack
+            .pop()
+            .and_then(|value| value_i32(&value))
+            .unwrap_or_default()
+    }
+
+    fn pop_i32(&mut self) -> i32 {
+        self.pop_address()
+    }
+
+    fn pop_memory_address(&mut self) -> i32 {
+        match self.operand_stack.pop() {
+            Some(BcsValue::MemoryAddr(address)) => address,
+            Some(BcsValue::BaseOffset(offset)) => self.memory.pointer.wrapping_sub(offset),
+            Some(value) => value_i32(&value).unwrap_or_default(),
+            None => 0,
+        }
+    }
+
+    fn execute_binary_operator(&mut self, operator: &str) {
+        let right = self.pop_i32();
+        let left = self.pop_i32();
+        let value = match operator {
+            "add" => left.wrapping_add(right),
+            "sub" => left.wrapping_sub(right),
+            "mul" => left.wrapping_mul(right),
+            "div" => {
+                if right == 0 {
+                    0
+                } else {
+                    left.wrapping_div(right)
+                }
+            }
+            "mod" => {
+                if right == 0 {
+                    0
+                } else {
+                    left.wrapping_rem(right)
+                }
+            }
+            "and" => left & right,
+            "or" => left | right,
+            "xor" => left ^ right,
+            "shl" => left.wrapping_shl(right as u32),
+            "shr" => ((left as u32) >> (right as u32)) as i32,
+            "sar" => left >> (right as u32),
+            _ => 0,
+        };
+        self.operand_stack.push(BcsValue::Int(value));
+    }
+
+    fn execute_comparison(&mut self, operator: &str) {
+        let right = self.pop_i32();
+        let left = self.pop_i32();
+        let value = match operator {
+            "eq" => left == right,
+            "neq" => left != right,
+            "leq" => left <= right,
+            "geq" => left >= right,
+            "lt" => left < right,
+            "gt" => left > right,
+            "bool_and" => left != 0 && right != 0,
+            "bool_or" => left != 0 || right != 0,
+            _ => false,
+        };
+        self.operand_stack.push(BcsValue::Int(i32::from(value)));
     }
 }
 
@@ -128,59 +695,31 @@ struct ScenarioActionBuilder {
     actions: Vec<ScenarioAction>,
     scheduled_actions: Vec<ScenarioAction>,
     characters: BTreeMap<i32, CharacterState>,
-    stack: Vec<BcsValue>,
-    pending_arg_count: Option<usize>,
 }
 
 impl ScenarioActionBuilder {
-    fn observe(&mut self, command: &BcsCommand) {
-        if is_push_command(command) {
-            self.stack.extend(command.args.iter().cloned());
-            return;
-        }
-        if matches!(command.name, Some("nargs")) {
-            self.pending_arg_count = command
-                .args
-                .iter()
-                .filter_map(value_i32)
-                .last()
-                .and_then(|value| usize::try_from(value).ok());
-            return;
-        }
-
-        if self.observe_stack_operator(command) {
-            return;
-        }
-
+    fn observe_invocation(&mut self, command: &BcsCommand, args: &[BcsValue]) {
         if command.opcode == 0x1c {
-            let context = self.take_script_call_context();
-            self.observe_script_call(&context);
+            self.observe_script_call(args);
         } else if matches!(
             command.name,
             Some("sprite" | "bg" | "bg_transition" | "bg240")
         ) {
-            let args = self.take_pending_args();
-            self.observe_visual_command(&args);
-        } else if matches!(command.name, Some("sprite_hide")) {
-            let args = self.take_pending_args();
-            self.observe_sprite_hide(&args);
+            self.observe_visual_command(args);
+        } else if matches!(command.name, Some("sprite_hide" | "sprite_hide_all")) {
+            self.observe_sprite_hide(args);
         } else if matches!(command.name, Some("wait")) {
-            let args = self.take_pending_args();
-            self.observe_wait(&args);
+            self.observe_wait(args);
+        } else if command.name == Some("cmd0x120") {
+            if ints(args).last().copied().unwrap_or_default() != 0 {
+                self.actions.push(ScenarioAction::Wait { frames: 0 });
+            }
         } else if matches!(command.name, Some("say" | "msg")) {
-            let args = self.take_message_args(command);
-            self.observe_message(&args);
+            self.observe_message(args);
         } else if matches!(command.name, Some("sound" | "sound_1a0" | "snd")) {
-            let args = self.take_pending_args();
-            self.observe_sound_command(command, &args);
-        } else if matches!(command.name, Some("exec_script")) {
-            let args = self.take_pending_args();
-            self.observe_script_jump(&args);
-        } else if command.opcode == 0xf3 {
-            let args = self.take_script_jump_context();
-            self.observe_script_jump(&args);
-        } else if should_consume_pending_args(command) {
-            let _ = self.take_pending_args();
+            self.observe_sound_command(command, args);
+        } else if matches!(command.name, Some("exec_script")) || command.opcode == 0xf3 {
+            self.observe_script_jump(args);
         }
     }
 
@@ -415,10 +954,6 @@ impl ScenarioActionBuilder {
         }
     }
 
-    fn push_sprite(&mut self, file: String, frames: u32) {
-        self.push_sprite_with_hints(file, frames, VisualHints::default());
-    }
-
     fn push_sprite_with_hints(&mut self, file: String, frames: u32, hints: VisualHints) {
         self.actions.push(ScenarioAction::Sprite {
             file,
@@ -467,6 +1002,8 @@ impl ScenarioActionBuilder {
         };
         self.actions.push(ScenarioAction::LoadScript {
             file: file.to_string(),
+            symbol: None,
+            transfer: ScriptTransfer::Jump,
         });
     }
 
@@ -505,105 +1042,6 @@ impl ScenarioActionBuilder {
             body_layer: character_body_layer_for_pose(pose),
         })
     }
-
-    fn take_pending_args(&mut self) -> Vec<BcsValue> {
-        let Some(count) = self.pending_arg_count.take() else {
-            return Vec::new();
-        };
-        let split = self.stack.len().saturating_sub(count);
-        self.stack.split_off(split)
-    }
-
-    fn take_message_args(&mut self, command: &BcsCommand) -> Vec<BcsValue> {
-        if self.pending_arg_count.is_some() {
-            return self.take_pending_args();
-        }
-        let fallback_count = match command.name {
-            Some("say") => 5,
-            Some("msg") => 0,
-            _ => 0,
-        };
-        if fallback_count == 0 || self.stack.len() < fallback_count {
-            return Vec::new();
-        }
-        let split = self.stack.len() - fallback_count;
-        self.stack.split_off(split)
-    }
-
-    fn take_script_call_context(&mut self) -> Vec<BcsValue> {
-        let Some(function_index) = self
-            .stack
-            .iter()
-            .rposition(|value| matches!(value, BcsValue::Str(text) if text.starts_with('_')))
-        else {
-            return Vec::new();
-        };
-        let start = self
-            .stack
-            .iter()
-            .take(function_index)
-            .rposition(|value| matches!(value, BcsValue::Str(text) if text.ends_with(".txt")))
-            .map(|index| {
-                let after_source_line = index.saturating_add(2);
-                after_source_line.min(function_index)
-            })
-            .unwrap_or_else(|| function_index.saturating_sub(40));
-        self.stack.split_off(start)
-    }
-
-    fn take_script_jump_context(&mut self) -> Vec<BcsValue> {
-        if self.pending_arg_count.is_some() {
-            return self.take_pending_args();
-        }
-        let Some(script_index) = self.stack.iter().rposition(
-            |value| matches!(value, BcsValue::Str(text) if looks_like_script_name(text)),
-        ) else {
-            return Vec::new();
-        };
-        if self.stack.len().saturating_sub(script_index) > 4 {
-            return Vec::new();
-        }
-        self.stack.split_off(script_index)
-    }
-
-    fn observe_stack_operator(&mut self, command: &BcsCommand) -> bool {
-        match command.name {
-            Some("add") | Some("sub") | Some("mul") | Some("div") | Some("mod") => {
-                let right = self.stack.pop();
-                let left = self.stack.pop();
-                if let (Some(left), Some(right)) = (left, right) {
-                    if let (Some(left), Some(right)) = (value_i32(&left), value_i32(&right)) {
-                        let value = match command.name {
-                            Some("add") => left.saturating_add(right),
-                            Some("sub") => left.saturating_sub(right),
-                            Some("mul") => left.saturating_mul(right),
-                            Some("div") if right != 0 => left / right,
-                            Some("mod") if right != 0 => left % right,
-                            _ => 0,
-                        };
-                        self.stack.push(BcsValue::Int(value));
-                    } else {
-                        self.stack.push(left);
-                        self.stack.push(right);
-                    }
-                }
-                true
-            }
-            Some("bool_zero") => {
-                if let Some(value) = self.stack.pop() {
-                    let value = value_i32(&value).map(|value| value == 0).unwrap_or(false);
-                    self.stack.push(BcsValue::Int(i32::from(value)));
-                }
-                true
-            }
-            Some("jc") | Some("jmp") => {
-                let _ = self.stack.pop();
-                true
-            }
-            Some("check_translator_note") => true,
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -628,44 +1066,6 @@ pub(crate) struct VisualHints {
     pub(crate) z: Option<i32>,
     pub(crate) opacity: Option<f32>,
     pub(crate) body_layer: Option<&'static str>,
-}
-
-fn is_push_command(command: &BcsCommand) -> bool {
-    matches!(
-        command.name,
-        Some("push_dword" | "push_offset" | "push_base_offset" | "push_string" | "line")
-    )
-}
-
-fn should_consume_pending_args(command: &BcsCommand) -> bool {
-    matches!(
-        command.name,
-        Some(
-            "sys"
-                | "snd"
-                | "grp"
-                | "slct"
-                | "cmd0x120"
-                | "cmd0x121"
-                | "cmd0x126"
-                | "set_font"
-                | "cmd0x151"
-                | "sound"
-                | "sound_1a0"
-                | "img_hide"
-                | "fx_smth1"
-                | "cmd0x1b1"
-                | "char_act"
-                | "set_script_file"
-                | "set_voice_seq"
-                | "play_movie"
-                | "cmd0x230"
-                | "fade_to_black"
-                | "transition"
-                | "sprite_hide_all"
-                | "cmd0x340"
-        )
-    ) || matches!(command.opcode, 0xe0 | 0xe2 | 0xe3 | 0xe5 | 0xe6 | 0xfe)
 }
 
 fn strings(values: &[BcsValue]) -> Vec<&str> {
@@ -734,13 +1134,6 @@ fn character_body_layer_for_pose(pose: &str) -> Option<&'static str> {
         "c" => Some("ax14"),
         _ => None,
     }
-}
-
-fn first_position_hint(values: &[BcsValue]) -> Option<i32> {
-    values
-        .iter()
-        .filter_map(value_i32)
-        .find(|value| (-640..=640).contains(value) && *value != 0 && *value != 1 && *value != 256)
 }
 
 fn visual_hints(values: &[BcsValue]) -> VisualHints {
@@ -918,7 +1311,10 @@ fn duration_millis(values: &[BcsValue]) -> Option<i32> {
 
 fn value_i32(value: &BcsValue) -> Option<i32> {
     match value {
-        BcsValue::Int(value) | BcsValue::Addr(value) | BcsValue::BaseOffset(value) => Some(*value),
+        BcsValue::Int(value)
+        | BcsValue::Addr(value)
+        | BcsValue::BaseOffset(value)
+        | BcsValue::MemoryAddr(value) => Some(*value),
         BcsValue::Mul(left, right) => Some(value_i32(left)? * value_i32(right)?),
         BcsValue::CheckNote(value) => value_i32(value),
         BcsValue::Line { .. } | BcsValue::Arg2 | BcsValue::Str(_) => None,
@@ -967,4 +1363,320 @@ fn is_speaker_label(text: &str) -> bool {
 
 fn should_wait_after_message(text: &str) -> bool {
     !is_message_marker(text) && !is_speaker_label(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(
+        addr: u32,
+        opcode: u32,
+        name: Option<&'static str>,
+        args: Vec<BcsValue>,
+    ) -> BcsCommand {
+        BcsCommand {
+            file_offset: addr as usize,
+            addr,
+            opcode,
+            name,
+            args,
+            string_refs: Vec::new(),
+        }
+    }
+
+    fn program(commands: Vec<BcsCommand>) -> BcsProgram {
+        BcsProgram {
+            header_size: 0,
+            namespaces: Vec::new(),
+            subs: Vec::new(),
+            symbols: Vec::new(),
+            code_start: 0,
+            code_end: 0,
+            executable_end: 0,
+            resolver_end: None,
+            commands,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn follows_jump_instead_of_precollecting_skipped_actions() {
+        let program = program(vec![
+            command(0x1c, 0, Some("push_dword"), vec![BcsValue::Addr(0x4c)]),
+            command(0x24, 0x18, Some("jmp"), Vec::new()),
+            command(
+                0x2c,
+                0,
+                Some("push_string"),
+                vec![BcsValue::Str("「skipped」".into())],
+            ),
+            command(0x34, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x3c, 0x140, Some("say"), Vec::new()),
+            command(0x44, 0x1b, Some("ret"), Vec::new()),
+            command(
+                0x4c,
+                0,
+                Some("push_string"),
+                vec![BcsValue::Str("「visited」".into())],
+            ),
+            command(0x54, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x5c, 0x140, Some("say"), Vec::new()),
+            command(0x64, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let mut playback = ScenarioPlayback::from_program(program).expect("program");
+
+        let (action, consumed) = playback.tick(false);
+
+        assert!(!consumed);
+        assert!(matches!(
+            action,
+            Some(ScenarioAction::Message { text, .. }) if text == "「visited」"
+        ));
+    }
+
+    #[test]
+    fn conditional_jump_uses_its_encoded_target_not_the_operand_stack() {
+        let program = program(vec![
+            command(0x1c, 0, Some("push_dword"), vec![BcsValue::Int(1)]),
+            command(0x24, 0x19, Some("jc"), vec![BcsValue::Addr(0x54)]),
+            command(
+                0x2c,
+                0,
+                Some("push_string"),
+                vec![BcsValue::Str("「fallthrough」".into())],
+            ),
+            command(0x34, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x3c, 0x140, Some("say"), Vec::new()),
+            command(0x44, 0x1b, Some("ret"), Vec::new()),
+            command(
+                0x54,
+                0,
+                Some("push_string"),
+                vec![BcsValue::Str("「taken」".into())],
+            ),
+            command(0x5c, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x64, 0x140, Some("say"), Vec::new()),
+            command(0x6c, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let mut playback = ScenarioPlayback::from_program(program).expect("program");
+
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::Message { text, .. }) if text == "「taken」"
+        ));
+    }
+
+    #[test]
+    fn external_script_return_restores_calling_program() {
+        let parent = program(vec![
+            command(
+                0x1c,
+                0,
+                Some("push_string"),
+                vec![BcsValue::Str("child".into())],
+            ),
+            command(0x24, 0, Some("push_dword"), vec![BcsValue::Int(0)]),
+            command(0x2c, 0x0f0, Some("exec_script"), Vec::new()),
+            command(
+                0x34,
+                0,
+                Some("push_string"),
+                vec![BcsValue::Str("「returned」".into())],
+            ),
+            command(0x3c, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x44, 0x140, Some("say"), Vec::new()),
+            command(0x4c, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let child = program(vec![command(0x1c, 0x1b, Some("ret"), Vec::new())]);
+        let mut playback = ScenarioPlayback::from_program(parent).expect("parent");
+
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::LoadScript { file, transfer: ScriptTransfer::Call, .. }) if file == "child"
+        ));
+        assert!(playback.append_program(child).is_some());
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::Message { text, .. }) if text == "「returned」"
+        ));
+    }
+
+    #[test]
+    fn legacy_external_script_return_restores_calling_program() {
+        let parent = program(vec![
+            command(
+                0x1c,
+                0,
+                Some("push_string"),
+                vec![BcsValue::Str("MakerLogo".into())],
+            ),
+            command(0x24, 0, Some("push_dword"), vec![BcsValue::Int(0)]),
+            command(0x2c, 0x0f3, Some("exec_script_legacy"), Vec::new()),
+            command(0x34, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let child = program(vec![command(0x1c, 0x1b, Some("ret"), Vec::new())]);
+        let mut playback = ScenarioPlayback::from_program(parent).expect("parent");
+
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::LoadScript { file, transfer: ScriptTransfer::Call, .. })
+                if file == "MakerLogo"
+        ));
+        assert!(playback.append_program(child).is_some());
+        assert!(playback.tick(false).0.is_none());
+        assert!(playback.completed);
+    }
+
+    #[test]
+    fn f6_resolves_a_local_label_before_call() {
+        let mut program = program(vec![
+            command(
+                0x1c,
+                0x03,
+                Some("push_string"),
+                vec![BcsValue::Str("__entry".into())],
+            ),
+            command(0x24, 0x0f6, Some("resolve_symbol"), Vec::new()),
+            command(0x28, 0x01, Some("push_offset"), vec![BcsValue::Addr(0)]),
+            command(0x30, 0x1a, Some("call"), Vec::new()),
+            command(0x34, 0x1b, Some("ret"), Vec::new()),
+            command(
+                0x50,
+                0x03,
+                Some("push_string"),
+                vec![BcsValue::Str("「resolved」".into())],
+            ),
+            command(0x58, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x60, 0x140, Some("say"), Vec::new()),
+            command(0x68, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        program.symbols.push(BcsSymbol {
+            name: "__entry".into(),
+            addr: 0x50,
+            table_offset: 0,
+        });
+        let mut playback = ScenarioPlayback::from_program(program).expect("program");
+
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::Message { text, .. }) if text == "「resolved」"
+        ));
+    }
+
+    #[test]
+    fn executes_frame_memory_reads_writes_and_a_conditional_branch() {
+        let program = program(vec![
+            command(0x1c, 0x10, Some("get_stack_pointer"), Vec::new()),
+            command(0x20, 0, Some("push_dword"), vec![BcsValue::Int(8)]),
+            command(0x28, 0x20, Some("add"), Vec::new()),
+            command(0x2c, 0x11, Some("set_stack_pointer"), Vec::new()),
+            command(0x30, 0, Some("push_dword"), vec![BcsValue::Int(123)]),
+            command(
+                0x38,
+                0x2,
+                Some("push_base_offset"),
+                vec![BcsValue::BaseOffset(4)],
+            ),
+            command(0x40, 0x0a, Some("write_mem"), vec![BcsValue::Int(2)]),
+            command(
+                0x44,
+                0x2,
+                Some("push_base_offset"),
+                vec![BcsValue::BaseOffset(4)],
+            ),
+            command(0x4c, 0x08, Some("read_mem"), vec![BcsValue::Int(2)]),
+            command(0x54, 0, Some("push_dword"), vec![BcsValue::Int(123)]),
+            command(0x5c, 0x30, Some("eq"), Vec::new()),
+            command(0x60, 0x19, Some("jc"), vec![BcsValue::Addr(0x90)]),
+            command(
+                0x68,
+                0x3,
+                Some("push_string"),
+                vec![BcsValue::Str("「wrong branch」".into())],
+            ),
+            command(0x70, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x78, 0x140, Some("say"), Vec::new()),
+            command(0x80, 0x1b, Some("ret"), Vec::new()),
+            command(
+                0x90,
+                0x3,
+                Some("push_string"),
+                vec![BcsValue::Str("「frame memory works」".into())],
+            ),
+            command(0x98, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0xa0, 0x140, Some("say"), Vec::new()),
+            command(0xa8, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let mut playback = ScenarioPlayback::from_program(program).expect("program");
+
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::Message { text, .. }) if text == "「frame memory works」"
+        ));
+    }
+
+    #[test]
+    fn global_set_and_get_follow_the_compiler_stack_contract() {
+        let program = program(vec![
+            command(0x1c, 0, Some("push_dword"), vec![BcsValue::Int(9)]),
+            command(0x24, 0, Some("push_dword"), vec![BcsValue::Int(9)]),
+            command(0x2c, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x34, 0xe1, Some("global_get"), Vec::new()),
+            command(0x3c, 0, Some("push_dword"), vec![BcsValue::Int(1)]),
+            command(0x44, 0x20, Some("add"), Vec::new()),
+            command(0x4c, 0x3f, Some("nargs"), vec![BcsValue::Int(2)]),
+            command(0x54, 0xe0, Some("global_set"), Vec::new()),
+            command(0x5c, 0, Some("push_dword"), vec![BcsValue::Int(9)]),
+            command(0x64, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x6c, 0xe1, Some("global_get"), Vec::new()),
+            command(0x74, 0, Some("push_dword"), vec![BcsValue::Int(1)]),
+            command(0x7c, 0x30, Some("eq"), Vec::new()),
+            command(0x84, 0x19, Some("jc"), vec![BcsValue::Addr(0xa4)]),
+            command(0x8c, 0x1b, Some("ret"), Vec::new()),
+            command(
+                0xa4,
+                0x3,
+                Some("push_string"),
+                vec![BcsValue::Str("「global state works」".into())],
+            ),
+            command(0xac, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0xb4, 0x140, Some("say"), Vec::new()),
+            command(0xbc, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let mut playback = ScenarioPlayback::from_program(program).expect("program");
+
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::Message { text, .. }) if text == "「global state works」"
+        ));
+        assert_eq!(playback.globals.get(&9), Some(&BcsValue::Int(1)));
+        assert!(playback.operand_stack.is_empty());
+        assert!(playback.pending_arg_count.is_none());
+    }
+
+    #[test]
+    fn scheduler_yield_resumes_on_the_next_frame() {
+        let program = program(vec![
+            command(0x1c, 0, Some("push_dword"), vec![BcsValue::Int(1)]),
+            command(0x24, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x2c, 0x120, Some("cmd0x120"), Vec::new()),
+            command(
+                0x34,
+                0x3,
+                Some("push_string"),
+                vec![BcsValue::Str("「after yield」".into())],
+            ),
+            command(0x3c, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x44, 0x140, Some("say"), Vec::new()),
+            command(0x4c, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let mut playback = ScenarioPlayback::from_program(program).expect("program");
+
+        assert!(playback.tick(false).0.is_none());
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::Message { text, .. }) if text == "「after yield」"
+        ));
+    }
 }

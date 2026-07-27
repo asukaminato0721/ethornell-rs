@@ -1,7 +1,7 @@
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use ethornell_core::{EthornellError, Result};
 use ethornell_image::DecodedImage;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use winit::window::Window;
 
 pub type TextureId = u64;
@@ -22,6 +22,8 @@ pub enum RenderCommand {
         src_width: f32,
         src_height: f32,
         opacity: f32,
+        rotation_degrees: f32,
+        clip: Option<[f32; 4]>,
         z: i32,
     },
     DrawText {
@@ -42,7 +44,27 @@ pub struct TextureHandle {
 }
 
 struct TextureRecord {
+    texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TextCacheKey {
+    text: String,
+    size_bits: u32,
+    color_bits: [u32; 4],
+}
+
+impl TextCacheKey {
+    fn new(text: &str, size: f32, color: [f32; 4]) -> Self {
+        Self {
+            text: text.to_string(),
+            size_bits: size.to_bits(),
+            color_bits: color.map(f32::to_bits),
+        }
+    }
 }
 
 #[repr(C)]
@@ -89,6 +111,7 @@ pub struct Renderer<'w> {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: BTreeMap<TextureId, TextureRecord>,
+    text_cache: BTreeMap<TextCacheKey, TextureHandle>,
     next_texture_id: TextureId,
     commands: Vec<RenderCommand>,
     font: FontArc,
@@ -215,9 +238,10 @@ impl<'w> Renderer<'w> {
             bind_group_layout,
             sampler,
             textures: BTreeMap::new(),
+            text_cache: BTreeMap::new(),
             next_texture_id: 1,
             commands: Vec::new(),
-            font: load_default_font()?,
+            font: load_system_cjk_font()?,
             virtual_width: 1280.0,
             virtual_height: 720.0,
         })
@@ -239,11 +263,12 @@ impl<'w> Renderer<'w> {
         width: f32,
         height: f32,
     ) -> (f32, f32, f32, f32) {
-        let scale = (self.config.width as f32 / self.virtual_width)
-            .min(self.config.height as f32 / self.virtual_height)
-            .max(0.01);
-        let offset_x = (self.config.width as f32 - self.virtual_width * scale) * 0.5;
-        let offset_y = (self.config.height as f32 - self.virtual_height * scale) * 0.5;
+        let (scale, offset_x, offset_y) = viewport_transform(
+            self.config.width as f32,
+            self.config.height as f32,
+            self.virtual_width,
+            self.virtual_height,
+        );
         (
             offset_x + x * scale,
             offset_y + y * scale,
@@ -253,11 +278,12 @@ impl<'w> Renderer<'w> {
     }
 
     pub fn surface_to_game_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
-        let scale = (self.config.width as f32 / self.virtual_width)
-            .min(self.config.height as f32 / self.virtual_height)
-            .max(0.01);
-        let offset_x = (self.config.width as f32 - self.virtual_width * scale) * 0.5;
-        let offset_y = (self.config.height as f32 - self.virtual_height * scale) * 0.5;
+        let (scale, offset_x, offset_y) = viewport_transform(
+            self.config.width as f32,
+            self.config.height as f32,
+            self.virtual_width,
+            self.virtual_height,
+        );
         let game_x = (x - offset_x) / scale;
         let game_y = (y - offset_y) / scale;
         if (0.0..=self.virtual_width).contains(&game_x)
@@ -270,11 +296,51 @@ impl<'w> Renderer<'w> {
     }
 
     pub fn insert_rgba(&mut self, image: &DecodedImage) -> Result<TextureHandle> {
-        if image.rgba.len() != image.width as usize * image.height as usize * 4 {
-            return Err(EthornellError::Parse("texture RGBA size mismatch".into()));
-        }
+        validate_rgba(image)?;
         let id = self.next_texture_id;
         self.next_texture_id += 1;
+        let record = self.create_texture_record(image);
+        self.textures.insert(id, record);
+        Ok(TextureHandle {
+            id,
+            width: image.width,
+            height: image.height,
+        })
+    }
+
+    pub fn update_rgba(
+        &mut self,
+        handle: &TextureHandle,
+        image: &DecodedImage,
+    ) -> Result<TextureHandle> {
+        validate_rgba(image)?;
+        let same_dimensions = self
+            .textures
+            .get(&handle.id)
+            .is_some_and(|record| record.width == image.width && record.height == image.height);
+        if same_dimensions {
+            let record = self
+                .textures
+                .get(&handle.id)
+                .ok_or_else(|| EthornellError::Parse("unknown texture handle".into()))?;
+            self.write_texture(&record.texture, image);
+        } else {
+            let record = self.create_texture_record(image);
+            self.textures.insert(handle.id, record);
+        }
+        Ok(TextureHandle {
+            id: handle.id,
+            width: image.width,
+            height: image.height,
+        })
+    }
+
+    pub fn remove_texture(&mut self, texture: TextureId) {
+        self.textures.remove(&texture);
+        self.text_cache.retain(|_, handle| handle.id != texture);
+    }
+
+    fn create_texture_record(&self, image: &DecodedImage) -> TextureRecord {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ethornell-rgba-texture"),
             size: wgpu::Extent3d {
@@ -289,9 +355,34 @@ impl<'w> Renderer<'w> {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        self.write_texture(&texture, image);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ethornell-texture-bind-group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        TextureRecord {
+            texture,
+            bind_group,
+            width: image.width,
+            height: image.height,
+        }
+    }
+
+    fn write_texture(&self, texture: &wgpu::Texture, image: &DecodedImage) {
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
-                texture: &texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -308,28 +399,6 @@ impl<'w> Renderer<'w> {
                 depth_or_array_layers: 1,
             },
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ethornell-texture-bind-group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        let handle = TextureHandle {
-            id,
-            width: image.width,
-            height: image.height,
-        };
-        self.textures.insert(id, TextureRecord { bind_group });
-        Ok(handle)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -370,6 +439,7 @@ impl<'w> Renderer<'w> {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut draw_items = Vec::new();
+        let mut active_text_keys = BTreeSet::new();
         let mut draw_commands: Vec<_> = self
             .commands
             .iter()
@@ -381,9 +451,39 @@ impl<'w> Renderer<'w> {
             .collect();
         draw_commands.sort_by_key(|(z, _)| *z);
         for (_, command) in draw_commands {
-            let (texture, x, y, width, height, src_x, src_y, src_width, src_height, opacity) =
-                match command {
-                    RenderCommand::DrawTexture {
+            let (
+                texture,
+                x,
+                y,
+                width,
+                height,
+                src_x,
+                src_y,
+                src_width,
+                src_height,
+                opacity,
+                rotation_degrees,
+                clip,
+            ) = match command {
+                RenderCommand::DrawTexture {
+                    texture,
+                    x,
+                    y,
+                    width,
+                    height,
+                    src_x,
+                    src_y,
+                    src_width,
+                    src_height,
+                    opacity,
+                    rotation_degrees,
+                    clip,
+                    ..
+                } => {
+                    if !self.textures.contains_key(&texture) {
+                        continue;
+                    }
+                    (
                         texture,
                         x,
                         y,
@@ -394,42 +494,53 @@ impl<'w> Renderer<'w> {
                         src_width,
                         src_height,
                         opacity,
-                        ..
-                    } => {
-                        if !self.textures.contains_key(&texture) {
-                            continue;
-                        }
-                        (
-                            texture, x, y, width, height, src_x, src_y, src_width, src_height,
-                            opacity,
-                        )
-                    }
-                    RenderCommand::DrawText {
-                        text,
-                        x,
-                        y,
-                        color,
-                        size,
-                        ..
-                    } => {
+                        rotation_degrees,
+                        clip,
+                    )
+                }
+                RenderCommand::DrawText {
+                    text,
+                    x,
+                    y,
+                    color,
+                    size,
+                    ..
+                } => {
+                    let key = TextCacheKey::new(&text, size, color);
+                    active_text_keys.insert(key.clone());
+                    let handle = if let Some(handle) = self.text_cache.get(&key).cloned() {
+                        handle
+                    } else {
                         let image = rasterize_text(&self.font, &text, size, color);
                         let handle = self.insert_rgba(&image)?;
-                        (
-                            handle.id,
-                            x,
-                            y,
-                            handle.width as f32,
-                            handle.height as f32,
-                            0.0,
-                            0.0,
-                            handle.width as f32,
-                            handle.height as f32,
-                            color[3],
-                        )
-                    }
-                    RenderCommand::Clear { .. } => continue,
-                };
+                        self.text_cache.insert(key, handle.clone());
+                        handle
+                    };
+                    (
+                        handle.id,
+                        x,
+                        y,
+                        handle.width as f32,
+                        handle.height as f32,
+                        0.0,
+                        0.0,
+                        handle.width as f32,
+                        handle.height as f32,
+                        1.0,
+                        0.0,
+                        None,
+                    )
+                }
+                RenderCommand::Clear { .. } => continue,
+            };
             let (x, y, width, height) = self.game_to_surface_rect(x, y, width, height);
+            let scissor = match clip {
+                Some(rect) => match self.game_clip_to_scissor(rect) {
+                    Some(scissor) => Some(scissor),
+                    None => continue,
+                },
+                None => None,
+            };
             let vertices = quad_vertices(
                 x,
                 y,
@@ -440,6 +551,7 @@ impl<'w> Renderer<'w> {
                 src_width,
                 src_height,
                 opacity,
+                rotation_degrees,
                 self.config.width as f32,
                 self.config.height as f32,
             );
@@ -450,8 +562,21 @@ impl<'w> Renderer<'w> {
                     contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-            draw_items.push((texture, vertex_buffer));
+            draw_items.push((texture, vertex_buffer, scissor));
         }
+
+        let stale_text_keys = self
+            .text_cache
+            .keys()
+            .filter(|key| !active_text_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in stale_text_keys {
+            if let Some(handle) = self.text_cache.remove(&key) {
+                self.textures.remove(&handle.id);
+            }
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -473,7 +598,12 @@ impl<'w> Renderer<'w> {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            for (texture, vertex_buffer) in &draw_items {
+            for (texture, vertex_buffer, scissor) in &draw_items {
+                if let Some((x, y, width, height)) = scissor {
+                    pass.set_scissor_rect(*x, *y, *width, *height);
+                } else {
+                    pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                }
                 if let Some(record) = self.textures.get(texture) {
                     pass.set_bind_group(0, &record.bind_group, &[]);
                     pass.set_vertex_buffer(0, vertex_buffer.slice(..));
@@ -485,9 +615,53 @@ impl<'w> Renderer<'w> {
         frame.present();
         Ok(())
     }
+
+    fn game_clip_to_scissor(&self, clip: [f32; 4]) -> Option<(u32, u32, u32, u32)> {
+        let (x, y, width, height) = self.game_to_surface_rect(clip[0], clip[1], clip[2], clip[3]);
+        let x0 = x.floor().max(0.0).min(self.config.width as f32) as u32;
+        let y0 = y.floor().max(0.0).min(self.config.height as f32) as u32;
+        let x1 = (x + width).ceil().max(0.0).min(self.config.width as f32) as u32;
+        let y1 = (y + height).ceil().max(0.0).min(self.config.height as f32) as u32;
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+    }
 }
 
-fn load_default_font() -> Result<FontArc> {
+fn viewport_transform(
+    surface_width: f32,
+    surface_height: f32,
+    virtual_width: f32,
+    virtual_height: f32,
+) -> (f32, f32, f32) {
+    let scale = (surface_width / virtual_width)
+        .min(surface_height / virtual_height)
+        .max(0.01);
+    let offset_x = (surface_width - virtual_width * scale) * 0.5;
+    let offset_y = (surface_height - virtual_height * scale) * 0.5;
+    (scale, offset_x, offset_y)
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::viewport_transform;
+
+    #[test]
+    fn hdpi_surface_uses_the_physical_device_scale() {
+        assert_eq!(
+            viewport_transform(2560.0, 1440.0, 1280.0, 720.0),
+            (2.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn letterbox_offset_is_shared_by_rendering_and_input() {
+        assert_eq!(
+            viewport_transform(1600.0, 1200.0, 1280.0, 720.0),
+            (1.25, 0.0, 150.0)
+        );
+    }
+}
+
+pub fn load_system_cjk_font() -> Result<FontArc> {
     for path in SYSTEM_CJK_FONT_CANDIDATES {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
@@ -540,17 +714,13 @@ fn rasterize_text(font: &FontArc, text: &str, px_height: f32, color: [f32; 4]) -
                         return;
                     }
                     let idx = (py as usize * width as usize + px as usize) * 4;
-                    let alpha = (coverage * rgba_color[3] as f32) as u8;
-                    let inv = 255u16.saturating_sub(alpha as u16);
-                    rgba[idx] = ((rgba_color[0] as u16 * alpha as u16 + rgba[idx] as u16 * inv)
-                        / 255) as u8;
-                    rgba[idx + 1] = ((rgba_color[1] as u16 * alpha as u16
-                        + rgba[idx + 1] as u16 * inv)
-                        / 255) as u8;
-                    rgba[idx + 2] = ((rgba_color[2] as u16 * alpha as u16
-                        + rgba[idx + 2] as u16 * inv)
-                        / 255) as u8;
-                    rgba[idx + 3] = rgba[idx + 3].saturating_add(alpha);
+                    let alpha = (coverage * rgba_color[3] as f32).round() as u8;
+                    if alpha >= rgba[idx + 3] {
+                        rgba[idx] = rgba_color[0];
+                        rgba[idx + 1] = rgba_color[1];
+                        rgba[idx + 2] = rgba_color[2];
+                    }
+                    rgba[idx + 3] = rgba[idx + 3].max(alpha);
                 });
             }
         }
@@ -587,6 +757,27 @@ const SYSTEM_CJK_FONT_CANDIDATES: &[&str] = &[
     "C:/Windows/Fonts/msyh.ttc",
 ];
 
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    #[test]
+    fn selected_system_font_contains_japanese_glyphs() {
+        let font = load_system_cjk_font().expect("system CJK font");
+        assert_ne!(font.glyph_id('\u{65e5}').0, 0);
+    }
+}
+
+fn validate_rgba(image: &DecodedImage) -> Result<()> {
+    if image.width == 0 || image.height == 0 {
+        return Err(EthornellError::Parse("zero-sized texture".into()));
+    }
+    if image.rgba.len() != image.width as usize * image.height as usize * 4 {
+        return Err(EthornellError::Parse("texture RGBA size mismatch".into()));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn quad_vertices(
     x: f32,
@@ -598,45 +789,58 @@ fn quad_vertices(
     src_w: f32,
     src_h: f32,
     opacity: f32,
+    rotation_degrees: f32,
     sw: f32,
     sh: f32,
 ) -> [Vertex; 6] {
-    let left = x / sw * 2.0 - 1.0;
-    let right = (x + w) / sw * 2.0 - 1.0;
-    let top = 1.0 - y / sh * 2.0;
-    let bottom = 1.0 - (y + h) / sh * 2.0;
+    let center_x = x + w * 0.5;
+    let center_y = y + h * 0.5;
+    let radians = rotation_degrees.to_radians();
+    let sin = radians.sin();
+    let cos = radians.cos();
+    let rotate = |px: f32, py: f32| {
+        let dx = px - center_x;
+        let dy = py - center_y;
+        let rx = center_x + dx * cos - dy * sin;
+        let ry = center_y + dx * sin + dy * cos;
+        [rx / sw * 2.0 - 1.0, 1.0 - ry / sh * 2.0]
+    };
+    let top_left = rotate(x, y);
+    let bottom_left = rotate(x, y + h);
+    let bottom_right = rotate(x + w, y + h);
+    let top_right = rotate(x + w, y);
     let u0 = src_x.clamp(0.0, 1.0);
     let v0 = src_y.clamp(0.0, 1.0);
     let u1 = (src_x + src_w).clamp(0.0, 1.0);
     let v1 = (src_y + src_h).clamp(0.0, 1.0);
     [
         Vertex {
-            position: [left, top],
+            position: top_left,
             texcoord: [u0, v0],
             opacity,
         },
         Vertex {
-            position: [left, bottom],
+            position: bottom_left,
             texcoord: [u0, v1],
             opacity,
         },
         Vertex {
-            position: [right, bottom],
+            position: bottom_right,
             texcoord: [u1, v1],
             opacity,
         },
         Vertex {
-            position: [left, top],
+            position: top_left,
             texcoord: [u0, v0],
             opacity,
         },
         Vertex {
-            position: [right, bottom],
+            position: bottom_right,
             texcoord: [u1, v1],
             opacity,
         },
         Vertex {
-            position: [right, top],
+            position: top_right,
             texcoord: [u1, v0],
             opacity,
         },

@@ -1,8 +1,15 @@
 use ethornell_core::{EthornellError, Result};
+use kira::dsp::Frame;
 use kira::manager::{AudioManager, AudioManagerSettings};
-use kira::sound::static_sound::{StaticSoundData, StaticSoundSettings};
+use kira::sound::{
+    static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
+    PlaybackState,
+};
+use kira::tween::Tween;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AudioInfo {
@@ -104,6 +111,8 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 pub struct AudioSystem {
     manager: AudioManager,
     volume: f64,
+    channels: BTreeMap<i32, StaticSoundHandle>,
+    next_unmanaged_channel: i32,
 }
 
 impl AudioSystem {
@@ -113,6 +122,8 @@ impl AudioSystem {
         Ok(Self {
             manager,
             volume: 1.0,
+            channels: BTreeMap::new(),
+            next_unmanaged_channel: i32::MIN,
         })
     }
 
@@ -126,21 +137,177 @@ impl AudioSystem {
     }
 
     pub fn play_from_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let payload = unwrap_buriko_wave_ogg(bytes).unwrap_or(bytes);
-        let data = StaticSoundData::from_cursor(
-            Cursor::new(payload.to_vec()),
-            StaticSoundSettings::default(),
+        let channel = self.next_unmanaged_channel;
+        self.next_unmanaged_channel = self.next_unmanaged_channel.saturating_add(1);
+        self.play_on_channel(channel, bytes, false, 1.0, 1.0, 1.0, 0.5, 0)
+    }
+
+    pub fn play_on_channel(
+        &mut self,
+        channel: i32,
+        bytes: &[u8],
+        looped: bool,
+        volume: f64,
+        decode_gain: f64,
+        playback_rate: f64,
+        panning: f64,
+        fade_in_ms: u64,
+    ) -> Result<()> {
+        self.play_on_channel_inner(
+            channel,
+            bytes,
+            looped,
+            volume,
+            decode_gain,
+            playback_rate,
+            panning,
+            fade_in_ms,
+            true,
         )
-        .map_err(|err| EthornellError::Other(format!("load audio bytes failed: {err}")))?;
-        self.manager
+        .map(|_| ())
+    }
+
+    pub fn play_on_channel_if_stopped(
+        &mut self,
+        channel: i32,
+        bytes: &[u8],
+        looped: bool,
+        volume: f64,
+        decode_gain: f64,
+        playback_rate: f64,
+        panning: f64,
+        fade_in_ms: u64,
+    ) -> Result<bool> {
+        self.play_on_channel_inner(
+            channel,
+            bytes,
+            looped,
+            volume,
+            decode_gain,
+            playback_rate,
+            panning,
+            fade_in_ms,
+            false,
+        )
+    }
+
+    fn play_on_channel_inner(
+        &mut self,
+        channel: i32,
+        bytes: &[u8],
+        looped: bool,
+        volume: f64,
+        decode_gain: f64,
+        playback_rate: f64,
+        panning: f64,
+        fade_in_ms: u64,
+        restart: bool,
+    ) -> Result<bool> {
+        if !restart && self.channel_is_active(channel) {
+            return Ok(false);
+        }
+        let payload = unwrap_buriko_wave_ogg(bytes).unwrap_or(bytes);
+        let mut settings = StaticSoundSettings::default()
+            .volume(volume.clamp(0.0, 1.0))
+            .playback_rate(playback_rate.clamp(0.01, 16.0))
+            .panning(panning.clamp(0.0, 1.0));
+        if looped {
+            settings = settings.loop_region(..);
+        }
+        if fade_in_ms > 0 {
+            settings = settings.fade_in_tween(Tween {
+                duration: Duration::from_millis(fade_in_ms),
+                ..Tween::default()
+            });
+        }
+        let mut data = StaticSoundData::from_cursor(Cursor::new(payload.to_vec()), settings)
+            .map_err(|err| EthornellError::Other(format!("load audio bytes failed: {err}")))?;
+        let decode_gain = decode_gain.max(0.0) as f32;
+        if (decode_gain - 1.0).abs() > f32::EPSILON {
+            data.frames = data
+                .frames
+                .iter()
+                .map(|frame| {
+                    Frame::new(
+                        (frame.left * decode_gain).clamp(-1.0, 1.0),
+                        (frame.right * decode_gain).clamp(-1.0, 1.0),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
+        let handle = self
+            .manager
             .play(data)
             .map_err(|err| EthornellError::Other(format!("play audio bytes failed: {err}")))?;
-        Ok(())
+        if let Some(mut previous) = self.channels.insert(channel, handle) {
+            let _ = previous.stop(Tween::default());
+        }
+        Ok(true)
     }
 
     pub fn stop_all(&mut self) {
-        // Kira stops sounds through handles/tracks. The first skeleton does not
-        // retain handles yet, so this becomes real once playback routing exists.
+        for handle in self.channels.values_mut() {
+            let _ = handle.stop(Tween::default());
+        }
+        self.channels.clear();
+    }
+
+    pub fn stop_channel(&mut self, channel: i32, fade_out_ms: u64) {
+        let Some(handle) = self.channels.get_mut(&channel) else {
+            return;
+        };
+        let _ = handle.stop(Tween {
+            duration: Duration::from_millis(fade_out_ms),
+            ..Tween::default()
+        });
+    }
+
+    pub fn pause_channel(&mut self, channel: i32, paused: bool, fade_ms: u64) {
+        let Some(handle) = self.channels.get_mut(&channel) else {
+            return;
+        };
+        let tween = Tween {
+            duration: Duration::from_millis(fade_ms),
+            ..Tween::default()
+        };
+        if paused {
+            let _ = handle.pause(tween);
+        } else {
+            let _ = handle.resume(tween);
+        }
+    }
+
+    pub fn set_channel_volume(&mut self, channel: i32, volume: f64, fade_ms: u64) {
+        let Some(handle) = self.channels.get_mut(&channel) else {
+            return;
+        };
+        let _ = handle.set_volume(
+            volume.clamp(0.0, 1.0),
+            Tween {
+                duration: Duration::from_millis(fade_ms),
+                ..Tween::default()
+            },
+        );
+    }
+
+    pub fn set_channel_panning(&mut self, channel: i32, panning: f64, fade_ms: u64) {
+        let Some(handle) = self.channels.get_mut(&channel) else {
+            return;
+        };
+        let _ = handle.set_panning(
+            panning.clamp(0.0, 1.0),
+            Tween {
+                duration: Duration::from_millis(fade_ms),
+                ..Tween::default()
+            },
+        );
+    }
+
+    pub fn channel_is_active(&self, channel: i32) -> bool {
+        self.channels
+            .get(&channel)
+            .is_some_and(|handle| handle.state() != PlaybackState::Stopped)
     }
 
     pub fn set_volume(&mut self, volume: f64) {

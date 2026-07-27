@@ -1,4 +1,4 @@
-use super::{RuntimeTraceApi, RuntimeUserControl, INPUT_DESCRIPTOR_ENTER};
+use super::{RuntimeTraceApi, RuntimeUserControl, INPUT_DESCRIPTOR_MOUSE_LEFT};
 
 impl RuntimeTraceApi {
     pub(crate) fn maybe_auto_click_user(&mut self) {
@@ -62,7 +62,7 @@ impl RuntimeTraceApi {
         self.pending_click_age_frames = 0;
         self.pending_object_state = Some(point);
         self.pending_input_state = Some(0x1000_0002);
-        self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_ENTER);
+        self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
         self.auto_user_click_done = true;
         if self.auto_user_click_repeat {
             self.auto_user_click_elapsed_frames = 0;
@@ -110,7 +110,9 @@ impl RuntimeTraceApi {
             return true;
         }
         if !self.scenario_bootstrapped {
-            return self.scenario_overlay_active() || self.text_runtime.is_animating();
+            return self.scenario_overlay_active()
+                || self.native_message_active
+                || self.text_runtime.is_animating();
         }
         self.scenario_overlay_active()
             || self.text_runtime.is_animating()

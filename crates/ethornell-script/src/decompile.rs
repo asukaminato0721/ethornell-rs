@@ -1,5 +1,7 @@
+use crate::bcs::{BcsProgram, BcsValue};
 use crate::calls::instruction_call_key;
 use crate::{BpInstruction, BpOperand, BpProgram};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct DecompileOptions {
@@ -42,6 +44,266 @@ pub fn decompile_bp(program: &BpProgram, options: &DecompileOptions) -> String {
     }
 
     state.lines.join("\n")
+}
+
+/// Render BCS as stack-oriented pseudocode. This deliberately preserves opcode
+/// IDs and branch targets so reverse-engineering evidence is not hidden behind
+/// guessed high-level syntax.
+pub fn decompile_bcs(program: &BcsProgram, options: &DecompileOptions) -> String {
+    let mut state = BcsDecompileState {
+        stack: Vec::new(),
+        lines: vec![format!(
+            "// BURIKO scenario code 0x{:X}..0x{:X}",
+            program.code_start, program.code_end
+        )],
+        show_stack: options.show_stack,
+        pending_arg_count: None,
+        sub_names: program
+            .subs
+            .iter()
+            .map(|sub| (sub.addr, sub.name.as_str()))
+            .chain(
+                program
+                    .symbols
+                    .iter()
+                    .map(|symbol| (symbol.addr, symbol.name.as_str())),
+            )
+            .collect(),
+    };
+
+    for command in program
+        .commands
+        .iter()
+        .take(options.limit.unwrap_or(usize::MAX))
+    {
+        state.visit(command);
+    }
+    state.lines.join("\n")
+}
+
+struct BcsDecompileState<'a> {
+    stack: Vec<String>,
+    lines: Vec<String>,
+    show_stack: bool,
+    pending_arg_count: Option<usize>,
+    sub_names: BTreeMap<u32, &'a str>,
+}
+
+impl BcsDecompileState<'_> {
+    fn visit(&mut self, command: &crate::bcs::BcsCommand) {
+        if let Some(name) = self.sub_names.get(&command.addr) {
+            self.lines
+                .push(format!("\nsub_{:08X}_{name}:", command.addr));
+        }
+        let op = command.name.unwrap_or("unknown");
+        match op {
+            "push_dword" | "push_offset" | "push_base_offset" | "push_string" => {
+                for value in &command.args {
+                    self.stack.push(format_bcs_value(value));
+                }
+                self.emit(command, format!("push {}", command_args(&command.args)));
+            }
+            "nargs" => {
+                self.pending_arg_count = command
+                    .args
+                    .iter()
+                    .rev()
+                    .find_map(bcs_value_i32)
+                    .and_then(|value| usize::try_from(value).ok());
+                self.emit(
+                    command,
+                    format!("argc = {};", self.pending_arg_count.unwrap_or_default()),
+                );
+            }
+            "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shl" | "shr"
+            | "sar" | "eq" | "neq" | "leq" | "geq" | "lt" | "gt" => {
+                let right = self.pop();
+                let left = self.pop();
+                self.stack
+                    .push(format!("({left} {} {right})", bcs_binary_symbol(op)));
+                self.emit(command, format!("stack.push({});", self.stack_tail(1)));
+            }
+            "not" | "bool_zero" => {
+                let value = self.pop();
+                let expression = if op == "not" {
+                    format!("~({value})")
+                } else {
+                    format!("({value} == 0)")
+                };
+                self.stack.push(expression);
+                self.emit(command, format!("stack.push({});", self.stack_tail(1)));
+            }
+            "jmp" => {
+                let target = self.pop();
+                self.emit(command, format!("goto {target};"));
+            }
+            "jc" => {
+                let target = self.pop();
+                let condition = self.pop();
+                self.emit(command, format!("if ({condition}) goto {target};"));
+            }
+            "call" => {
+                let target = self.pop();
+                self.emit(command, format!("call {target};"));
+            }
+            "resolve_symbol" => {
+                let symbol = self.pop();
+                let resolved = if self
+                    .stack
+                    .last()
+                    .is_some_and(|value| value.starts_with('"'))
+                {
+                    let script = self.pop();
+                    format!("resolve({script}, {symbol})")
+                } else {
+                    format!("resolve({symbol})")
+                };
+                self.stack.push(resolved.clone());
+                self.emit(command, format!("stack.push({resolved});"));
+            }
+            "global_set" => {
+                let count = self.pending_arg_count.take().unwrap_or(2);
+                let args = self.pop_args(count);
+                let index = args.first().cloned().unwrap_or_else(|| "?".into());
+                let value = args.get(1).cloned().unwrap_or_else(|| "?".into());
+                self.emit(command, format!("global[{index}] = {value};"));
+            }
+            "global_get" => {
+                let count = self.pending_arg_count.take().unwrap_or(1);
+                let args = self.pop_args(count);
+                let index = args.last().cloned().unwrap_or_else(|| "?".into());
+                self.stack.push(format!("global[{index}]"));
+                self.emit(command, format!("stack.push(global[{index}]);"));
+            }
+            "line" => self.emit(
+                command,
+                format!("debug_line({});", command_args(&command.args)),
+            ),
+            "source_line" => {
+                let count = self.pending_arg_count.take().unwrap_or(2);
+                let args = self.pop_args(count);
+                self.emit(command, format!("debug_line({});", args.join(", ")));
+            }
+            "script_call" => {
+                let Some(function_index) = self.stack.iter().rposition(|value| {
+                    value.starts_with('"') && value.trim_matches('"').starts_with('_')
+                }) else {
+                    self.emit(command, "script_call(<missing-function>);".to_string());
+                    return;
+                };
+                let function = self.stack[function_index].trim_matches('"').to_string();
+                let args = self.stack.drain(..function_index).collect::<Vec<_>>();
+                self.stack.clear();
+                self.emit(command, format!("{function}({});", args.join(", ")));
+            }
+            "ret" => self.emit(command, "return;".to_string()),
+            "check_translator_note" => {
+                let count = self.pending_arg_count.take().unwrap_or(1);
+                let value = self.pop_args(count).pop().unwrap_or_else(|| "?".into());
+                self.stack.push(format!("note({value})"));
+                self.emit(command, format!("stack.push({});", self.stack_tail(1)));
+            }
+            _ => {
+                let arg_count = self.pending_arg_count.take().unwrap_or(0);
+                let args = self.pop_args(arg_count);
+                let name = format!("{op}_0x{:03X}", command.opcode);
+                self.emit(command, format!("{name}({});", args.join(", ")));
+            }
+        }
+    }
+
+    fn pop(&mut self) -> String {
+        self.stack
+            .pop()
+            .unwrap_or_else(|| "<stack-underflow>".to_string())
+    }
+
+    fn pop_args(&mut self, count: usize) -> Vec<String> {
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            args.push(self.pop());
+        }
+        args.reverse();
+        args
+    }
+
+    fn emit(&mut self, command: &crate::bcs::BcsCommand, body: String) {
+        if self.show_stack {
+            self.lines.push(format!(
+                "{:08X}: {body:<72} // stack=[{}]",
+                command.addr,
+                self.stack_tail(12)
+            ));
+        } else {
+            self.lines.push(format!("{:08X}: {body}", command.addr));
+        }
+    }
+
+    fn stack_tail(&self, limit: usize) -> String {
+        let start = self.stack.len().saturating_sub(limit);
+        let mut values = self.stack[start..].to_vec();
+        if start > 0 {
+            values.insert(0, format!("...{start} more"));
+        }
+        values.join(", ")
+    }
+}
+
+fn command_args(args: &[BcsValue]) -> String {
+    args.iter()
+        .map(format_bcs_value)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_bcs_value(value: &BcsValue) -> String {
+    match value {
+        BcsValue::Int(value) => value.to_string(),
+        BcsValue::Addr(value) => format!("sub_0x{value:08X}"),
+        BcsValue::BaseOffset(value) => format!("base[{value}]"),
+        BcsValue::MemoryAddr(value) => format!("mem[0x{value:08X}]"),
+        BcsValue::Line { file, line } => format!("line({file:?}, {line})"),
+        BcsValue::Arg2 => "arg2".to_string(),
+        BcsValue::Str(value) => format!("{value:?}"),
+        BcsValue::Mul(left, right) => {
+            format!("({} * {})", format_bcs_value(left), format_bcs_value(right))
+        }
+        BcsValue::CheckNote(value) => format!("note({})", format_bcs_value(value)),
+    }
+}
+
+fn bcs_value_i32(value: &BcsValue) -> Option<i32> {
+    match value {
+        BcsValue::Int(value)
+        | BcsValue::Addr(value)
+        | BcsValue::BaseOffset(value)
+        | BcsValue::MemoryAddr(value) => Some(*value),
+        BcsValue::Mul(left, right) => Some(bcs_value_i32(left)? * bcs_value_i32(right)?),
+        BcsValue::CheckNote(value) => bcs_value_i32(value),
+        BcsValue::Line { .. } | BcsValue::Arg2 | BcsValue::Str(_) => None,
+    }
+}
+
+fn bcs_binary_symbol(name: &str) -> &'static str {
+    match name {
+        "add" => "+",
+        "sub" => "-",
+        "mul" => "*",
+        "div" => "/",
+        "mod" => "%",
+        "and" => "&",
+        "or" => "|",
+        "xor" => "^",
+        "shl" => "<<",
+        "shr" | "sar" => ">>",
+        "eq" => "==",
+        "neq" => "!=",
+        "leq" => "<=",
+        "geq" => ">=",
+        "lt" => "<",
+        "gt" => ">",
+        _ => "?",
+    }
 }
 
 struct DecompileState {
@@ -89,12 +351,25 @@ impl DecompileState {
                 let value = self.pop();
                 let ptr = self.pop();
                 self.emit(offset, format!("store{width}({ptr}, {value});"));
+                self.push(value);
             }
             "move_arg" => {
                 let width = operand_u32(instruction).unwrap_or_default();
                 let ptr = self.pop();
                 let value = self.pop();
                 self.emit(offset, format!("store_arg{width}({ptr}, {value});"));
+            }
+            "copy_inline" => {
+                let ptr = self.pop();
+                let bytes = instruction
+                    .operands
+                    .first()
+                    .and_then(|operand| match operand {
+                        BpOperand::Raw(bytes) => Some(bytes.as_slice()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.emit(offset, format!("copy_inline({ptr}, {bytes:?});"));
             }
             "copy_stack" => {
                 let width = operand_u32(instruction).unwrap_or_default();
@@ -162,16 +437,20 @@ impl DecompileState {
                 let value = self.pop();
                 self.push(format!("{name}({value})"));
             }
-            "memcpy" | "memclr" | "memset" | "memcmp" | "strreplace" | "strlen" | "streq"
-            | "strcpy" | "strconcat" | "getchar" | "tolower" | "sprintf" | "malloc" | "free"
-            | "addmemboundary" | "confirm" | "message_box" | "assert" | "dumpmem" => {
+            "memcpy" | "memclr" | "memset" | "memcmp" | "memrepeat" | "memfind" | "strfind"
+            | "strreplace" | "strlen" | "streq" | "strcpy" | "strconcat" | "getchar"
+            | "tolower" | "sprintf" | "malloc" | "free" | "addmemboundary" | "confirm"
+            | "message_box" | "assert" | "dumpmem" => {
                 self.emit_builtin(offset, name);
             }
             "sys1" | "sys2" | "grp1" | "grp2" | "grp3" | "snd1" | "usr1" | "usr2" => {
                 self.emit_dispatch(offset, instruction);
             }
             "script_load" | "script_free" | "script_call" => {
-                self.emit(offset, format!("{name}();"));
+                self.emit(
+                    offset,
+                    format!("{name}({});", format_operands(&instruction.operands)),
+                );
             }
             _ => self.emit(
                 offset,
@@ -196,26 +475,43 @@ impl DecompileState {
         if self.show_stack {
             self.lines.push(format!(
                 "{offset:08X}: {body:<72} // stack=[{}]",
-                self.stack.join(", ")
+                self.stack_tail(12)
             ));
         } else {
             self.lines.push(format!("{offset:08X}: {body}"));
         }
     }
 
+    fn stack_tail(&self, limit: usize) -> String {
+        let len = self.stack.len();
+        let start = len.saturating_sub(limit);
+        let mut values = self.stack[start..].to_vec();
+        if start > 0 {
+            values.insert(0, format!("...{} more", start));
+        }
+        values.join(", ")
+    }
+
     fn emit_builtin(&mut self, offset: u64, name: &str) {
         let arity = match name {
             "strlen" | "getchar" | "tolower" | "malloc" | "free" | "confirm" | "assert" => 1,
-            "memclr" | "streq" | "strcpy" | "message_box" | "dumpmem" => 2,
+            "memclr" | "streq" | "strcpy" | "strfind" | "message_box" | "dumpmem" => 2,
             "memcpy" | "memset" | "memcmp" | "strconcat" | "sprintf" => 3,
-            "strreplace" => 4,
+            "memrepeat" | "memfind" | "strreplace" => 4,
             "addmemboundary" => 3,
             _ => 0,
         };
         let mut args = self.pop_args(arity);
         if matches!(
             name,
-            "memcmp" | "strlen" | "streq" | "getchar" | "malloc" | "confirm"
+            "memcmp"
+                | "memfind"
+                | "strfind"
+                | "strlen"
+                | "streq"
+                | "getchar"
+                | "malloc"
+                | "confirm"
         ) {
             let temp = self.next_temp();
             self.emit(offset, format!("{temp} = {name}({});", args.join(", ")));

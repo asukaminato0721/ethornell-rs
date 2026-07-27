@@ -85,7 +85,12 @@ impl TimelineSystem {
             .unwrap_or_default()
     }
 
-    pub(crate) fn tick(&mut self) {
+    pub(crate) fn contains(&self, handle: i32) -> bool {
+        self.timelines.contains_key(&handle)
+    }
+
+    pub(crate) fn tick(&mut self) -> Vec<i32> {
+        let mut finished = Vec::new();
         for timeline in self.timelines.values_mut() {
             if !timeline.enabled || timeline.finished {
                 continue;
@@ -96,8 +101,10 @@ impl TimelineSystem {
             if timeline.remaining_frames == 0 {
                 timeline.finished = true;
                 timeline.enabled = false;
+                finished.push(timeline.handle);
             }
         }
+        finished
     }
 
     pub(crate) fn poll(&self, handle: i32) -> TimelinePoll {
@@ -123,6 +130,7 @@ impl TimelineSystem {
 
 #[derive(Debug, Clone)]
 struct RuntimeTimeline {
+    handle: i32,
     attachments: Vec<i32>,
     duration_frames: u32,
     remaining_frames: u32,
@@ -131,8 +139,9 @@ struct RuntimeTimeline {
 }
 
 impl RuntimeTimeline {
-    fn new(_handle: i32) -> Self {
+    fn new(handle: i32) -> Self {
         Self {
+            handle,
             attachments: Vec::new(),
             duration_frames: 1,
             remaining_frames: 0,

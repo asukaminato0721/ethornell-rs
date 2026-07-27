@@ -13,11 +13,11 @@ use ethornell_script::{
         infer_program_call_arg_counts, instruction_call_key, scan_program_calls,
         summarize_call_sites, summarize_inferred_arg_counts, CallSite,
     },
-    decompile::{decompile_bp, DecompileOptions},
+    decompile::{decompile_bcs, decompile_bp, DecompileOptions},
     detect_script_format, disassemble_bp, disassemble_file, parse_bp_program, BpInstruction,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -53,6 +53,8 @@ enum Command {
         #[arg(long)]
         game: Option<PathBuf>,
         #[arg(long)]
+        archive: Option<String>,
+        #[arg(long)]
         script: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
@@ -73,7 +75,9 @@ enum Command {
         #[arg(long)]
         game: PathBuf,
         #[arg(long)]
-        script: String,
+        archive: Option<String>,
+        #[arg(long)]
+        script: Option<String>,
         #[arg(long, value_parser = parse_hex_u8)]
         group: u8,
         #[arg(long, value_parser = parse_hex_u16)]
@@ -84,6 +88,8 @@ enum Command {
         after: usize,
         #[arg(long)]
         limit: Option<usize>,
+        #[arg(long)]
+        decompiled: bool,
     },
     Run {
         #[arg(long)]
@@ -94,6 +100,8 @@ enum Command {
         fail_on_stub: bool,
         #[arg(long)]
         force_text_test: bool,
+        #[arg(long)]
+        headless: bool,
         #[arg(long)]
         script: Option<String>,
     },
@@ -169,6 +177,12 @@ enum Command {
         script: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+    },
+    BcsCatalog {
+        #[arg(long)]
+        game: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     AudioScan {
         #[arg(long)]
@@ -311,10 +325,11 @@ fn main() -> anyhow::Result<()> {
         Command::Decompile {
             file,
             game,
+            archive,
             script,
             limit,
             show_stack,
-        } => run_decompile(file, game, script, limit, show_stack)?,
+        } => run_decompile(file, game, archive, script, limit, show_stack)?,
         Command::CallCatalog {
             game,
             json,
@@ -323,18 +338,31 @@ fn main() -> anyhow::Result<()> {
         } => run_call_catalog(game, json, unknown_only, limit_scripts)?,
         Command::CallSites {
             game,
+            archive,
             script,
             group,
             id,
             before,
             after,
             limit,
-        } => run_call_sites(game, &script, group, id, before, after, limit)?,
+            decompiled,
+        } => run_call_sites(
+            game,
+            archive.as_deref(),
+            script.as_deref(),
+            group,
+            id,
+            before,
+            after,
+            limit,
+            decompiled,
+        )?,
         Command::Run {
             game,
             trace,
             fail_on_stub,
             force_text_test,
+            headless,
             script,
         } => {
             let game_root = GameRoot::new(game)?;
@@ -343,6 +371,7 @@ fn main() -> anyhow::Result<()> {
                 trace,
                 fail_on_stub,
                 force_text_test,
+                headless,
                 script,
             })?;
         }
@@ -381,6 +410,7 @@ fn main() -> anyhow::Result<()> {
             script,
             limit,
         } => run_script_info(file, game, script, limit)?,
+        Command::BcsCatalog { game, json } => run_bcs_catalog(game, json)?,
         Command::AudioScan { game, dir, limit } => run_audio_scan(game, dir, limit)?,
         Command::AudioInfo { game, name } => run_audio_info(game, &name)?,
         Command::PlayAudio { game, name } => run_play_audio(game, &name)?,
@@ -766,6 +796,73 @@ fn run_script_info(
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct BcsOpcodeSummary {
+    opcode: String,
+    name: Option<&'static str>,
+    count: usize,
+    scripts: Vec<String>,
+}
+
+fn run_bcs_catalog(game: PathBuf, json: bool) -> anyhow::Result<()> {
+    let manager = ResourceManager::open_game(&game)?;
+    let mut scripts_scanned = 0usize;
+    let mut commands_scanned = 0usize;
+    let mut summaries: BTreeMap<u32, (usize, BTreeSet<String>)> = BTreeMap::new();
+
+    for entry in manager.list() {
+        let Ok(bytes) = manager.read_by_entry_decoded(&entry) else {
+            continue;
+        };
+        let Some(program) = parse_bcs(&bytes) else {
+            continue;
+        };
+        scripts_scanned += 1;
+        commands_scanned += program.commands.len();
+        let label = format!("{}:{}", entry.archive_path.display(), entry.entry_name);
+        for command in program.commands {
+            let (count, scripts) = summaries.entry(command.opcode).or_default();
+            *count += 1;
+            if scripts.len() < 12 {
+                scripts.insert(label.clone());
+            }
+        }
+    }
+
+    let rows = summaries
+        .into_iter()
+        .map(|(opcode, (count, scripts))| BcsOpcodeSummary {
+            opcode: format!("0x{opcode:03X}"),
+            name: ethornell_script::bcs::command_name(opcode),
+            count,
+            scripts: scripts.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "scripts_scanned": scripts_scanned,
+                "commands_scanned": commands_scanned,
+                "opcodes": rows,
+            }))?
+        );
+    } else {
+        println!("bcs_scripts={scripts_scanned} commands={commands_scanned}");
+        for row in rows {
+            println!(
+                "{} count={} name={} samples={}",
+                row.opcode,
+                row.count,
+                row.name.unwrap_or("<unknown>"),
+                row.scripts.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn print_script_summary(label: &str, bytes: &[u8], program: &ethornell_script::BpProgram) {
     let mut calls: BTreeMap<String, usize> = BTreeMap::new();
     for inst in &program.instructions {
@@ -814,6 +911,13 @@ fn print_bcs_summary(
     for warning in program.warnings.iter().take(10) {
         println!("  warning: {warning}");
     }
+    let sub_limit = limit.unwrap_or(usize::MAX);
+    for (index, sub) in program.subs.iter().take(sub_limit).enumerate() {
+        println!("  sub #{index:04} addr=0x{:X} name={}", sub.addr, sub.name);
+    }
+    if program.subs.len() > sub_limit {
+        println!("  ... {} more subs", program.subs.len() - sub_limit);
+    }
     if let Some(limit) = limit {
         for (index, command) in program.commands.iter().take(limit).enumerate() {
             println!(
@@ -842,6 +946,7 @@ fn format_bcs_value(value: &BcsValue) -> String {
         BcsValue::Int(value) => value.to_string(),
         BcsValue::Addr(value) => format!("addr:0x{value:X}"),
         BcsValue::BaseOffset(value) => format!("base:{value}"),
+        BcsValue::MemoryAddr(value) => format!("mem:0x{value:X}"),
         BcsValue::Arg2 => "arg2".to_string(),
         BcsValue::Str(value) => format!("{value:?}"),
         BcsValue::Line { file, line } => format!("line:{file}:{line}"),
@@ -969,6 +1074,7 @@ fn run_vm_trace(
             max_steps,
             trace: !quiet_trace,
             fail_on_stub,
+            collect_diagnostics: true,
         },
     );
     println!("steps={}", report.steps);
@@ -1008,7 +1114,7 @@ impl ethornell_vm::SysApi for VmTraceApi {
                     .read_decoded_from_archive(&archive, &file)
                     .map_err(|err| ethornell_vm::VmError::Runtime(err.to_string()))?;
                 let program = parse_bp_program(Some(format!("{archive}:{file}")), &bytes);
-                return Ok(ethornell_vm::Value::Program(Box::new(program)));
+                return Ok(ethornell_vm::Value::Program(std::sync::Arc::new(program)));
             }
             (0x80, 0x44) => {
                 for _ in 0..3 {
@@ -1021,7 +1127,7 @@ impl ethornell_vm::SysApi for VmTraceApi {
                     .read_decoded_from_archive(&archive, &file)
                     .map_err(|err| ethornell_vm::VmError::Runtime(err.to_string()))?;
                 let program = parse_bp_program(Some(format!("{archive}:{file}")), &bytes);
-                return Ok(ethornell_vm::Value::Program(Box::new(program)));
+                return Ok(ethornell_vm::Value::Program(std::sync::Arc::new(program)));
             }
             (0x80, 0x34) => {
                 let file = pop_vm_string(stack).unwrap_or_else(|| "<unknown>".into());
@@ -1167,6 +1273,7 @@ fn read_header(path: &Path) -> anyhow::Result<Vec<u8>> {
 fn run_decompile(
     file: Option<PathBuf>,
     game: Option<PathBuf>,
+    archive: Option<String>,
     script: Option<String>,
     limit: Option<usize>,
     show_stack: bool,
@@ -1180,10 +1287,17 @@ fn run_decompile(
         let game = game.context("decompile requires <file> or --game <dir> --script <name>")?;
         let script = script.context("decompile --game requires --script <name>")?;
         let manager = ResourceManager::open_game(game)?;
-        (script.clone(), manager.read_decoded(&script)?)
+        let bytes = if let Some(archive) = archive {
+            manager.read_decoded_from_archive(&archive, &script)?
+        } else {
+            manager.read_decoded(&script)?
+        };
+        (script.clone(), bytes)
     };
-    if parse_bcs(&bytes).is_some() {
-        bail!("decompile currently targets BP ._bp scripts; use disasm for BCS scenario files");
+    if let Some(program) = parse_bcs(&bytes) {
+        let text = decompile_bcs(&program, &DecompileOptions { limit, show_stack });
+        println!("{text}");
+        return Ok(());
     }
     let program = parse_bp_program(Some(label), &bytes);
     let text = decompile_bp(&program, &DecompileOptions { limit, show_stack });
@@ -1293,49 +1407,119 @@ fn run_call_catalog(
 
 fn run_call_sites(
     game: PathBuf,
-    script: &str,
+    archive: Option<&str>,
+    script: Option<&str>,
     group: u8,
     id: u16,
     before: usize,
     after: usize,
     limit: Option<usize>,
+    decompiled: bool,
 ) -> anyhow::Result<()> {
     let manager = ResourceManager::open_game(game)?;
-    let bytes = manager.read_decoded(script)?;
-    if parse_bcs(&bytes).is_some() {
-        bail!("call-sites currently targets BP ._bp scripts; use disasm for BCS scenario files");
-    }
-    let program = parse_bp_program(Some(script.to_string()), &bytes);
-    let mut shown = 0usize;
-    for (index, instruction) in program.instructions.iter().enumerate() {
-        let Some(key) = instruction_call_key(instruction) else {
-            continue;
+    let mut programs = Vec::new();
+    if let Some(script) = script {
+        let bytes = if let Some(archive) = archive {
+            manager.read_decoded_from_archive(archive, script)?
+        } else {
+            manager.read_decoded(script)?
         };
-        if key.group != group || key.id != id {
-            continue;
+        if parse_bcs(&bytes).is_some() {
+            bail!(
+                "call-sites currently targets BP ._bp scripts; use disasm for BCS scenario files"
+            );
         }
-        if shown >= limit.unwrap_or(usize::MAX) {
-            break;
+        programs.push((
+            script.to_string(),
+            parse_bp_program(Some(script.to_string()), &bytes),
+        ));
+    } else {
+        let archive_filter = archive.map(|value| value.to_ascii_lowercase());
+        for entry in manager.list() {
+            if !entry.entry_name.to_ascii_lowercase().ends_with("._bp") {
+                continue;
+            }
+            if archive_filter.as_ref().is_some_and(|filter| {
+                entry
+                    .archive_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_ascii_lowercase() != *filter)
+                    .unwrap_or(true)
+            }) {
+                continue;
+            }
+            let Ok(bytes) = manager.read_by_entry_decoded(&entry) else {
+                continue;
+            };
+            if parse_bcs(&bytes).is_some() {
+                continue;
+            }
+            let label = format!("{}:{}", entry.archive_path.display(), entry.entry_name);
+            programs.push((label.clone(), parse_bp_program(Some(label), &bytes)));
         }
-        shown += 1;
-        let start = index.saturating_sub(before);
-        let end = (index + after + 1).min(program.instructions.len());
-        println!(
-            "== {script} call #{shown} group=0x{group:02X} id=0x{id:02X} offset=0x{:08X} argc={} name={}",
-            instruction.offset,
-            key.arg_count()
-                .map(|count| count.to_string())
-                .unwrap_or_else(|| "?".to_string()),
-            key.name().unwrap_or("<unknown>")
-        );
-        for (row, inst) in program.instructions[start..end].iter().enumerate() {
-            let absolute = start + row;
-            let marker = if absolute == index { "=>" } else { "  " };
-            print_call_site_instruction(marker, inst);
+    }
+    let mut shown = 0usize;
+    'programs: for (script, program) in programs {
+        let decompiled_lines = decompiled.then(|| decompiled_lines_by_offset(&program));
+        for (index, instruction) in program.instructions.iter().enumerate() {
+            let Some(key) = instruction_call_key(instruction) else {
+                continue;
+            };
+            if key.group != group || key.id != id {
+                continue;
+            }
+            if shown >= limit.unwrap_or(usize::MAX) {
+                break 'programs;
+            }
+            shown += 1;
+            let start = index.saturating_sub(before);
+            let end = (index + after + 1).min(program.instructions.len());
+            println!(
+                "== {script} call #{shown} group=0x{group:02X} id=0x{id:02X} offset=0x{:08X} argc={} name={}",
+                instruction.offset,
+                key.arg_count()
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                key.name().unwrap_or("<unknown>")
+            );
+            for (row, inst) in program.instructions[start..end].iter().enumerate() {
+                let absolute = start + row;
+                let marker = if absolute == index { "=>" } else { "  " };
+                print_call_site_instruction(marker, inst);
+            }
+            if let Some(lines) = &decompiled_lines {
+                println!("-- decompiled");
+                for inst in &program.instructions[start..end] {
+                    if let Some(line) = lines.get(&inst.offset) {
+                        println!("{line}");
+                    }
+                }
+            }
         }
     }
     println!("matches={shown}");
     Ok(())
+}
+
+fn decompiled_lines_by_offset(program: &ethornell_script::BpProgram) -> BTreeMap<u64, String> {
+    decompile_bp(
+        program,
+        &DecompileOptions {
+            limit: None,
+            show_stack: true,
+        },
+    )
+    .lines()
+    .filter_map(|line| {
+        let offset = line.get(0..8)?;
+        if line.as_bytes().get(8) != Some(&b':') {
+            return None;
+        }
+        let offset = u64::from_str_radix(offset, 16).ok()?;
+        Some((offset, line.to_string()))
+    })
+    .collect()
 }
 
 fn print_call_site_instruction(marker: &str, inst: &BpInstruction) {

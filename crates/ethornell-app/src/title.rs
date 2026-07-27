@@ -1,5 +1,5 @@
-use super::{value_to_i32, RuntimeTraceApi, RuntimeUserControl, INPUT_DESCRIPTOR_ENTER};
-use ethornell_vm::Value;
+use super::{value_to_i32, RuntimeTraceApi, RuntimeUserControl, INPUT_DESCRIPTOR_MOUSE_LEFT};
+use ethornell_vm::{GraphInputDescriptor, Value};
 
 impl RuntimeTraceApi {
     pub(crate) fn hit_test_user_controls(&self, point: (f32, f32)) -> Option<i32> {
@@ -101,7 +101,8 @@ impl RuntimeTraceApi {
         self.title_child_program_active = false;
         self.title_child_program = None;
         self.title_scenario_requested = false;
-        self.user_controls.retain(|_, control| !control.title_only);
+        self.user_controls
+            .retain(|_, control| control.owner_id == crate::text::MESSAGE_CONTROL_OWNER_ID);
         self.text_nodes.retain(|id, _| *id < 50_000);
         self.clear_title_graph_layers();
         tracing::info!(control = self.last_hit_control, file, "title ui departed");
@@ -134,36 +135,72 @@ impl RuntimeTraceApi {
         ));
     }
 
-    pub(crate) fn seed_title_controls(&mut self) {
-        // title._bp callback table at 0x1357. The visual order in
-        // SGTitle000000 is not the numeric callback order: index 1 opens the
-        // load/user-data window, while index 5 starts from the first scenario.
-        const TITLE_BUTTONS: [(i32, i32, i32, f32, f32, f32, f32); 7] = [
-            (0, 6164, 0, 141.0, 526.0, 224.0, 54.0),
-            (1, 6154, 5, 399.0, 526.0, 224.0, 54.0),
-            (2, 6159, 1, 657.0, 526.0, 224.0, 54.0),
-            (3, 6184, 2, 915.0, 526.0, 224.0, 54.0),
-            (4, 6169, 7, 271.0, 604.0, 224.0, 54.0),
-            (5, 6174, 3, 529.0, 604.0, 224.0, 54.0),
-            (6, 6179, 6, 787.0, 604.0, 224.0, 54.0),
-        ];
-        for (slot, object_id, logical, x, y, width, height) in TITLE_BUTTONS {
+    pub(crate) fn observe_title_graph_event(&mut self, event: [i32; 3]) {
+        if event[0] != 0x1000_0006 || !self.title_ui_active || self.has_title_child_render_context()
+        {
+            return;
+        }
+        let payload = event[1] & 0xffff;
+        self.last_hit_control = event[1];
+        self.last_hit_payload = payload;
+        self.title_scenario_requested = is_title_scenario_callback(payload);
+        self.trace_graph(format!(
+            "title graph release payload={payload} scenario={}",
+            self.title_scenario_requested
+        ));
+    }
+
+    pub(crate) fn apply_title_graph_payload_override(&mut self, packed: i32) -> i32 {
+        if !self.title_ui_active || self.has_title_child_render_context() {
+            return packed;
+        }
+        let Some(payload) = self.pending_title_payload_override.take() else {
+            return packed;
+        };
+        (packed & !0xffff) | (payload & 0xffff)
+    }
+
+    pub(crate) fn sync_title_controls_from_input(
+        &mut self,
+        owner_id: i32,
+        descriptor: &GraphInputDescriptor,
+    ) {
+        if !self.title_ui_active || self.has_title_child_render_context() {
+            return;
+        }
+        self.user_controls.retain(|_, control| !control.title_only);
+        for region in descriptor
+            .regions
+            .iter()
+            .filter(|region| region.enabled_depth != 0 && region.width > 0 && region.height > 0)
+        {
+            let payload = region.index & 0xffff;
+            let id = title_object_for_payload(payload)
+                .unwrap_or_else(|| owner_id.saturating_mul(100).saturating_add(payload));
             self.user_controls.insert(
-                slot,
+                id,
                 RuntimeUserControl {
-                    id: object_id,
-                    owner_id: object_id,
-                    payload: logical & 0xffff,
-                    x,
-                    y,
-                    width,
-                    height,
+                    id,
+                    owner_id,
+                    payload,
+                    x: region.x as f32,
+                    y: region.y as f32,
+                    width: region.width as f32,
+                    height: region.height as f32,
+                    normal_resource: region.normal_resource,
+                    selected_resource: region.selected_resource,
                     enabled: true,
                     title_only: true,
                 },
             );
             self.trace_graph(format!(
-                "title control slot={slot} object=#{object_id} payload={logical} x={x:.0} y={y:.0} w={width:.0} h={height:.0}"
+                "title input object=#{owner_id} control=#{id} payload={payload} x={} y={} w={} h={} normal=#{} selected=#{}",
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                region.normal_resource,
+                region.selected_resource
             ));
         }
     }
@@ -186,6 +223,60 @@ impl RuntimeTraceApi {
         id: u16,
         stack: &mut Vec<Value>,
     ) -> ethornell_vm::VmResult<Option<Value>> {
+        if let Some(result) = self.dispatch_native_effect(group, id, stack) {
+            return result.map(Some);
+        }
+        if group == 0xb0 {
+            match id {
+                0x02 => {
+                    // The default user subsystem initializer is used when IPL
+                    // has no host-specific pair to pass to 0x03.
+                    return Ok(Some(Value::Int(0)));
+                }
+                0x03 => {
+                    let _host_context = pop_user_args(stack, 2)?;
+                    return Ok(Some(Value::Int(0)));
+                }
+                0x06 => {
+                    // Every testcase callsite uses this zero-argument boolean
+                    // immediately before processing window or pointer input.
+                    let enabled = !self.input_requires_focus || self.window_focused;
+                    return Ok(Some(Value::Int(i32::from(enabled))));
+                }
+                _ => {}
+            }
+            let argc = match id {
+                0x08 => 7,
+                0x10 => 5,
+                0x11 | 0x17 => 1,
+                0x14 | 0x1c => 2,
+                0x19 => 6,
+                0x82 => 3,
+                0x8c => 4,
+                _ => return Ok(None),
+            };
+            let args = pop_user_args(stack, argc)?;
+            let result = match id {
+                0x08 => Some(Value::Int(self.alloc_object())),
+                0x10 | 0x82 | 0x8c => Some(Value::Int(0)),
+                0x17 => {
+                    let (x, y) = self
+                        .mouse_pos
+                        .map(|(x, y)| (x.round() as i32, y.round() as i32))
+                        .unwrap_or_default();
+                    stack.push(Value::Int(x));
+                    Some(Value::Int(y))
+                }
+                _ => Some(Value::None),
+            };
+            if self.debug_graph {
+                self.trace_graph(format!(
+                    "debug user 0x{id:02X} args={:?}",
+                    args.iter().map(value_to_i32).collect::<Vec<_>>()
+                ));
+            }
+            return Ok(result);
+        }
         if group != 0xc0 {
             return Ok(None);
         }
@@ -196,30 +287,83 @@ impl RuntimeTraceApi {
             0x05 => 6,
             0x09 | 0x0a | 0x0c | 0x0d => 2,
             0x0b => 10,
-            0x0f | 0x1f => 1,
+            0x17 => 1,
+            0x0f | 0x1f | 0x41 => 1,
             0x18 => 7,
             0x28 => 4,
             0x29 => 16,
             0x2d => 18,
+            0x10 => 12,
+            0x1a => 8,
+            0x1b => 3,
+            0x20 => 4,
+            0x40 | 0x42 | 0x43 => 2,
+            0x44 => 6,
+            0x45 => 7,
+            0x46 | 0x47 | 0x48 | 0x49 | 0x4a | 0x4b | 0x4e => 2,
+            0x4c | 0x4d => 4,
             0x4f => 2,
             _ => return Ok(None),
         };
         let args = pop_user_args(stack, argc)?;
+        if id == 0x00 {
+            let height = args.first().map(value_to_i32).unwrap_or(720).max(1);
+            let width = args.get(1).map(value_to_i32).unwrap_or(1280).max(1);
+            self.screen_width = width;
+            self.screen_height = height;
+            let handle = self.alloc_object();
+            self.set_current_graph_object(handle);
+            self.trace_graph(format!(
+                "create screen graph object #{handle} {width}x{height}"
+            ));
+            return Ok(Some(Value::Int(handle)));
+        }
+        if id == 0x17 {
+            let target = args.first().map(value_to_i32).unwrap_or_default();
+            let (x, y) = self
+                .graph_object_layers
+                .get(&target)
+                .and_then(|layers| layers.iter().next())
+                .and_then(|layer| self.graph_layers.get(layer))
+                .map(|layer| (layer.x.round() as i32, layer.y.round() as i32))
+                .unwrap_or_default();
+            stack.push(Value::Int(x));
+            return Ok(Some(Value::Int(y)));
+        }
         if self.title_ui_active && !self.title_child_program_active {
             if self.debug_graph {
                 self.trace_graph(format!("title preload ignored user2 0x{id:02X}"));
             }
             return Ok(Some(Value::None));
         }
+        match self.effects.call(group, id, &args) {
+            crate::effects::EffectCall::Handled(value) => {
+                self.trace_graph(format!(
+                    "effect user 0x{id:02X} args={:?} result={value:?}",
+                    args.iter().map(value_to_i32).collect::<Vec<_>>()
+                ));
+                return Ok(Some(value.map(Value::Int).unwrap_or(Value::None)));
+            }
+            crate::effects::EffectCall::Unhandled => {}
+        }
         match id {
             0x01 => {
                 if let Some(target) = args.first().map(value_to_i32) {
-                    self.trace_graph(format!("user object register #{target}"));
-                    let control = self.user_controls.entry(target).or_default();
-                    control.id = target;
-                    control.owner_id = target;
-                    control.payload = target;
-                    control.title_only = false;
+                    self.user_controls
+                        .retain(|_, control| control.title_only || control.owner_id != target);
+                    self.trace_graph(format!("user object release #{target}"));
+                }
+            }
+            0x41 => {
+                if let Some(target) = args.first().map(value_to_i32) {
+                    self.user_controls
+                        .retain(|_, control| control.title_only || control.owner_id != target);
+                    self.trace_graph(format!("user object release-ex #{target}"));
+                }
+            }
+            0x0f => {
+                if let Some(target) = args.first().map(value_to_i32) {
+                    self.trace_graph(format!("user object commit #{target}"));
                 }
             }
             0x04 if args.len() >= 2 => {
@@ -243,7 +387,7 @@ impl RuntimeTraceApi {
                     Some((x, y, width, height)) => {
                         self.user_controls.retain(|_, control| {
                             control.title_only
-                                || control.owner_id == target
+                                || control.owner_id != target
                                 || control.payload != slot
                         });
                         (
@@ -370,7 +514,7 @@ impl RuntimeTraceApi {
         self.pending_object_state = Some(point);
         self.pending_title_payload_override = self.auto_title_payload_override;
         self.pending_input_state = Some(0x1000_0002);
-        self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_ENTER);
+        self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
         self.auto_title_click_done = true;
         self.auto_title_release_after_state = true;
         tracing::info!(
@@ -390,15 +534,17 @@ impl RuntimeTraceApi {
 pub(crate) fn title_payload_for_control_text(text: &str) -> Option<i32> {
     let compact = text.trim();
     if compact.contains("オートセーブ") {
-        Some(0)
-    } else if compact.contains("シナリオを序章") {
         Some(5)
+    } else if compact.contains("シナリオを序章") {
+        Some(0)
     } else if compact.contains("データを選んで再開") {
         Some(1)
     } else if compact.contains("好きな章") || compact.contains("Ｈシーン") {
-        Some(3)
-    } else if compact.contains("各種環境設定") {
         Some(7)
+    } else if compact.contains("各種環境設定") {
+        Some(2)
+    } else if compact.contains("おまけ") || compact.eq_ignore_ascii_case("omake") {
+        Some(3)
     } else if compact.contains("プログラムを終了") {
         Some(6)
     } else {
@@ -407,24 +553,32 @@ pub(crate) fn title_payload_for_control_text(text: &str) -> Option<i32> {
 }
 
 pub(crate) fn title_object_for_control_text(text: &str) -> Option<i32> {
-    match title_payload_for_control_text(text)? {
-        0 => Some(6164),
+    title_object_for_payload(title_payload_for_control_text(text)?)
+}
+
+fn title_object_for_payload(payload: i32) -> Option<i32> {
+    match payload & 0xffff {
+        0 => Some(6154),
         1 => Some(6159),
-        2 => Some(6184),
-        3 => Some(6184),
-        5 => Some(6154),
+        2 => Some(6169),
+        3 => Some(6174),
+        5 => Some(6164),
         6 => Some(6179),
-        7 => Some(6169),
+        7 => Some(6184),
         _ => None,
     }
 }
 
-fn is_title_scenario_callback(payload: i32) -> bool {
+pub(crate) fn title_payload_is_scenario(payload: i32) -> bool {
     matches!(payload & 0xffff, 0 | 5 | 8)
 }
 
+fn is_title_scenario_callback(payload: i32) -> bool {
+    title_payload_is_scenario(payload)
+}
+
 fn is_primary_title_control(control: &RuntimeUserControl) -> bool {
-    control.title_only && control.owner_id == control.id
+    control.title_only
 }
 
 fn avg_control_bounds(slot: i32) -> Option<(f32, f32, f32, f32)> {
@@ -466,4 +620,26 @@ fn pop_user_args(stack: &mut Vec<Value>, count: usize) -> ethornell_vm::VmResult
         args.push(stack.pop().ok_or(ethornell_vm::VmError::StackUnderflow)?);
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{title_object_for_control_text, title_payload_for_control_text};
+
+    #[test]
+    fn title_text_uses_native_descriptor_callback_order() {
+        let cases = [
+            ("シナリオを序章からはじめる", 0, 6154),
+            ("データを選んで再開", 1, 6159),
+            ("オートセーブデータから再開", 5, 6164),
+            ("各種環境設定", 2, 6169),
+            ("おまけ", 3, 6174),
+            ("プログラムを終了します", 6, 6179),
+            ("好きな章から始めることができます", 7, 6184),
+        ];
+        for (text, payload, object) in cases {
+            assert_eq!(title_payload_for_control_text(text), Some(payload));
+            assert_eq!(title_object_for_control_text(text), Some(object));
+        }
+    }
 }

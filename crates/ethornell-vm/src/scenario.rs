@@ -5,6 +5,8 @@ const BCS_MAGIC: &[u8] = b"BurikoCompiledScriptVer1.00\0";
 const BCS_RET_OPCODE: u32 = 0x1b;
 const SCRIPT_CODE_BASE_SLOT: u32 = 0x0004_ca78;
 const SCRIPT_CURRENT_OFFSET_SLOT: u32 = 0x0004_cc70;
+const SCRIPT_FUNCTION_TABLE_SLOT: u32 = 1768;
+const SCRIPT_INFO_COUNT_SLOT: u32 = 314_072 + 26_044;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedBcsRange {
@@ -30,6 +32,7 @@ impl Vm {
         let direct_strings = self.shadow_bcs_string_refs(base, &program.commands);
         let (sound_strings, text_strings, visual_strings) =
             self.shadow_bcs_command_refs(base, &program.commands);
+        let registered_subs = self.register_bcs_subs(base, &program)?;
         tracing::info!(
             script_name,
             bytes = bytes.len(),
@@ -43,6 +46,7 @@ impl Vm {
             sound_strings,
             text_strings,
             visual_strings,
+            registered_subs,
             "ScenarioLoadedFilePreprocess"
         );
         Ok(())
@@ -53,7 +57,7 @@ impl Vm {
         script_name: &str,
         body_length: usize,
     ) -> VmResult<()> {
-        let Some((base, bytes)) = self.find_loaded_bcs(body_length) else {
+        let Some((base, bytes)) = self.find_loaded_bcs(script_name, body_length) else {
             tracing::warn!(
                 script_name,
                 body_length,
@@ -75,6 +79,7 @@ impl Vm {
         let direct_strings = self.shadow_bcs_string_refs(base, &program.commands);
         let (sound_strings, text_strings, visual_strings) =
             self.shadow_bcs_command_refs(base, &program.commands);
+        let registered_subs = self.register_bcs_subs(base, &program)?;
 
         tracing::info!(
             script_name,
@@ -89,6 +94,7 @@ impl Vm {
             sound_strings,
             text_strings,
             visual_strings,
+            registered_subs,
             "ScenarioCodePreprocess"
         );
         Ok(())
@@ -106,11 +112,17 @@ impl Vm {
             return None;
         }
 
+        let ptr_addr = Self::memory_addr(ptr);
+        if self.loaded_bcs_ranges.iter().any(|range| {
+            ptr_addr >= range.base.saturating_add(range.code_start)
+                && ptr_addr < range.base.saturating_add(range.code_end)
+        }) {
+            return None;
+        }
+
         let range = self.loaded_bcs_ranges.iter().find(|range| {
             code_base_addr >= range.base
                 && code_base_addr < range.base.saturating_add(range.total_len)
-                && current_offset >= range.code_end
-                && current_offset < range.total_len
         })?;
 
         if std::env::var_os("DEBUG").is_some() {
@@ -141,7 +153,10 @@ impl Vm {
             script_name: script_name.to_string(),
             base,
             code_start: program.code_start as u32,
-            code_end: program.code_end as u32,
+            code_end: program
+                .resolver_end
+                .unwrap_or(program.code_end)
+                .max(program.executable_end) as u32,
             total_len: total_len as u32,
         });
     }
@@ -191,8 +206,10 @@ impl Vm {
         written
     }
 
-    fn find_loaded_bcs(&self, body_length: usize) -> Option<(u32, Vec<u8>)> {
+    fn find_loaded_bcs(&self, script_name: &str, body_length: usize) -> Option<(u32, Vec<u8>)> {
         let mut search_from = 0usize;
+        let mut fallback = None;
+        let mut matched = None;
         while search_from < self.memory.len() {
             let haystack = &self.memory[search_from..];
             let Some(relative) = find_bytes(haystack, BCS_MAGIC) else {
@@ -205,13 +222,56 @@ impl Vm {
             let total_len = body_start.checked_add(body_length)?;
             if start.checked_add(total_len)? <= self.memory.len() {
                 let bytes = self.memory[start..start + total_len].to_vec();
-                if parse_bcs(&bytes).is_some() {
-                    return Some((start as u32, bytes));
+                if let Some(program) = parse_bcs(&bytes) {
+                    fallback = Some((start as u32, bytes.clone()));
+                    if bcs_matches_script_name(&program, script_name) {
+                        matched = Some((start as u32, bytes));
+                    }
                 }
             }
             search_from = start.saturating_add(BCS_MAGIC.len());
         }
-        None
+        matched.or(fallback)
+    }
+
+    fn register_bcs_subs(
+        &mut self,
+        bcs_base: u32,
+        program: &ethornell_script::bcs::BcsProgram,
+    ) -> VmResult<usize> {
+        if program.subs.is_empty() {
+            return Ok(0);
+        }
+        let Some(handle) = self.read_raw_u32(SCRIPT_FUNCTION_TABLE_SLOT) else {
+            return Ok(0);
+        };
+        if handle == 0 || !self.record_tables.contains_key(&Self::value_key(handle)) {
+            tracing::warn!(subs = program.subs.len(), "BCS function table is not open");
+            return Ok(0);
+        }
+
+        let script_index = self
+            .read_raw_u32(SCRIPT_INFO_COUNT_SLOT)
+            .unwrap_or_default();
+        let bcs_base = Self::memory_addr(bcs_base);
+        if std::env::var_os("DEBUG").is_some() {
+            tracing::info!(
+                script_index,
+                bcs_base = format_args!("0x{bcs_base:08X}"),
+                subs = program.subs.len(),
+                "ScenarioRegisterFunctions"
+            );
+        }
+        let descriptor = self.alloc_heap(8);
+        for sub in &program.subs {
+            self.write_int(descriptor, 2, script_index)?;
+            let address = bcs_base
+                .saturating_add(program.code_start as u32)
+                .saturating_add(sub.addr);
+            self.write_int(descriptor.saturating_add(4), 2, address)?;
+            self.sys_record_table_copy(handle, Value::Str(sub.name.clone()), descriptor)?;
+        }
+        Ok(program.subs.len())
     }
 
     fn shadow_command_strings(
@@ -256,6 +316,24 @@ impl Vm {
     }
 }
 
+fn bcs_matches_script_name(program: &ethornell_script::bcs::BcsProgram, script_name: &str) -> bool {
+    let wanted = normalized_script_stem(script_name);
+    program.commands.iter().any(|command| {
+        command.args.iter().any(|arg| match arg {
+            BcsValue::Line { file, .. } => normalized_script_stem(file) == wanted,
+            _ => false,
+        })
+    })
+}
+
+fn normalized_script_stem(name: &str) -> String {
+    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    leaf.rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(leaf)
+        .to_ascii_lowercase()
+}
+
 fn value_text(value: &BcsValue) -> Option<&str> {
     match value {
         BcsValue::Str(text) => Some(text.as_str()),
@@ -272,4 +350,63 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn read_u32(buf: &[u8], offset: usize) -> Option<u32> {
     let bytes = buf.get(offset..offset + 4)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guarded_fetch_returns_ret_even_after_the_loaded_file_boundary() {
+        let mut vm = Vm::new();
+        let raw_base = 0x1220_0614u32;
+        let current_offset = 0x0001_0000u32;
+        vm.memory[SCRIPT_CODE_BASE_SLOT as usize..SCRIPT_CODE_BASE_SLOT as usize + 4]
+            .copy_from_slice(&raw_base.to_le_bytes());
+        vm.memory[SCRIPT_CURRENT_OFFSET_SLOT as usize..SCRIPT_CURRENT_OFFSET_SLOT as usize + 4]
+            .copy_from_slice(&current_offset.to_le_bytes());
+        vm.loaded_bcs_ranges.push(LoadedBcsRange {
+            script_name: "main".into(),
+            base: Vm::memory_addr(raw_base),
+            code_start: 0x60,
+            code_end: 0x0a98,
+            total_len: 3003,
+        });
+
+        assert_eq!(
+            vm.scenario_guarded_read_int(raw_base + current_offset, 2),
+            Some(BCS_RET_OPCODE)
+        );
+    }
+
+    #[test]
+    fn guarded_fetch_allows_code_in_another_bcs_in_the_same_arena() {
+        let mut vm = Vm::new();
+        let raw_base = 0x1220_0614u32;
+        let target_base = 0x1224_6084u32;
+        let target_offset = target_base.wrapping_sub(raw_base).saturating_add(0x7a78);
+        vm.memory[SCRIPT_CODE_BASE_SLOT as usize..SCRIPT_CODE_BASE_SLOT as usize + 4]
+            .copy_from_slice(&raw_base.to_le_bytes());
+        vm.memory[SCRIPT_CURRENT_OFFSET_SLOT as usize..SCRIPT_CURRENT_OFFSET_SLOT as usize + 4]
+            .copy_from_slice(&target_offset.to_le_bytes());
+        vm.loaded_bcs_ranges.push(LoadedBcsRange {
+            script_name: "main".into(),
+            base: Vm::memory_addr(raw_base),
+            code_start: 0x60,
+            code_end: 0x0ae0,
+            total_len: 3003,
+        });
+        vm.loaded_bcs_ranges.push(LoadedBcsRange {
+            script_name: "function".into(),
+            base: Vm::memory_addr(target_base),
+            code_start: 0x550,
+            code_end: 0x7c44,
+            total_len: 63_940,
+        });
+
+        assert_eq!(
+            vm.scenario_guarded_read_int(raw_base.wrapping_add(target_offset), 2),
+            None
+        );
+    }
 }

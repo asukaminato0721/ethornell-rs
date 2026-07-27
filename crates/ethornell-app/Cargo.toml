@@ -11,7 +11,9 @@ ethornell-render = { path = "../ethornell-render" }
 ethornell-audio = { path = "../ethornell-audio" }
 ethornell-script = { path = "../ethornell-script" }
 ethornell-vm = { path = "../ethornell-vm" }
+na_mpeg2_decoder = { path = "../na_mpeg2_decoder", default-features = false, features = ["video-only"] }
 ab_glyph.workspace = true
+encoding_rs.workspace = true
 pollster.workspace = true
 tracing.workspace = true
 winit.workspace = true

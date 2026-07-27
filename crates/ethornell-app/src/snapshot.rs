@@ -8,10 +8,39 @@ const SNAPSHOT_WIDTH: u32 = 1280;
 const SNAPSHOT_HEIGHT: u32 = 720;
 
 pub(crate) fn write_runtime_snapshot(api: &RuntimeTraceApi, path: &Path) -> Result<()> {
+    if let Some(directory) = std::env::var_os("ETHORNELL_HEADLESS_DUMP_IMAGES_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory)?;
+        for (key, image) in &api.graph_images {
+            let name = key
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+                .collect::<String>();
+            write_rgba_png(image, &directory.join(format!("{name}.png")))?;
+        }
+    }
+    let out = compose_runtime_frame(api, true);
+    write_rgba_png(&out, path)
+}
+
+pub(crate) fn runtime_frame_size(api: &RuntimeTraceApi) -> (u32, u32) {
+    let width = u32::try_from(api.screen_width)
+        .ok()
+        .filter(|width| *width > 0)
+        .unwrap_or(SNAPSHOT_WIDTH);
+    let height = u32::try_from(api.screen_height)
+        .ok()
+        .filter(|height| *height > 0)
+        .unwrap_or(SNAPSHOT_HEIGHT);
+    (width, height)
+}
+
+pub(crate) fn compose_runtime_frame(api: &RuntimeTraceApi, include_text: bool) -> DecodedImage {
+    let (width, height) = runtime_frame_size(api);
     let mut out = DecodedImage {
-        width: SNAPSHOT_WIDTH,
-        height: SNAPSHOT_HEIGHT,
-        rgba: vec![0; SNAPSHOT_WIDTH as usize * SNAPSHOT_HEIGHT as usize * 4],
+        width,
+        height,
+        rgba: vec![0; width as usize * height as usize * 4],
     };
     for px in out.rgba.chunks_exact_mut(4) {
         px.copy_from_slice(&[0, 0, 0, 255]);
@@ -36,16 +65,22 @@ pub(crate) fn write_runtime_snapshot(api: &RuntimeTraceApi, path: &Path) -> Resu
         );
     }
 
-    for node in api.text_nodes.values() {
-        if api.should_draw_text_node(node) {
-            draw_text_node(&mut out, node);
+    if include_text && std::env::var_os("ETHORNELL_SNAPSHOT_HIDE_TEXT").is_none() {
+        for node in api.text_nodes.values() {
+            if api.should_draw_text_node(node) {
+                draw_text_node(&mut out, node, api.graph_defaults.shadow());
+            }
         }
     }
 
-    write_rgba_png(&out, path)
+    out
 }
 
-fn draw_text_node(dst: &mut DecodedImage, node: &crate::text::RuntimeTextNode) {
+fn draw_text_node(
+    dst: &mut DecodedImage,
+    node: &crate::text::RuntimeTextNode,
+    shadow: Option<(i32, i32, f32)>,
+) {
     let Some(font) = snapshot_font() else {
         draw_fallback_text(dst, node);
         return;
@@ -53,7 +88,7 @@ fn draw_text_node(dst: &mut DecodedImage, node: &crate::text::RuntimeTextNode) {
     let scale = PxScale::from(node.size.max(12.0));
     let scaled = font.as_scaled(scale);
     let line_height = (node.size * 1.35).max(18.0);
-    let max_x = (SNAPSHOT_WIDTH as f32 - 36.0).max(node.x + 64.0);
+    let max_x = (dst.width as f32 - 36.0).max(node.x + 64.0);
     let mut x = node.x;
     let mut y = node.y + scaled.ascent();
 
@@ -70,15 +105,53 @@ fn draw_text_node(dst: &mut DecodedImage, node: &crate::text::RuntimeTextNode) {
             y += line_height;
         }
         let glyph = glyph_id.with_scale_and_position(scale, point(x, y));
-        draw_glyph(
-            dst,
-            font,
-            glyph.clone(),
-            [0.0, 0.0, 0.0, node.color[3] * 0.75],
-            2,
-            2,
-        );
+        if let Some((shadow_x, shadow_y, shadow_alpha)) = shadow {
+            draw_glyph(
+                dst,
+                font,
+                glyph.clone(),
+                [0.0, 0.0, 0.0, node.color[3] * shadow_alpha],
+                shadow_x,
+                shadow_y,
+            );
+        }
         draw_glyph(dst, font, glyph, node.color, 0, 0);
+        x += advance;
+    }
+
+    for (ruby, x, y, size) in crate::text::ruby_draw_runs(node) {
+        draw_text_run(dst, font, &ruby, x, y, size, node.color, shadow);
+    }
+}
+
+fn draw_text_run(
+    dst: &mut DecodedImage,
+    font: &FontArc,
+    text: &str,
+    mut x: f32,
+    y: f32,
+    size: f32,
+    color: [f32; 4],
+    shadow: Option<(i32, i32, f32)>,
+) {
+    let scale = PxScale::from(size);
+    let scaled = font.as_scaled(scale);
+    let baseline = y + scaled.ascent();
+    for ch in text.chars() {
+        let glyph_id = font.glyph_id(ch);
+        let advance = scaled.h_advance(glyph_id).max(size * 0.5);
+        let glyph = glyph_id.with_scale_and_position(scale, point(x, baseline));
+        if let Some((shadow_x, shadow_y, shadow_alpha)) = shadow {
+            draw_glyph(
+                dst,
+                font,
+                glyph.clone(),
+                [0.0, 0.0, 0.0, color[3] * shadow_alpha],
+                shadow_x,
+                shadow_y,
+            );
+        }
+        draw_glyph(dst, font, glyph, color, 0, 0);
         x += advance;
     }
 }
@@ -86,16 +159,14 @@ fn draw_text_node(dst: &mut DecodedImage, node: &crate::text::RuntimeTextNode) {
 fn snapshot_font() -> Option<&'static FontArc> {
     static FONT: OnceLock<Option<FontArc>> = OnceLock::new();
     FONT.get_or_init(|| {
-        let candidates = [
-            std::env::var("ETHORNELL_SNAPSHOT_FONT").ok(),
-            Some("/System/Library/Fonts/Supplemental/Arial Unicode.ttf".to_string()),
-            Some("/System/Library/Fonts/SFNS.ttf".to_string()),
-        ];
-        candidates
-            .into_iter()
-            .flatten()
-            .filter_map(|path| std::fs::read(path).ok())
-            .find_map(|bytes| FontArc::try_from_vec(bytes).ok())
+        if let Some(font) = std::env::var("ETHORNELL_SNAPSHOT_FONT")
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| FontArc::try_from_vec(bytes).ok())
+        {
+            return Some(font);
+        }
+        ethornell_render::load_system_cjk_font().ok()
     })
     .as_ref()
 }
@@ -136,7 +207,7 @@ fn draw_fallback_text(dst: &mut DecodedImage, node: &crate::text::RuntimeTextNod
     let char_w = (node.size * 0.55).max(8.0) as i32;
     let char_h = (node.size * 0.85).max(12.0) as i32;
     for ch in node.text.chars() {
-        if ch == '\n' || x + char_w >= SNAPSHOT_WIDTH as i32 - 36 {
+        if ch == '\n' || x + char_w >= dst.width as i32 - 36 {
             x = node.x as i32;
             y += (node.size * 1.35).max(18.0) as i32;
             if ch == '\n' {

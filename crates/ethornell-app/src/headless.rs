@@ -27,7 +27,9 @@ pub struct HeadlessInputScript {
 
 impl HeadlessInputScript {
     pub fn from_env() -> Option<Self> {
-        let source = std::env::var("ETHORNELL_HEADLESS_SCRIPT").ok()?;
+        let source = std::env::var("ETHORNELL_INPUT_SCRIPT")
+            .or_else(|_| std::env::var("ETHORNELL_HEADLESS_SCRIPT"))
+            .ok()?;
         match Self::parse(&source) {
             Ok(script) => Some(script),
             Err(err) => {

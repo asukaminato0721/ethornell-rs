@@ -768,6 +768,7 @@ name = "ethornell-app"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "encoding_rs",
  "ethornell-archive",
  "ethornell-audio",
  "ethornell-core",
@@ -775,6 +776,7 @@ dependencies = [
  "ethornell-render",
  "ethornell-script",
  "ethornell-vm",
+ "na_mpeg2_decoder",
  "pollster",
  "tracing",
  "winit",

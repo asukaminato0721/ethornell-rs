@@ -26,3 +26,4 @@ rustc-ice-*.txt
 out/
 reverse/
 testcase/
+pack_source.sh
