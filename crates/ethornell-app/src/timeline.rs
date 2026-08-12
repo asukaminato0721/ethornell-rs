@@ -1,3 +1,4 @@
+use crate::timing::duration_ms_to_ticks;
 use ethornell_vm::Value;
 use std::collections::BTreeMap;
 
@@ -20,7 +21,7 @@ impl TimelineSystem {
         timeline.configure(args);
         Some(TimelineEvent::Configured {
             handle,
-            duration: timeline.duration_frames,
+            duration: timeline.duration_ticks,
         })
     }
 
@@ -48,15 +49,21 @@ impl TimelineSystem {
             .timelines
             .entry(handle)
             .or_insert_with(|| RuntimeTimeline::new(handle));
-        timeline.enabled = enabled;
-        if enabled {
-            timeline.finished = false;
-            timeline.remaining_frames = timeline.duration_frames;
+        if enabled && timeline.duration_ticks == 0 {
+            timeline.enabled = false;
+            timeline.finished = true;
+            timeline.remaining_ticks = 0;
+        } else {
+            timeline.enabled = enabled;
+            if enabled {
+                timeline.finished = false;
+                timeline.remaining_ticks = timeline.duration_ticks;
+            }
         }
         TimelineEvent::Enabled {
             handle,
-            enabled,
-            remaining: timeline.remaining_frames,
+            enabled: timeline.enabled,
+            remaining: timeline.remaining_ticks,
         }
     }
 
@@ -65,16 +72,15 @@ impl TimelineSystem {
             .timelines
             .entry(handle)
             .or_insert_with(|| RuntimeTimeline::new(handle));
-        timeline.duration_frames = duration_to_frames(duration_ms);
-        if timeline.enabled && !timeline.finished {
-            timeline.remaining_frames = timeline.duration_frames.max(1);
-        } else {
-            timeline.remaining_frames = timeline.duration_frames;
-            timeline.finished = timeline.duration_frames == 0;
+        timeline.duration_ticks = duration_ms_to_ticks(duration_ms);
+        timeline.remaining_ticks = timeline.duration_ticks;
+        timeline.finished = timeline.duration_ticks == 0;
+        if timeline.finished {
+            timeline.enabled = false;
         }
         TimelineEvent::Configured {
             handle,
-            duration: timeline.duration_frames,
+            duration: timeline.duration_ticks,
         }
     }
 
@@ -95,10 +101,10 @@ impl TimelineSystem {
             if !timeline.enabled || timeline.finished {
                 continue;
             }
-            if timeline.remaining_frames > 0 {
-                timeline.remaining_frames -= 1;
+            if timeline.remaining_ticks > 0 {
+                timeline.remaining_ticks -= 1;
             }
-            if timeline.remaining_frames == 0 {
+            if timeline.remaining_ticks == 0 {
                 timeline.finished = true;
                 timeline.enabled = false;
                 finished.push(timeline.handle);
@@ -132,8 +138,8 @@ impl TimelineSystem {
 struct RuntimeTimeline {
     handle: i32,
     attachments: Vec<i32>,
-    duration_frames: u32,
-    remaining_frames: u32,
+    duration_ticks: u32,
+    remaining_ticks: u32,
     enabled: bool,
     finished: bool,
 }
@@ -143,8 +149,8 @@ impl RuntimeTimeline {
         Self {
             handle,
             attachments: Vec::new(),
-            duration_frames: 1,
-            remaining_frames: 0,
+            duration_ticks: 1,
+            remaining_ticks: 0,
             enabled: false,
             finished: true,
         }
@@ -159,11 +165,11 @@ impl RuntimeTimeline {
             .copied()
             .find(|value| *value > 0)
             .unwrap_or(1);
-        self.duration_frames = duration_to_frames(duration);
+        self.duration_ticks = duration_ms_to_ticks(duration);
         if !self.enabled {
-            self.remaining_frames = self.duration_frames;
+            self.remaining_ticks = self.duration_ticks;
         }
-        self.finished = self.duration_frames == 0;
+        self.finished = self.duration_ticks == 0;
     }
 
     fn attach(&mut self, target: i32) {
@@ -176,7 +182,7 @@ impl RuntimeTimeline {
         TimelinePoll {
             active: self.enabled && !self.finished,
             finished: self.finished || !self.enabled,
-            remaining: self.remaining_frames,
+            remaining: self.remaining_ticks,
         }
     }
 }
@@ -205,21 +211,48 @@ pub(crate) enum TimelineEvent {
     },
 }
 
-fn duration_to_frames(duration: i32) -> u32 {
-    if duration <= 0 {
-        return 1;
-    }
-    if duration <= 32 {
-        return duration as u32;
-    }
-    (duration as u32).div_ceil(16).max(1)
-}
-
 fn value_to_i32(value: &Value) -> Option<i32> {
     match value {
         Value::Int(value) => Some(*value),
         Value::Ptr(value) => Some(*value as i32),
         Value::Func { offset, .. } => Some(*offset as i32),
         Value::Str(_) | Value::Program(_) | Value::None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeline_durations_use_milliseconds_for_small_values() {
+        let mut timelines = TimelineSystem::default();
+        timelines.create(1);
+        timelines.set_duration_ms(1, 16);
+        match timelines.set_enabled(1, true) {
+            TimelineEvent::Enabled { remaining, .. } => assert_eq!(remaining, 1),
+            _ => unreachable!(),
+        }
+        assert_eq!(timelines.tick(), vec![1]);
+    }
+
+    #[test]
+    fn zero_duration_timeline_is_immediately_finished() {
+        let mut timelines = TimelineSystem::default();
+        timelines.create(1);
+        timelines.set_duration_ms(1, 0);
+        match timelines.set_enabled(1, true) {
+            TimelineEvent::Enabled {
+                enabled, remaining, ..
+            } => {
+                assert!(!enabled);
+                assert_eq!(remaining, 0);
+            }
+            _ => unreachable!(),
+        }
+        let poll = timelines.poll(1);
+        assert!(poll.finished);
+        assert!(!poll.active);
+        assert_eq!(poll.remaining, 0);
     }
 }

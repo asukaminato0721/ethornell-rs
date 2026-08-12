@@ -1,10 +1,19 @@
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use ethornell_core::{EthornellError, Result};
+use ethornell_core::{classify_native_blend, EthornellError, NativeBlendPath, Result};
 use ethornell_image::DecodedImage;
 use std::collections::{BTreeMap, BTreeSet};
 use winit::window::Window;
 
 pub type TextureId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextStyleSpan {
+    pub start_char: usize,
+    pub end_char: usize,
+    pub packed_rgb: Option<u32>,
+    pub bold: bool,
+    pub italic: bool,
+}
 
 #[derive(Debug, Clone)]
 pub enum RenderCommand {
@@ -22,6 +31,9 @@ pub enum RenderCommand {
         src_width: f32,
         src_height: f32,
         opacity: f32,
+        /// Native CDspObj blend selector. Common recovered modes are routed
+        /// to dedicated pipelines; unknown values retain ordinary alpha.
+        blend_mode: i32,
         rotation_degrees: f32,
         clip: Option<[f32; 4]>,
         z: i32,
@@ -32,6 +44,8 @@ pub enum RenderCommand {
         y: f32,
         color: [f32; 4],
         size: f32,
+        styles: Vec<TextStyleSpan>,
+        clip: Option<[f32; 4]>,
         z: i32,
     },
 }
@@ -48,6 +62,7 @@ struct TextureRecord {
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+    opaque: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,14 +70,16 @@ struct TextCacheKey {
     text: String,
     size_bits: u32,
     color_bits: [u32; 4],
+    styles: Vec<TextStyleSpan>,
 }
 
 impl TextCacheKey {
-    fn new(text: &str, size: f32, color: [f32; 4]) -> Self {
+    fn new(text: &str, size: f32, color: [f32; 4], styles: &[TextStyleSpan]) -> Self {
         Self {
             text: text.to_string(),
             size_bits: size.to_bits(),
             color_bits: color.map(f32::to_bits),
+            styles: styles.to_vec(),
         }
     }
 }
@@ -101,13 +118,40 @@ impl Vertex {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePipelineKind {
+    Alpha,
+    Replace,
+    Additive,
+    Subtractive,
+    ConstantInterpolation,
+}
+
+fn native_pipeline_kind(blend_mode: i32, opacity: f32, texture_opaque: bool) -> NativePipelineKind {
+    match classify_native_blend(blend_mode) {
+        // CDspObj's default copy selector may bypass destination blending only
+        // when the source is provably opaque.  RGBA input remains source-over.
+        NativeBlendPath::DefaultCopy if opacity >= 0.999 && texture_opaque => {
+            NativePipelineKind::Replace
+        }
+        NativeBlendPath::Additive => NativePipelineKind::Additive,
+        NativeBlendPath::Subtractive => NativePipelineKind::Subtractive,
+        NativeBlendPath::ConstantInterpolation => NativePipelineKind::ConstantInterpolation,
+        NativeBlendPath::DefaultCopy | NativeBlendPath::Unrecovered(_) => NativePipelineKind::Alpha,
+    }
+}
+
 pub struct Renderer<'w> {
     surface: wgpu::Surface<'w>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     clear_color: wgpu::Color,
-    pipeline: wgpu::RenderPipeline,
+    alpha_pipeline: wgpu::RenderPipeline,
+    replace_pipeline: wgpu::RenderPipeline,
+    additive_pipeline: wgpu::RenderPipeline,
+    subtractive_pipeline: wgpu::RenderPipeline,
+    constant_interpolation_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: BTreeMap<TextureId, TextureRecord>,
@@ -194,28 +238,80 @@ impl<'w> Renderer<'w> {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ethornell-2d-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[Vertex::layout()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+        let create_pipeline = |label: &'static str, blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[Vertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            })
+        };
+        let alpha_pipeline = create_pipeline(
+            "ethornell-2d-alpha-pipeline",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
+        let replace_pipeline = create_pipeline("ethornell-2d-replace-pipeline", None);
+        let additive_pipeline = create_pipeline(
+            "ethornell-2d-additive-pipeline",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
             }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
+        );
+        let subtractive_pipeline = create_pipeline(
+            "ethornell-2d-subtractive-pipeline",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::ReverseSubtract,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            }),
+        );
+        let constant_interpolation_pipeline = create_pipeline(
+            "ethornell-2d-constant-interpolation-pipeline",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Constant,
+                    dst_factor: wgpu::BlendFactor::OneMinusConstant,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Constant,
+                    dst_factor: wgpu::BlendFactor::OneMinusConstant,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            }),
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ethornell-linear-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -234,7 +330,11 @@ impl<'w> Renderer<'w> {
                 b: 0.0,
                 a: 1.0,
             },
-            pipeline,
+            alpha_pipeline,
+            replace_pipeline,
+            additive_pipeline,
+            subtractive_pipeline,
+            constant_interpolation_pipeline,
             bind_group_layout,
             sampler,
             textures: BTreeMap::new(),
@@ -254,6 +354,14 @@ impl<'w> Renderer<'w> {
 
     pub fn surface_size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// Target renderer offset +0x58 is used as a maximum pixel-capacity field
+    /// when large bitmaps are split into strips. The closest wgpu equivalent
+    /// is the square of max_texture_dimension_2d.
+    pub fn graphics_memory_metric(&self) -> i32 {
+        let side = u64::from(self.device.limits().max_texture_dimension_2d);
+        side.saturating_mul(side).min(i32::MAX as u64) as i32
     }
 
     pub fn game_to_surface_rect(
@@ -278,21 +386,14 @@ impl<'w> Renderer<'w> {
     }
 
     pub fn surface_to_game_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
-        let (scale, offset_x, offset_y) = viewport_transform(
+        surface_to_virtual_point(
+            x,
+            y,
             self.config.width as f32,
             self.config.height as f32,
             self.virtual_width,
             self.virtual_height,
-        );
-        let game_x = (x - offset_x) / scale;
-        let game_y = (y - offset_y) / scale;
-        if (0.0..=self.virtual_width).contains(&game_x)
-            && (0.0..=self.virtual_height).contains(&game_y)
-        {
-            Some((game_x, game_y))
-        } else {
-            None
-        }
+        )
     }
 
     pub fn insert_rgba(&mut self, image: &DecodedImage) -> Result<TextureHandle> {
@@ -324,6 +425,9 @@ impl<'w> Renderer<'w> {
                 .get(&handle.id)
                 .ok_or_else(|| EthornellError::Parse("unknown texture handle".into()))?;
             self.write_texture(&record.texture, image);
+            if let Some(record) = self.textures.get_mut(&handle.id) {
+                record.opaque = image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255);
+            }
         } else {
             let record = self.create_texture_record(image);
             self.textures.insert(handle.id, record);
@@ -376,6 +480,7 @@ impl<'w> Renderer<'w> {
             bind_group,
             width: image.width,
             height: image.height,
+            opaque: image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255),
         }
     }
 
@@ -439,6 +544,7 @@ impl<'w> Renderer<'w> {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut draw_items = Vec::new();
+        let mut frame_vertices = Vec::<Vertex>::new();
         let mut active_text_keys = BTreeSet::new();
         let mut draw_commands: Vec<_> = self
             .commands
@@ -462,6 +568,7 @@ impl<'w> Renderer<'w> {
                 src_width,
                 src_height,
                 opacity,
+                blend_mode,
                 rotation_degrees,
                 clip,
             ) = match command {
@@ -476,6 +583,7 @@ impl<'w> Renderer<'w> {
                     src_width,
                     src_height,
                     opacity,
+                    blend_mode,
                     rotation_degrees,
                     clip,
                     ..
@@ -494,6 +602,7 @@ impl<'w> Renderer<'w> {
                         src_width,
                         src_height,
                         opacity,
+                        blend_mode,
                         rotation_degrees,
                         clip,
                     )
@@ -504,14 +613,16 @@ impl<'w> Renderer<'w> {
                     y,
                     color,
                     size,
+                    styles,
+                    clip,
                     ..
                 } => {
-                    let key = TextCacheKey::new(&text, size, color);
+                    let key = TextCacheKey::new(&text, size, color, &styles);
                     active_text_keys.insert(key.clone());
                     let handle = if let Some(handle) = self.text_cache.get(&key).cloned() {
                         handle
                     } else {
-                        let image = rasterize_text(&self.font, &text, size, color);
+                        let image = rasterize_text(&self.font, &text, size, color, &styles);
                         let handle = self.insert_rgba(&image)?;
                         self.text_cache.insert(key, handle.clone());
                         handle
@@ -527,8 +638,9 @@ impl<'w> Renderer<'w> {
                         handle.width as f32,
                         handle.height as f32,
                         1.0,
+                        1,
                         0.0,
-                        None,
+                        clip,
                     )
                 }
                 RenderCommand::Clear { .. } => continue,
@@ -541,6 +653,17 @@ impl<'w> Renderer<'w> {
                 },
                 None => None,
             };
+            let texture_opaque = self
+                .textures
+                .get(&texture)
+                .map(|record| record.opaque)
+                .unwrap_or(false);
+            let pipeline_kind = native_pipeline_kind(blend_mode, opacity, texture_opaque);
+            let shader_opacity = if pipeline_kind == NativePipelineKind::ConstantInterpolation {
+                1.0
+            } else {
+                opacity
+            };
             let vertices = quad_vertices(
                 x,
                 y,
@@ -550,19 +673,15 @@ impl<'w> Renderer<'w> {
                 src_y,
                 src_width,
                 src_height,
-                opacity,
+                shader_opacity,
                 rotation_degrees,
                 self.config.width as f32,
                 self.config.height as f32,
             );
-            let vertex_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ethornell-quad-vertices"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            draw_items.push((texture, vertex_buffer, scissor));
+            let vertex_start = frame_vertices.len() as u32;
+            frame_vertices.extend_from_slice(&vertices);
+            let vertex_range = vertex_start..vertex_start + vertices.len() as u32;
+            draw_items.push((texture, vertex_range, scissor, pipeline_kind, opacity));
         }
 
         let stale_text_keys = self
@@ -576,6 +695,19 @@ impl<'w> Renderer<'w> {
                 self.textures.remove(&handle.id);
             }
         }
+
+        // The target renderer preserves the submitted composition order, but it
+        // does not require one host GPU allocation per sprite.  Keep all quads
+        // in one frame-local vertex buffer so a scene with many display objects
+        // does not create hundreds of tiny Metal/D3D/Vulkan buffers every frame.
+        let frame_vertex_buffer = (!frame_vertices.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("ethornell-frame-vertices"),
+                    contents: bytemuck::cast_slice(&frame_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
 
         let mut encoder = self
             .device
@@ -597,8 +729,29 @@ impl<'w> Renderer<'w> {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            for (texture, vertex_buffer, scissor) in &draw_items {
+            if let Some(vertex_buffer) = frame_vertex_buffer.as_ref() {
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            }
+            for (texture, vertex_range, scissor, pipeline_kind, opacity) in &draw_items {
+                let pipeline = match pipeline_kind {
+                    NativePipelineKind::Replace => &self.replace_pipeline,
+                    NativePipelineKind::Additive => &self.additive_pipeline,
+                    NativePipelineKind::Subtractive => &self.subtractive_pipeline,
+                    NativePipelineKind::Alpha => &self.alpha_pipeline,
+                    NativePipelineKind::ConstantInterpolation => {
+                        &self.constant_interpolation_pipeline
+                    }
+                };
+                pass.set_pipeline(pipeline);
+                if *pipeline_kind == NativePipelineKind::ConstantInterpolation {
+                    let factor = f64::from(opacity.clamp(0.0, 1.0));
+                    pass.set_blend_constant(wgpu::Color {
+                        r: factor,
+                        g: factor,
+                        b: factor,
+                        a: factor,
+                    });
+                }
                 if let Some((x, y, width, height)) = scissor {
                     pass.set_scissor_rect(*x, *y, *width, *height);
                 } else {
@@ -606,8 +759,7 @@ impl<'w> Renderer<'w> {
                 }
                 if let Some(record) = self.textures.get(texture) {
                     pass.set_bind_group(0, &record.bind_group, &[]);
-                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                    pass.draw(0..6, 0..1);
+                    pass.draw(vertex_range.clone(), 0..1);
                 }
             }
         }
@@ -640,9 +792,73 @@ fn viewport_transform(
     (scale, offset_x, offset_y)
 }
 
+fn surface_to_virtual_point(
+    x: f32,
+    y: f32,
+    surface_width: f32,
+    surface_height: f32,
+    virtual_width: f32,
+    virtual_height: f32,
+) -> Option<(f32, f32)> {
+    let (scale, offset_x, offset_y) =
+        viewport_transform(surface_width, surface_height, virtual_width, virtual_height);
+    let virtual_x = (x - offset_x) / scale;
+    let virtual_y = (y - offset_y) / scale;
+    if (0.0..=virtual_width).contains(&virtual_x) && (0.0..=virtual_height).contains(&virtual_y) {
+        Some((virtual_x, virtual_y))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod native_blend_tests {
+    use super::{native_pipeline_kind, NativePipelineKind};
+
+    #[test]
+    fn opaque_copy_uses_replace_pipeline() {
+        assert_eq!(
+            native_pipeline_kind(128, 1.0, true),
+            NativePipelineKind::Replace
+        );
+    }
+
+    #[test]
+    fn transparent_copy_keeps_alpha_composition() {
+        assert_eq!(
+            native_pipeline_kind(128, 1.0, false),
+            NativePipelineKind::Alpha
+        );
+        assert_eq!(
+            native_pipeline_kind(128, 0.5, true),
+            NativePipelineKind::Alpha
+        );
+    }
+
+    #[test]
+    fn additive_and_subtractive_modes_have_dedicated_pipelines() {
+        assert_eq!(
+            native_pipeline_kind(2, 1.0, false),
+            NativePipelineKind::Additive
+        );
+        assert_eq!(
+            native_pipeline_kind(3, 1.0, false),
+            NativePipelineKind::Subtractive
+        );
+    }
+
+    #[test]
+    fn backb_constant_interpolation_has_a_dedicated_pipeline() {
+        assert_eq!(
+            native_pipeline_kind(0xf0, 0.5, false),
+            NativePipelineKind::ConstantInterpolation
+        );
+    }
+}
+
 #[cfg(test)]
 mod viewport_tests {
-    use super::viewport_transform;
+    use super::{surface_to_virtual_point, viewport_transform};
 
     #[test]
     fn hdpi_surface_uses_the_physical_device_scale() {
@@ -657,6 +873,26 @@ mod viewport_tests {
         assert_eq!(
             viewport_transform(1600.0, 1200.0, 1280.0, 720.0),
             (1.25, 0.0, 150.0)
+        );
+    }
+
+    #[test]
+    fn hdpi_input_round_trips_to_virtual_game_coordinates() {
+        assert_eq!(
+            surface_to_virtual_point(1086.0, 314.0, 2560.0, 1440.0, 1280.0, 720.0),
+            Some((543.0, 157.0))
+        );
+    }
+
+    #[test]
+    fn letterbox_input_rejects_bars_and_maps_the_viewport() {
+        assert_eq!(
+            surface_to_virtual_point(800.0, 150.0, 1600.0, 1200.0, 1280.0, 720.0),
+            Some((640.0, 0.0))
+        );
+        assert_eq!(
+            surface_to_virtual_point(800.0, 149.0, 1600.0, 1200.0, 1280.0, 720.0),
+            None
         );
     }
 }
@@ -676,7 +912,13 @@ pub fn load_system_cjk_font() -> Result<FontArc> {
     ))
 }
 
-fn rasterize_text(font: &FontArc, text: &str, px_height: f32, color: [f32; 4]) -> DecodedImage {
+fn rasterize_text(
+    font: &FontArc,
+    text: &str,
+    px_height: f32,
+    color: [f32; 4],
+    styles: &[TextStyleSpan],
+) -> DecodedImage {
     let lines: Vec<&str> = text.split('\n').collect();
     let scale = PxScale::from(px_height.max(1.0));
     let scaled = font.as_scaled(scale);
@@ -687,20 +929,44 @@ fn rasterize_text(font: &FontArc, text: &str, px_height: f32, color: [f32; 4]) -
         .iter()
         .map(|line| measure_line(font, *line, px_height))
         .collect();
-    let width = widths.iter().copied().max().unwrap_or(1).max(1);
+    let style_overhang = styles
+        .iter()
+        .any(|style| style.bold || style.italic)
+        .then_some((px_height * 0.25).ceil() as u32 + 1)
+        .unwrap_or_default();
+    let width = widths
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .saturating_add(style_overhang)
+        .max(1);
     let height = (line_height * lines.len().max(1) as u32).max(1);
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
-    let rgba_color = [
-        (color[0].clamp(0.0, 1.0) * 255.0) as u8,
-        (color[1].clamp(0.0, 1.0) * 255.0) as u8,
-        (color[2].clamp(0.0, 1.0) * 255.0) as u8,
-        (color[3].clamp(0.0, 1.0) * 255.0) as u8,
-    ];
 
+    let mut char_index = 0usize;
     for (line_index, line) in lines.iter().enumerate() {
         let baseline_y = line_index as f32 * line_height as f32 + scaled.ascent();
         let mut cursor_x = 0.0f32;
         for ch in line.chars() {
+            let style = text_style_at(styles, char_index);
+            let glyph_color = style
+                .and_then(|style| style.packed_rgb)
+                .map(|packed| {
+                    [
+                        ((packed >> 16) & 0xff) as f32 / 255.0,
+                        ((packed >> 8) & 0xff) as f32 / 255.0,
+                        (packed & 0xff) as f32 / 255.0,
+                        color[3],
+                    ]
+                })
+                .unwrap_or(color);
+            let rgba_color = [
+                (glyph_color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (glyph_color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (glyph_color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                (glyph_color[3].clamp(0.0, 1.0) * 255.0) as u8,
+            ];
             let glyph_id = font.glyph_id(ch);
             let glyph =
                 glyph_id.with_scale_and_position(scale, ab_glyph::point(cursor_x, baseline_y));
@@ -708,22 +974,32 @@ fn rasterize_text(font: &FontArc, text: &str, px_height: f32, color: [f32; 4]) -
             if let Some(outlined) = font.outline_glyph(glyph) {
                 let bounds = outlined.px_bounds();
                 outlined.draw(|gx, gy, coverage| {
-                    let px = bounds.min.x as i32 + gx as i32;
+                    let italic_dx = style
+                        .filter(|style| style.italic)
+                        .map(|_| ((bounds.height() - gy as f32).max(0.0) * 0.20).round() as i32)
+                        .unwrap_or_default();
+                    let px = bounds.min.x as i32 + gx as i32 + italic_dx;
                     let py = bounds.min.y as i32 + gy as i32;
-                    if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
-                        return;
+                    let bold_width = usize::from(style.is_some_and(|style| style.bold));
+                    for bold_dx in 0..=bold_width {
+                        let px = px + bold_dx as i32;
+                        if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                            continue;
+                        }
+                        let idx = (py as usize * width as usize + px as usize) * 4;
+                        let alpha = (coverage * rgba_color[3] as f32).round() as u8;
+                        if alpha >= rgba[idx + 3] {
+                            rgba[idx] = rgba_color[0];
+                            rgba[idx + 1] = rgba_color[1];
+                            rgba[idx + 2] = rgba_color[2];
+                        }
+                        rgba[idx + 3] = rgba[idx + 3].max(alpha);
                     }
-                    let idx = (py as usize * width as usize + px as usize) * 4;
-                    let alpha = (coverage * rgba_color[3] as f32).round() as u8;
-                    if alpha >= rgba[idx + 3] {
-                        rgba[idx] = rgba_color[0];
-                        rgba[idx + 1] = rgba_color[1];
-                        rgba[idx + 2] = rgba_color[2];
-                    }
-                    rgba[idx + 3] = rgba[idx + 3].max(alpha);
                 });
             }
+            char_index += 1;
         }
+        char_index += usize::from(line_index + 1 < lines.len());
     }
 
     DecodedImage {
@@ -731,6 +1007,13 @@ fn rasterize_text(font: &FontArc, text: &str, px_height: f32, color: [f32; 4]) -
         height,
         rgba,
     }
+}
+
+fn text_style_at(styles: &[TextStyleSpan], char_index: usize) -> Option<TextStyleSpan> {
+    styles
+        .iter()
+        .copied()
+        .find(|style| style.start_char <= char_index && char_index < style.end_char)
 }
 
 fn measure_line(font: &FontArc, text: &str, px_height: f32) -> u32 {
@@ -765,6 +1048,32 @@ mod font_tests {
     fn selected_system_font_contains_japanese_glyphs() {
         let font = load_system_cjk_font().expect("system CJK font");
         assert_ne!(font.glyph_id('\u{65e5}').0, 0);
+    }
+
+    #[test]
+    fn styled_text_rasterizer_applies_per_character_color_and_shape() {
+        let font = load_system_cjk_font().expect("system CJK font");
+        let image = rasterize_text(
+            &font,
+            "AB",
+            32.0,
+            [1.0; 4],
+            &[TextStyleSpan {
+                start_char: 1,
+                end_char: 2,
+                packed_rgb: Some(0xff0000),
+                bold: true,
+                italic: true,
+            }],
+        );
+        assert!(image
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 && pixel[3] > 0));
+        assert!(image
+            .rgba
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0));
     }
 }
 

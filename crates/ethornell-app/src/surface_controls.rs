@@ -34,6 +34,12 @@ impl SurfaceControlRegistry {
     pub(crate) fn contains_layer(&self, layer: i32) -> bool {
         self.layers.values().any(|layers| layers.contains(&layer))
     }
+
+    pub(crate) fn update_descriptor(&mut self, surface: i32, descriptor: GraphInputDescriptor) {
+        if self.layers.contains_key(&surface) {
+            self.descriptors.insert(surface, descriptor);
+        }
+    }
 }
 
 #[cfg(test)]

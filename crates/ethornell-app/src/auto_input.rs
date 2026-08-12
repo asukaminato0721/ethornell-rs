@@ -63,10 +63,15 @@ impl RuntimeTraceApi {
         self.pending_object_state = Some(point);
         self.pending_input_state = Some(0x1000_0002);
         self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
+        self.pending_input_consumed = false;
         self.auto_user_click_done = true;
-        if self.auto_user_click_repeat {
+        let stop_after_control = control
+            .is_some_and(|control| self.auto_user_click_stop_payload == Some(control.payload));
+        if self.auto_user_click_repeat && !stop_after_control {
             self.auto_user_click_elapsed_frames = 0;
             self.auto_user_click_hovered_frames = 0;
+        } else if stop_after_control {
+            self.auto_user_click_repeat = false;
         }
         self.auto_title_release_after_state = true;
         if let Some(control) = control {

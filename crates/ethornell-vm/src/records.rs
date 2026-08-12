@@ -5,8 +5,8 @@ pub(crate) struct RecordTableState {
     pub(crate) slot: u32,
     pub(crate) record_size: u32,
     pub(crate) cursor: u32,
-    pub(crate) capacity: u32,
-    pub(crate) keys: std::collections::BTreeMap<u32, Value>,
+    pub(crate) keys: std::collections::BTreeMap<u32, String>,
+    pub(crate) records: std::collections::BTreeMap<u32, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +121,11 @@ impl Vm {
         let header = self.resolve_range(src, HEADER_SIZE)?;
         let header = self.memory[header].to_vec();
         if header.get(..MAGIC.len()) != Some(MAGIC) {
+            tracing::warn!(
+                src = format_args!("0x{src:08X}"),
+                header = %header.iter().take(16).map(|byte| format!("{byte:02X}")).collect::<String>(),
+                "SDC header magic mismatch"
+            );
             return Ok(0);
         }
 
@@ -128,7 +133,19 @@ impl Vm {
         let packed_len = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
         let expected_sum = u16::from_le_bytes(header[28..30].try_into().unwrap());
         let expected_xor = u16::from_le_bytes(header[30..32].try_into().unwrap());
-        let packed = self.resolve_range(src.saturating_add(HEADER_SIZE as u32), packed_len)?;
+        let packed = match self.resolve_range(src.saturating_add(HEADER_SIZE as u32), packed_len) {
+            Ok(range) => range,
+            Err(error) => {
+                tracing::warn!(
+                    src = format_args!("0x{src:08X}"),
+                    packed_len,
+                    raw_len = u32::from_le_bytes(header[24..28].try_into().unwrap()),
+                    %error,
+                    "SDC packed payload is outside VM memory"
+                );
+                return Ok(0);
+            }
+        };
         let mut packed = self.memory[packed].to_vec();
 
         let sum = packed
@@ -162,7 +179,21 @@ impl Vm {
             *byte = byte.wrapping_sub(random);
         }
 
-        let unpacked = unpack_sdc_lz(&packed)?;
+        let unpacked = match unpack_sdc_lz(&packed) {
+            Ok(unpacked) => unpacked,
+            Err(error) => {
+                tracing::warn!(
+                    src = format_args!("0x{src:08X}"),
+                    dst = format_args!("0x{dst:08X}"),
+                    seed = format_args!("0x{seed:08X}"),
+                    packed_len,
+                    raw_len = u32::from_le_bytes(header[24..28].try_into().unwrap()),
+                    %error,
+                    "SDC LZ decompression failed"
+                );
+                return Ok(0);
+            }
+        };
         let range = self.resolve_write_range(dst, unpacked.len())?;
         self.memory[range].copy_from_slice(&unpacked);
         self.clear_shadow_values(dst, unpacked.len());
@@ -174,45 +205,138 @@ impl Vm {
 
         let decoded_len = self.read_int(src.saturating_add(24), 2)? as usize;
         if decoded_len < 24 {
+            tracing::warn!(
+                src = format_args!("0x{src:08X}"),
+                decoded_len,
+                "SDC/DCFS decoded length is too small"
+            );
             return Ok(0);
         }
         let temporary = self.alloc_heap(decoded_len as u32);
-        if self.decode_sdc_records(src, temporary)? as usize != decoded_len {
+        if temporary == 0 {
+            tracing::warn!(decoded_len, "SDC/DCFS temporary allocation failed");
             return Ok(0);
+        }
+        let written = self.decode_sdc_records(src, temporary)?;
+        if written <= 0 || written as usize > decoded_len {
+            tracing::warn!(
+                src = format_args!("0x{src:08X}"),
+                allocation = decoded_len,
+                written,
+                "SDC/DCFS outer decompression failed or exceeded its target allocation"
+            );
+            let _ = self.free_heap(temporary);
+            return Ok(0);
+        }
+        if written as usize != decoded_len {
+            // Target Sys80:C5 allocates header.raw_len bytes, invokes
+            // sub_4938F0, and deliberately ignores its returned byte count
+            // before running the DCFS parser. Preserve that behavior: a
+            // shorter decoded stream may still contain a complete DCFS table
+            // followed by unused allocation padding.
+            tracing::info!(
+                src = format_args!("0x{src:08X}"),
+                allocation = decoded_len,
+                written,
+                "SDC/DCFS decoded byte count differs from allocation; continuing like target"
+            );
         }
         let range = self.resolve_range(temporary, decoded_len)?;
         let encoded = self.memory[range].to_vec();
         if encoded.get(..STRUCT_MAGIC.len()) != Some(STRUCT_MAGIC) {
+            tracing::warn!(
+                src = format_args!("0x{src:08X}"),
+                decoded_header = %encoded.iter().take(16).map(|byte| format!("{byte:02X}")).collect::<String>(),
+                "DCFS structure magic mismatch"
+            );
+            let _ = self.free_heap(temporary);
             return Ok(0);
         }
 
         let record_size = u32::from_le_bytes(encoded[16..20].try_into().unwrap()) as usize;
         let record_count = u32::from_le_bytes(encoded[20..24].try_into().unwrap()) as usize;
         if record_size == 0 || record_count == 0 {
+            tracing::warn!(
+                record_size,
+                record_count,
+                "DCFS structure dimensions are invalid"
+            );
+            let _ = self.free_heap(temporary);
             return Ok(0);
         }
-        let first_end = 24usize.saturating_add(record_size);
-        let first = encoded
-            .get(24..first_end)
-            .ok_or_else(|| crate::VmError::Runtime("truncated DCFS first record".into()))?;
-        let mut records = Vec::with_capacity(record_size.saturating_mul(record_count));
+        let total_output = match record_size.checked_mul(record_count) {
+            Some(total) => total,
+            None => {
+                tracing::warn!(record_size, record_count, "DCFS output size overflow");
+                let _ = self.free_heap(temporary);
+                return Ok(0);
+            }
+        };
+        let first_end = match 24usize.checked_add(record_size) {
+            Some(end) => end,
+            None => {
+                let _ = self.free_heap(temporary);
+                return Ok(0);
+            }
+        };
+        let Some(first) = encoded.get(24..first_end) else {
+            tracing::warn!(
+                decoded_len,
+                record_size,
+                record_count,
+                "DCFS first record is truncated"
+            );
+            let _ = self.free_heap(temporary);
+            return Ok(0);
+        };
+        let mut records = Vec::with_capacity(total_output);
         records.extend_from_slice(first);
         let mut input = first_end;
 
-        for _ in 1..record_count {
+        for record_index in 1..record_count {
             let previous = records[records.len() - record_size..].to_vec();
             let mut record = Vec::with_capacity(record_size);
             let mut literal = false;
             while record.len() < record_size {
-                let count = read_dcfs_varint(&encoded, &mut input)?;
+                let count = match read_dcfs_varint(&encoded, &mut input) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        tracing::warn!(
+                            record_index,
+                            input,
+                            record_size,
+                            record_count,
+                            %error,
+                            "DCFS run-length stream is truncated"
+                        );
+                        let _ = self.free_heap(temporary);
+                        return Ok(0);
+                    }
+                };
                 if record.len().saturating_add(count) > record_size {
-                    return Err(crate::VmError::Runtime("invalid DCFS run length".into()));
+                    tracing::warn!(
+                        record_index,
+                        run_offset = record.len(),
+                        count,
+                        record_size,
+                        "DCFS run exceeds record boundary"
+                    );
+                    let _ = self.free_heap(temporary);
+                    return Ok(0);
                 }
                 if literal {
                     let end = input.saturating_add(count);
-                    let bytes = encoded
-                        .get(input..end)
-                        .ok_or_else(|| crate::VmError::Runtime("truncated DCFS literal".into()))?;
+                    let Some(bytes) = encoded.get(input..end) else {
+                        tracing::warn!(
+                            record_index,
+                            input,
+                            count,
+                            decoded_len,
+                            "DCFS literal run is truncated"
+                        );
+                        let _ = self.free_heap(temporary);
+                        return Ok(0);
+                    };
                     record.extend_from_slice(bytes);
                     input = end;
                 } else {
@@ -227,41 +351,45 @@ impl Vm {
         let range = self.resolve_write_range(dst, records.len())?;
         self.memory[range].copy_from_slice(&records);
         self.clear_shadow_values(dst, records.len());
+        let _ = self.free_heap(temporary);
+        tracing::info!(
+            src = format_args!("0x{src:08X}"),
+            dst = format_args!("0x{dst:08X}"),
+            decoded_len,
+            record_size,
+            record_count,
+            output_bytes = records.len(),
+            "SDC/DCFS structure decompressed"
+        );
         Ok(record_count as i32)
     }
 
-    pub(crate) fn sys_record_table_open(&mut self, slot: u32, record_size: u32) -> VmResult<Value> {
-        let capacity = if slot == 1972 && record_size == 124 {
-            32
-        } else {
-            4096
-        };
-        let ptr = if slot == 1972 && record_size == 124 {
-            0x0004_cad8
-        } else {
-            self.alloc_heap(record_size.saturating_mul(capacity).saturating_add(4))
-        };
-        self.write_value(slot, 2, &Value::Ptr(ptr))?;
+    pub(crate) fn sys_record_table_open(&mut self, slot: u32, record_size: u32) -> VmResult<i32> {
+        const INVALID_RECORD_SIZE: i32 = 0x8000_0001u32 as i32;
+        if record_size <= 1 {
+            return Ok(INVALID_RECORD_SIZE);
+        }
+
+        let handle = self.next_record_table_handle.max(1);
+        self.next_record_table_handle = handle.wrapping_add(1).max(1);
+        self.write_int(slot, 2, handle)?;
         self.record_tables.insert(
-            Self::value_key(ptr),
+            Self::value_key(handle),
             RecordTableState {
                 slot,
                 record_size,
                 cursor: 0,
-                capacity,
                 keys: std::collections::BTreeMap::new(),
+                records: std::collections::BTreeMap::new(),
             },
         );
-        if std::env::var_os("DEBUG").is_some() {
-            tracing::info!(
-                slot = format_args!("0x{slot:08X}"),
-                record_size,
-                capacity,
-                ptr = format_args!("0x{ptr:08X}"),
-                "RecordTableOpen"
-            );
-        }
-        Ok(Value::Ptr(ptr))
+        tracing::debug!(
+            slot = format_args!("0x{slot:08X}"),
+            record_size,
+            handle,
+            "RecordTableOpen"
+        );
+        Ok(0)
     }
 
     pub(crate) fn sys_record_table_copy(
@@ -269,50 +397,90 @@ impl Vm {
         handle: u32,
         key: Value,
         src: u32,
-    ) -> VmResult<()> {
-        let handle_addr = Self::value_key(handle);
-        let key = self.normalize_record_key(key);
-        if let Some((index, slot, record_size, capacity)) =
-            self.record_tables.get_mut(&handle_addr).map(|table| {
+    ) -> VmResult<i32> {
+        const TABLE_NOT_FOUND: i32 = 0x8000_0002u32 as i32;
+        let key = match self.normalize_record_key(key) {
+            Value::Str(text) => text,
+            Value::Ptr(0) | Value::Int(0) | Value::None => String::new(),
+            value => value.as_i32().to_string(),
+        };
+        let handle_key = Self::value_key(handle);
+        let Some((index, record_size, record_ptr)) =
+            self.record_tables.get(&handle_key).map(|table| {
                 let existing = table
                     .keys
                     .iter()
-                    .find_map(|(index, saved)| record_keys_equal(saved, &key).then_some(*index));
+                    .find_map(|(index, saved)| (saved == &key).then_some(*index));
                 let index = existing.unwrap_or(table.cursor);
-                if existing.is_none() {
-                    table.cursor = table.cursor.saturating_add(1);
-                }
-                table.keys.insert(index, key.clone());
-                (index, table.slot, table.record_size, table.capacity)
+                (index, table.record_size, table.records.get(&index).copied())
             })
-        {
-            if std::env::var_os("DEBUG").is_some() {
-                tracing::debug!(
-                    index,
-                    slot = format_args!("0x{slot:08X}"),
-                    record_size,
-                    capacity,
-                    handle = format_args!("0x{handle:08X}"),
-                    key = ?key,
-                    src = format_args!("0x{src:08X}"),
-                    "RecordTableCopy"
-                );
-            }
-            if record_size > 0 {
-                let table_dst = handle_addr.saturating_add(index.saturating_mul(record_size));
-                self.copy_record_into_table(table_dst, src, record_size as usize)?;
-            }
-        } else if let Some(dst) = value_ptr(&key) {
-            if dst as usize + 4 <= self.memory.len() && src as usize + 4 <= self.memory.len() {
-                let value = self.read_int(src, 2)?;
-                self.write_int(dst, 2, value)?;
-            }
-        }
-        Ok(())
+        else {
+            return Ok(TABLE_NOT_FOUND);
+        };
+
+        let record_ptr = if let Some(record_ptr) = record_ptr {
+            record_ptr
+        } else {
+            let record_ptr = self.alloc_heap(record_size);
+            let table = self
+                .record_tables
+                .get_mut(&handle_key)
+                .expect("record table disappeared while inserting");
+            table.cursor = table.cursor.saturating_add(1);
+            table.keys.insert(index, key.clone());
+            table.records.insert(index, record_ptr);
+            record_ptr
+        };
+        self.copy_record_into_table(record_ptr, src, record_size as usize)?;
+        tracing::debug!(
+            handle,
+            index,
+            key,
+            record_size,
+            src = format_args!("0x{src:08X}"),
+            record_ptr = format_args!("0x{record_ptr:08X}"),
+            "RecordTableInsert"
+        );
+        Ok(0)
     }
 
-    pub(crate) fn sys_record_table_close(&mut self, handle: u32) {
-        self.record_tables.remove(&Self::value_key(handle));
+    pub(crate) fn sys_record_table_close(&mut self, handle: u32) -> i32 {
+        const TABLE_NOT_FOUND: i32 = 0x8000_0002u32 as i32;
+        let Some(table) = self.record_tables.remove(&Self::value_key(handle)) else {
+            return TABLE_NOT_FOUND;
+        };
+        for record_ptr in table.records.into_values() {
+            let _ = self.free_heap(record_ptr);
+        }
+        0
+    }
+
+    pub(crate) fn sys_record_table_remove(&mut self, handle: u32, key: Value) -> i32 {
+        const TABLE_NOT_FOUND: i32 = 0x8000_0002u32 as i32;
+        const KEY_NOT_FOUND: i32 = 0x8000_0003u32 as i32;
+
+        let handle_key = Self::value_key(handle);
+        let key = match self.normalize_record_key(key) {
+            Value::Str(text) => text,
+            Value::Ptr(0) | Value::Int(0) | Value::None => String::new(),
+            value => value.as_i32().to_string(),
+        };
+        let Some(table) = self.record_tables.get_mut(&handle_key) else {
+            return TABLE_NOT_FOUND;
+        };
+        let Some(index) = table
+            .keys
+            .iter()
+            .find_map(|(index, saved)| (saved == &key).then_some(*index))
+        else {
+            return KEY_NOT_FOUND;
+        };
+        table.keys.remove(&index);
+        let record_ptr = table.records.remove(&index);
+        if let Some(record_ptr) = record_ptr {
+            let _ = self.free_heap(record_ptr);
+        }
+        0
     }
 
     pub(crate) fn sys_record_table_fetch(
@@ -320,51 +488,46 @@ impl Vm {
         dst: u32,
         handle: u32,
         selector: Value,
-        mode: i32,
+        index: i32,
     ) -> VmResult<Value> {
-        let handle_addr = Self::value_key(handle);
-        let Some(table) = self.record_tables.get(&handle_addr).cloned() else {
-            return Ok(Value::Int(1));
+        const TABLE_NOT_FOUND: i32 = 0x8000_0002u32 as i32;
+        const RECORD_NOT_FOUND: i32 = 0x8000_0003u32 as i32;
+        let handle_key = Self::value_key(handle);
+        let Some(table) = self.record_tables.get(&handle_key) else {
+            return Ok(Value::Int(TABLE_NOT_FOUND));
         };
-        if table.record_size == 0 {
-            return Ok(Value::Int(1));
-        }
-
-        let Some(index) = self.find_record_index(handle_addr, &table, &selector, mode)? else {
-            if std::env::var_os("DEBUG").is_some() {
-                tracing::debug!(
-                    slot = format_args!("0x{:08X}", table.slot),
-                    handle = format_args!("0x{handle:08X}"),
-                    selector = ?selector,
-                    mode,
-                    "RecordTableFetchMiss"
-                );
+        let selected = match self.normalize_record_key(selector) {
+            Value::Ptr(0) | Value::Int(0) | Value::None => usize::try_from(index)
+                .ok()
+                .and_then(|index| table.keys.keys().copied().nth(index)),
+            Value::Str(key) => table
+                .keys
+                .iter()
+                .find_map(|(index, saved)| (saved == &key).then_some(*index)),
+            value => {
+                let key = value.as_i32().to_string();
+                table
+                    .keys
+                    .iter()
+                    .find_map(|(index, saved)| (saved == &key).then_some(*index))
             }
-            return Ok(Value::Int(1));
         };
-
-        let src = handle_addr.saturating_add(index.saturating_mul(table.record_size));
-        self.copy_buffer(dst, src, table.record_size as usize)?;
-        if std::env::var_os("DEBUG").is_some() {
-            let descriptor = (table.record_size >= 8).then(|| {
-                (
-                    self.read_int(src, 2).unwrap_or_default(),
-                    self.read_int(src.saturating_add(4), 2).unwrap_or_default(),
-                )
-            });
-            tracing::debug!(
-                index,
-                slot = format_args!("0x{:08X}", table.slot),
-                record_size = table.record_size,
-                handle = format_args!("0x{handle:08X}"),
-                src = format_args!("0x{src:08X}"),
-                dst = format_args!("0x{dst:08X}"),
-                selector = ?selector,
-                mode,
-                descriptor = ?descriptor,
-                "RecordTableFetch"
-            );
-        }
+        let Some(selected) = selected else {
+            return Ok(Value::Int(RECORD_NOT_FOUND));
+        };
+        let Some(src) = table.records.get(&selected).copied() else {
+            return Ok(Value::Int(RECORD_NOT_FOUND));
+        };
+        let record_size = table.record_size;
+        self.copy_buffer(dst, src, record_size as usize)?;
+        tracing::debug!(
+            handle,
+            selected,
+            record_size,
+            src = format_args!("0x{src:08X}"),
+            dst = format_args!("0x{dst:08X}"),
+            "RecordTableFetch"
+        );
         Ok(Value::Int(0))
     }
 
@@ -377,8 +540,9 @@ impl Vm {
         if capacity == 0 || record_size == 0 {
             return Ok(2);
         }
-        let handle = self.alloc_heap(4);
-        self.write_value(slot, 2, &Value::Ptr(handle))?;
+        let handle = self.next_indexed_record_handle.max(1);
+        self.next_indexed_record_handle = handle.wrapping_add(1).max(1);
+        self.write_value(slot, 2, &Value::Int(handle as i32))?;
         self.indexed_record_tables.insert(
             Self::value_key(handle),
             IndexedRecordState {
@@ -393,10 +557,12 @@ impl Vm {
 
         if std::env::var_os("DEBUG").is_some() {
             tracing::info!(
+                thread_id = self.thread.thread_id(),
                 slot = format_args!("0x{slot:08X}"),
                 capacity,
                 record_size,
                 handle = format_args!("0x{handle:08X}"),
+                table_count = self.indexed_record_tables.len(),
                 "IndexedRecordOpen"
             );
         }
@@ -407,10 +573,12 @@ impl Vm {
         if let Some(state) = self.indexed_record_tables.remove(&Self::value_key(handle)) {
             if std::env::var_os("DEBUG").is_some() {
                 tracing::info!(
+                    thread_id = self.thread.thread_id(),
                     handle = format_args!("0x{handle:08X}"),
                     slot = format_args!("0x{:08X}", state.slot),
                     capacity = state.capacity,
                     record_size = state.record_size,
+                    record_count = state.records.len(),
                     "IndexedRecordClose"
                 );
             }
@@ -422,14 +590,26 @@ impl Vm {
 
     pub(crate) fn sys_indexed_record_count(&mut self, dst: u32, handle: u32) -> VmResult<i32> {
         let Some(state) = self.indexed_record_tables.get(&Self::value_key(handle)) else {
+            if std::env::var_os("DEBUG").is_some() {
+                tracing::info!(
+                    thread_id = self.thread.thread_id(),
+                    dst = format_args!("0x{dst:08X}"),
+                    handle = format_args!("0x{handle:08X}"),
+                    table_count = self.indexed_record_tables.len(),
+                    "IndexedRecordCount missing handle"
+                );
+            }
             return Ok(1);
         };
         let count = state.records.len() as u32;
+        let slot = state.slot;
         self.write_int(dst, 2, count)?;
         if std::env::var_os("DEBUG").is_some() {
             tracing::info!(
+                thread_id = self.thread.thread_id(),
                 dst = format_args!("0x{dst:08X}"),
                 handle = format_args!("0x{handle:08X}"),
+                slot = format_args!("0x{slot:08X}"),
                 count,
                 "IndexedRecordCount"
             );
@@ -440,10 +620,20 @@ impl Vm {
     pub(crate) fn sys_indexed_record_push(&mut self, handle: u32, src: u32) -> VmResult<i32> {
         let key = Self::value_key(handle);
         let Some(state) = self.indexed_record_tables.get(&key) else {
+            if std::env::var_os("DEBUG").is_some() {
+                tracing::info!(
+                    thread_id = self.thread.thread_id(),
+                    handle = format_args!("0x{handle:08X}"),
+                    src = format_args!("0x{src:08X}"),
+                    table_count = self.indexed_record_tables.len(),
+                    "IndexedRecordPush missing handle"
+                );
+            }
             return Ok(1);
         };
         let size = state.record_size as usize;
         let capacity = state.capacity as usize;
+        let slot = state.slot;
         let src_range = self.resolve_range(src, size)?;
         let src_start = Self::value_key(src);
         let src_end = src_start.saturating_add(state.record_size);
@@ -461,6 +651,17 @@ impl Vm {
         let state = self.indexed_record_tables.get_mut(&key).unwrap();
         state.records.push_front(entry);
         state.records.truncate(capacity);
+        let count = state.records.len();
+        if std::env::var_os("DEBUG").is_some() {
+            tracing::info!(
+                thread_id = self.thread.thread_id(),
+                handle = format_args!("0x{handle:08X}"),
+                src = format_args!("0x{src:08X}"),
+                slot = format_args!("0x{slot:08X}"),
+                count,
+                "IndexedRecordPush"
+            );
+        }
         Ok(0)
     }
 
@@ -574,58 +775,6 @@ impl Vm {
         self.copy_buffer(dst, src, size)
     }
 
-    fn find_record_index(
-        &self,
-        handle_addr: u32,
-        table: &RecordTableState,
-        selector: &Value,
-        mode: i32,
-    ) -> VmResult<Option<u32>> {
-        let selector = self.normalize_record_key(selector.clone());
-        if matches!(selector, Value::Int(0) | Value::Ptr(0) | Value::None)
-            && mode >= 0
-            && (mode as u32) < table.cursor
-        {
-            return Ok(Some(mode as u32));
-        }
-        if let Some(index) = table
-            .keys
-            .iter()
-            .find_map(|(index, key)| record_keys_equal(key, &selector).then_some(*index))
-        {
-            return Ok(Some(index));
-        }
-
-        let selector_text = match &selector {
-            Value::Str(text) => Some(text.clone()),
-            Value::Ptr(ptr) => self
-                .read_c_string(*ptr)
-                .ok()
-                .filter(|text| !text.is_empty()),
-            Value::Int(value) if *value != 0 => self
-                .read_c_string(*value as u32)
-                .ok()
-                .filter(|text| !text.is_empty()),
-            _ => None,
-        };
-        let selector_int = selector.as_i32();
-
-        for index in 0..table.cursor {
-            let record = handle_addr.saturating_add(index.saturating_mul(table.record_size));
-            if let Some(text) = selector_text.as_deref() {
-                if self.record_matches_text(record, table.record_size, text)? {
-                    return Ok(Some(index));
-                }
-            }
-            if selector_int != 0
-                && self.record_matches_int(record, table.record_size, selector_int)?
-            {
-                return Ok(Some(index));
-            }
-        }
-        Ok(None)
-    }
-
     fn normalize_record_key(&self, key: Value) -> Value {
         match key {
             Value::Ptr(ptr) => self
@@ -642,36 +791,6 @@ impl Vm {
                 .unwrap_or(Value::Int(ptr)),
             other => other,
         }
-    }
-
-    fn record_matches_text(&self, record: u32, record_size: u32, text: &str) -> VmResult<bool> {
-        if let Some(Value::Str(value)) = self.mem_values.get(&Self::value_key(record)) {
-            if value == text {
-                return Ok(true);
-            }
-        }
-        let max_offset = record_size.saturating_sub(4);
-        for offset in (0..=max_offset).step_by(4) {
-            let ptr = self.read_int(record.saturating_add(offset), 2)?;
-            if ptr != 0 {
-                if let Ok(value) = self.read_c_string(ptr) {
-                    if value == text {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    fn record_matches_int(&self, record: u32, record_size: u32, needle: i32) -> VmResult<bool> {
-        let max_offset = record_size.saturating_sub(4);
-        for offset in (0..=max_offset).step_by(4) {
-            if self.read_int(record.saturating_add(offset), 2)? as i32 == needle {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -727,21 +846,6 @@ fn read_dcfs_varint(encoded: &[u8], input: &mut usize) -> VmResult<usize> {
     }
 }
 
-fn record_keys_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Str(left), Value::Str(right)) => left == right,
-        _ => left.as_i32() == right.as_i32(),
-    }
-}
-
-fn value_ptr(value: &Value) -> Option<u32> {
-    match value {
-        Value::Ptr(ptr) => Some(*ptr),
-        Value::Int(ptr) if *ptr >= 0 => Some(*ptr as u32),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,24 +853,33 @@ mod tests {
     #[test]
     fn keyed_record_fetch_uses_zero_for_success_and_replaces_duplicate_keys() {
         let mut vm = Vm::new();
-        let handle = vm
-            .sys_record_table_open(0x100, 8)
-            .expect("open record table")
-            .as_i32() as u32;
+        let slot = vm.alloc_heap(4);
+        assert_eq!(
+            vm.sys_record_table_open(slot, 8)
+                .expect("open record table"),
+            0
+        );
+        let handle = vm.read_int(slot, 2).expect("read record table handle");
         let src = vm.alloc_heap(8);
         let dst = vm.alloc_heap(8);
 
         vm.write_int(src, 2, 3).expect("write script index");
         vm.write_int(src + 4, 2, 0x1234)
             .expect("write function address");
-        vm.sys_record_table_copy(handle, Value::Str("_Wait".into()), src)
-            .expect("insert record");
+        assert_eq!(
+            vm.sys_record_table_copy(handle, Value::Str("_Wait".into()), src)
+                .expect("insert record"),
+            0
+        );
 
         vm.write_int(src, 2, 4).expect("replace script index");
         vm.write_int(src + 4, 2, 0x5678)
             .expect("replace function address");
-        vm.sys_record_table_copy(handle, Value::Str("_Wait".into()), src)
-            .expect("replace record");
+        assert_eq!(
+            vm.sys_record_table_copy(handle, Value::Str("_Wait".into()), src)
+                .expect("replace record"),
+            0
+        );
 
         let found = vm
             .sys_record_table_fetch(dst, handle, Value::Str("_Wait".into()), 0)
@@ -782,6 +895,75 @@ mod tests {
             .sys_record_table_fetch(dst, handle, Value::Str("_Missing".into()), 0)
             .expect("fetch missing record");
         assert!(matches!(missing, Value::Int(value) if value != 0));
+    }
+
+    #[test]
+    fn keyed_record_remove_preserves_native_raw_status_codes() {
+        let mut vm = Vm::new();
+        let slot = vm.alloc_heap(4);
+        assert_eq!(
+            vm.sys_record_table_open(slot, 8)
+                .expect("open record table"),
+            0
+        );
+        let handle = vm.read_int(slot, 2).expect("read record table handle");
+        let src = vm.alloc_heap(8);
+        assert_eq!(
+            vm.sys_record_table_copy(handle, Value::Str("_Wait".into()), src)
+                .expect("insert record"),
+            0
+        );
+
+        assert_eq!(
+            vm.sys_record_table_remove(handle, Value::Str("_Wait".into())),
+            0
+        );
+        assert_eq!(
+            vm.sys_record_table_remove(handle, Value::Str("_Wait".into())),
+            0x8000_0003u32 as i32
+        );
+        assert_eq!(
+            vm.sys_record_table_remove(0xdead_beef, Value::Str("_Wait".into())),
+            0x8000_0002u32 as i32
+        );
+    }
+
+    #[test]
+    fn record_tables_use_unbounded_per_key_nodes_and_linked_list_indexing() {
+        let mut vm = Vm::new();
+        let slot = vm.alloc_heap(4);
+        assert_eq!(vm.sys_record_table_open(slot, 8).unwrap(), 0);
+        let handle = vm.read_int(slot, 2).unwrap();
+        let src = vm.alloc_heap(8);
+        let dst = vm.alloc_heap(8);
+
+        for index in 0..4_100u32 {
+            vm.write_int(src, 2, index).unwrap();
+            vm.write_int(src + 4, 2, index ^ 0x55aa).unwrap();
+            assert_eq!(
+                vm.sys_record_table_copy(handle, Value::Str(format!("key-{index}")), src)
+                    .unwrap(),
+                0
+            );
+        }
+
+        assert!(matches!(
+            vm.sys_record_table_fetch(dst, handle, Value::Ptr(0), 4_099)
+                .unwrap(),
+            Value::Int(0)
+        ));
+        assert_eq!(vm.read_int(dst, 2).unwrap(), 4_099);
+
+        assert_eq!(
+            vm.sys_record_table_remove(handle, Value::Str("key-1".into())),
+            0
+        );
+        assert!(matches!(
+            vm.sys_record_table_fetch(dst, handle, Value::Ptr(0), 1)
+                .unwrap(),
+            Value::Int(0)
+        ));
+        assert_eq!(vm.read_int(dst, 2).unwrap(), 2);
     }
 
     #[test]

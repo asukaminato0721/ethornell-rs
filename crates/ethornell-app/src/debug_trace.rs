@@ -5,9 +5,9 @@ pub(crate) fn frame_selected(frame: usize, selector: Option<&str>) -> bool {
     selector.split(',').any(|part| {
         let part = part.trim();
         if let Some((start, end)) = part.split_once("..=") {
-            return parse_frame(start).zip(parse_frame(end)).is_some_and(
-                |(start, end)| (start..=end).contains(&frame),
-            );
+            return parse_frame(start)
+                .zip(parse_frame(end))
+                .is_some_and(|(start, end)| (start..=end).contains(&frame));
         }
         if let Some((start, end)) = part.split_once("..") {
             return parse_frame(start)

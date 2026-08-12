@@ -2,10 +2,11 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use encoding_rs::SHIFT_JIS;
 use ethornell_core::{EthornellError, GameRoot, Result};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub const MAGIC_PACK_FILE: &[u8] = b"PackFile";
 pub const MAGIC_PACK_FILE_FULL: &[u8] = b"PackFile    ";
@@ -93,10 +94,27 @@ pub struct ResourceEntry {
     pub flags: u32,
 }
 
+#[derive(Debug)]
+struct ResourceManagerInner {
+    set: GameArchiveSet,
+    /// Normalized resource name -> stable locators into `set.archives[*].entries[*]`.
+    /// The archive index remains part of the locator so duplicate filenames in
+    /// different archives preserve the original archive ordering semantics.
+    by_name: HashMap<String, Vec<(usize, usize)>>,
+    /// Lower-cased archive filename -> first archive with that filename.
+    archive_by_name: HashMap<String, usize>,
+    /// Full archive path -> archive index. This avoids rescanning every archive
+    /// when callers hand a ResourceEntry back to us.
+    archive_by_path: HashMap<PathBuf, usize>,
+    /// Runtime archive handles. Resource reads are overwhelmingly random seeks
+    /// into a small, stable set of ARC files; reopening the archive for every
+    /// BP/image/audio entry is substantially more expensive than the seek/read.
+    archive_files: Vec<Mutex<fs::File>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResourceManager {
-    set: GameArchiveSet,
-    by_name: BTreeMap<String, Vec<(usize, usize)>>,
+    inner: Arc<ResourceManagerInner>,
 }
 
 impl ResourceManager {
@@ -110,25 +128,39 @@ impl ResourceManager {
             root: game.path().to_path_buf(),
             archives,
         };
-        let mut by_name: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
-        for (archive_index, archive) in set.archives.iter().enumerate() {
-            for (entry_index, entry) in archive.entries.iter().enumerate() {
-                by_name
-                    .entry(normalize_resource_name(&entry.name))
-                    .or_default()
-                    .push((archive_index, entry_index));
-            }
-        }
-        Ok(Self { set, by_name })
+        let (by_name, archive_by_name, archive_by_path) = build_resource_lookup(&set);
+        let archive_files = set
+            .archives
+            .iter()
+            .map(|archive| fs::File::open(&archive.path).map(Mutex::new))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self {
+            inner: Arc::new(ResourceManagerInner {
+                set,
+                by_name,
+                archive_by_name,
+                archive_by_path,
+                archive_files,
+            }),
+        })
     }
 
     pub fn archives(&self) -> &GameArchiveSet {
-        &self.set
+        &self.inner.set
+    }
+
+    pub fn resource_count(&self) -> usize {
+        self.inner
+            .set
+            .archives
+            .iter()
+            .map(|archive| archive.entries.len())
+            .sum()
     }
 
     pub fn list(&self) -> Vec<ResourceEntry> {
         let mut entries = Vec::new();
-        for archive in &self.set.archives {
+        for archive in &self.inner.set.archives {
             for entry in &archive.entries {
                 entries.push(resource_entry_from_archive(archive, entry));
             }
@@ -137,29 +169,26 @@ impl ResourceManager {
     }
 
     pub fn find(&self, name: &str) -> Option<ResourceEntry> {
-        let key = normalize_resource_name(name);
-        if let Some(matches) = self.by_name.get(&key) {
-            return matches
-                .first()
-                .and_then(|&(archive, entry)| self.entry_at(archive, entry));
-        }
-        self.by_name
-            .iter()
-            .filter(|(candidate, _)| candidate.ends_with(&key) || candidate.contains(&key))
-            .flat_map(|(_, matches)| matches.iter())
-            .next()
-            .and_then(|&(archive, entry)| self.entry_at(archive, entry))
+        self.find_locator(name)
+            .and_then(|(archive, entry)| self.entry_at(archive, entry))
     }
 
     pub fn find_all(&self, query: &str) -> Vec<ResourceEntry> {
         let key = normalize_resource_name(query);
+        let mut matching_keys = self
+            .inner
+            .by_name
+            .iter()
+            .filter(|(candidate, _)| candidate.contains(&key))
+            .collect::<Vec<_>>();
+        // The old BTreeMap implementation exposed lexicographic normalized-key
+        // order. Preserve that behavior without re-normalizing archive entries.
+        matching_keys.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let mut out = Vec::new();
-        for (candidate, matches) in &self.by_name {
-            if candidate.contains(&key) {
-                for &(archive, entry) in matches {
-                    if let Some(entry) = self.entry_at(archive, entry) {
-                        out.push(entry);
-                    }
+        for (_, matches) in matching_keys {
+            for &(archive, entry) in matches {
+                if let Some(entry) = self.entry_at(archive, entry) {
+                    out.push(entry);
                 }
             }
         }
@@ -167,24 +196,16 @@ impl ResourceManager {
     }
 
     pub fn find_in_archive(&self, archive_name: &str, entry_name: &str) -> Option<ResourceEntry> {
-        let archive_key = archive_name.to_ascii_lowercase();
-        let entry_key = normalize_resource_name(entry_name);
-        self.list().into_iter().find(|entry| {
-            entry.entry_name.eq_ignore_ascii_case(entry_name)
-                && entry
-                    .archive_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.to_ascii_lowercase() == archive_key)
-                    .unwrap_or(false)
-                || normalize_resource_name(&entry.entry_name) == entry_key
-                    && entry
-                        .archive_path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| name.to_ascii_lowercase() == archive_key)
-                        .unwrap_or(false)
-        })
+        self.find_locator_in_archive(archive_name, entry_name)
+            .and_then(|(archive, entry)| self.entry_at(archive, entry))
+    }
+
+    pub fn first_in_archive(&self, archive_name: &str) -> Option<ResourceEntry> {
+        let archive_index = *self
+            .inner
+            .archive_by_name
+            .get(&archive_name_key(archive_name))?;
+        self.entry_at(archive_index, 0)
     }
 
     pub fn read_decoded_from_archive(
@@ -192,37 +213,60 @@ impl ResourceManager {
         archive_name: &str,
         entry_name: &str,
     ) -> Result<Vec<u8>> {
-        let entry = self
-            .find_in_archive(archive_name, entry_name)
+        let (archive_index, entry_index) = self
+            .find_locator_in_archive(archive_name, entry_name)
             .ok_or_else(|| {
                 EthornellError::Parse(format!(
                     "resource not found in archive {archive_name}: {entry_name}"
                 ))
             })?;
-        self.read_by_entry_decoded(&entry)
+        self.read_locator_decoded(archive_index, entry_index)
     }
 
     pub fn read_raw(&self, name: &str) -> Result<Vec<u8>> {
-        let entry = self.find(name).ok_or_else(|| {
+        let (archive_index, entry_index) = self.find_locator(name).ok_or_else(|| {
             EthornellError::Parse(format!("resource not found in game archives: {name}"))
         })?;
-        self.read_by_entry_raw(&entry)
+        self.read_locator_raw(archive_index, entry_index)
     }
 
     pub fn read_decoded(&self, name: &str) -> Result<Vec<u8>> {
-        let entry = self.find(name).ok_or_else(|| {
+        let (archive_index, entry_index) = self.find_locator(name).ok_or_else(|| {
             EthornellError::Parse(format!("resource not found in game archives: {name}"))
         })?;
-        self.read_by_entry_decoded(&entry)
+        self.read_locator_decoded(archive_index, entry_index)
     }
 
     pub fn read_by_entry_raw(&self, entry: &ResourceEntry) -> Result<Vec<u8>> {
-        let archive = self.archive_index_for(&entry.archive_path)?;
-        let archive_entry = archive
-            .entries
+        let archive_index = self.archive_index_for_path(&entry.archive_path)?;
+        let key = normalize_resource_name(&entry.entry_name);
+        let candidates = self.inner.by_name.get(&key).ok_or_else(|| {
+            EthornellError::Parse(format!(
+                "resource entry not found: {}:{}",
+                entry.archive_path.display(),
+                entry.entry_name
+            ))
+        })?;
+
+        let entry_index = candidates
             .iter()
-            .find(|candidate| {
-                candidate.name == entry.entry_name && candidate.packed_size == entry.packed_size
+            .filter(|&&(candidate_archive, _)| candidate_archive == archive_index)
+            .find_map(|&(_, candidate_entry)| {
+                let candidate = self.inner.set.archives[archive_index].entries.get(candidate_entry)?;
+                (candidate.name == entry.entry_name && candidate.packed_size == entry.packed_size)
+                    .then_some(candidate_entry)
+            })
+            .or_else(|| {
+                // Preserve the previous case-/normalization-insensitive behavior
+                // for ResourceEntry values constructed outside this manager.
+                candidates
+                    .iter()
+                    .filter(|&&(candidate_archive, _)| candidate_archive == archive_index)
+                    .find_map(|&(_, candidate_entry)| {
+                        let candidate =
+                            self.inner.set.archives[archive_index].entries.get(candidate_entry)?;
+                        (candidate.packed_size == entry.packed_size).then_some(candidate_entry)
+                    })
             })
             .ok_or_else(|| {
                 EthornellError::Parse(format!(
@@ -231,29 +275,128 @@ impl ResourceManager {
                     entry.entry_name
                 ))
             })?;
-        read_entry_raw(&archive.path, archive_entry)
+
+        self.read_locator_raw(archive_index, entry_index)
     }
 
     pub fn read_by_entry_decoded(&self, entry: &ResourceEntry) -> Result<Vec<u8>> {
         let raw = self.read_by_entry_raw(entry)?;
-        decode_payload(&entry.entry_name, &raw)
+        decode_payload_owned(&entry.entry_name, raw)
     }
 
-    fn archive_index_for(&self, path: &Path) -> Result<&ArchiveIndex> {
-        self.set
-            .archives
+    fn find_locator(&self, name: &str) -> Option<(usize, usize)> {
+        let key = normalize_resource_name(name);
+        if let Some(matches) = self.inner.by_name.get(&key) {
+            return matches.first().copied();
+        }
+
+        // Compatibility fallback for the historical fuzzy lookup. Scan the
+        // already-normalized hash keys instead of normalizing every archive
+        // entry again on each miss. This keeps the slow path allocation-free.
+        self.inner.by_name
             .iter()
-            .find(|archive| archive.path == path)
-            .ok_or_else(|| {
-                EthornellError::Parse(format!("archive not indexed: {}", path.display()))
-            })
+            .filter(|(candidate, _)| candidate.ends_with(&key) || candidate.contains(&key))
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .and_then(|(_, matches)| matches.first().copied())
+    }
+
+    fn find_locator_in_archive(
+        &self,
+        archive_name: &str,
+        entry_name: &str,
+    ) -> Option<(usize, usize)> {
+        let archive_index = *self.inner.archive_by_name.get(&archive_name_key(archive_name))?;
+        let entry_key = normalize_resource_name(entry_name);
+        self.inner.by_name.get(&entry_key)?.iter().copied().find(
+            |&(candidate_archive, _)| candidate_archive == archive_index,
+        )
+    }
+
+    fn read_locator_raw(&self, archive_index: usize, entry_index: usize) -> Result<Vec<u8>> {
+        let archive = self.inner.set.archives.get(archive_index).ok_or_else(|| {
+            EthornellError::Parse(format!("archive index out of range: {archive_index}"))
+        })?;
+        let entry = archive.entries.get(entry_index).ok_or_else(|| {
+            EthornellError::Parse(format!(
+                "resource entry index out of range: {archive_index}:{entry_index}"
+            ))
+        })?;
+        let file = self.inner.archive_files.get(archive_index).ok_or_else(|| {
+            EthornellError::Parse(format!("archive handle index out of range: {archive_index}"))
+        })?;
+        let mut file = file
+            .lock()
+            .map_err(|_| EthornellError::Other(format!("archive handle poisoned: {}", archive.path.display())))?;
+        file.seek(SeekFrom::Start(entry.offset))?;
+        let mut data = vec![0u8; entry.packed_size as usize];
+        file.read_exact(&mut data)?;
+        Ok(data)
+    }
+
+    fn read_locator_decoded(&self, archive_index: usize, entry_index: usize) -> Result<Vec<u8>> {
+        let archive = self.inner.set.archives.get(archive_index).ok_or_else(|| {
+            EthornellError::Parse(format!("archive index out of range: {archive_index}"))
+        })?;
+        let entry = archive.entries.get(entry_index).ok_or_else(|| {
+            EthornellError::Parse(format!(
+                "resource entry index out of range: {archive_index}:{entry_index}"
+            ))
+        })?;
+        let name = entry.name.clone();
+        let raw = self.read_locator_raw(archive_index, entry_index)?;
+        decode_payload_owned(&name, raw)
+    }
+
+    fn archive_index_for_path(&self, path: &Path) -> Result<usize> {
+        self.inner.archive_by_path.get(path).copied().ok_or_else(|| {
+            EthornellError::Parse(format!("archive not indexed: {}", path.display()))
+        })
     }
 
     fn entry_at(&self, archive_index: usize, entry_index: usize) -> Option<ResourceEntry> {
-        let archive = self.set.archives.get(archive_index)?;
+        let archive = self.inner.set.archives.get(archive_index)?;
         let entry = archive.entries.get(entry_index)?;
         Some(resource_entry_from_archive(archive, entry))
     }
+}
+
+fn build_resource_lookup(
+    set: &GameArchiveSet,
+) -> (
+    HashMap<String, Vec<(usize, usize)>>,
+    HashMap<String, usize>,
+    HashMap<PathBuf, usize>,
+) {
+    let mut by_name: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut archive_by_name = HashMap::with_capacity(set.archives.len());
+    let mut archive_by_path = HashMap::with_capacity(set.archives.len());
+
+    for (archive_index, archive) in set.archives.iter().enumerate() {
+        archive_by_path
+            .entry(archive.path.clone())
+            .or_insert(archive_index);
+        if let Some(name) = archive.path.file_name().and_then(|name| name.to_str()) {
+            archive_by_name
+                .entry(archive_name_key(name))
+                .or_insert(archive_index);
+        }
+        for (entry_index, entry) in archive.entries.iter().enumerate() {
+            by_name
+                .entry(normalize_resource_name(&entry.name))
+                .or_default()
+                .push((archive_index, entry_index));
+        }
+    }
+
+    (by_name, archive_by_name, archive_by_path)
+}
+
+fn archive_name_key(name: &str) -> String {
+    Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -463,6 +606,23 @@ pub fn decode_payload(name: &str, raw: &[u8]) -> Result<Vec<u8>> {
         )))
     } else {
         Ok(raw.to_vec())
+    }
+}
+
+fn decode_payload_owned(name: &str, raw: Vec<u8>) -> Result<Vec<u8>> {
+    if raw.starts_with(MAGIC_DSC_FORMAT) {
+        dsc_decode(&raw).map_err(|err| {
+            EthornellError::UnsupportedFormat(format!("DSC decode failed for {name}: {err}"))
+        })
+    } else if raw.starts_with(b"BSE 1.") {
+        Err(EthornellError::UnsupportedFormat(format!(
+            "BSE wrapped entry is not decoded yet: {name}"
+        )))
+    } else {
+        // The ResourceManager already owns the entry bytes. Returning that
+        // allocation directly avoids a second full-buffer copy for ordinary
+        // BP/image/audio resources.
+        Ok(raw)
     }
 }
 
@@ -946,5 +1106,58 @@ mod tests {
             unique_output_path(Path::new("out/free-name")),
             PathBuf::from("out/free-name")
         );
+    }
+
+
+    #[test]
+    fn resource_lookup_indexes_archive_and_entry_without_listing() {
+        let set = GameArchiveSet {
+            root: PathBuf::from("game"),
+            archives: vec![
+                ArchiveIndex {
+                    path: PathBuf::from("game/system.arc"),
+                    format: ArchiveFormat::BurikoArc20,
+                    entries: vec![ArchiveEntry {
+                        name: "IPL._BP".to_string(),
+                        offset: 0x100,
+                        packed_size: 64,
+                        unpacked_size: None,
+                        flags: 0,
+                        method: None,
+                    }],
+                },
+                ArchiveIndex {
+                    path: PathBuf::from("game/sysprg.arc"),
+                    format: ArchiveFormat::BurikoArc20,
+                    entries: vec![ArchiveEntry {
+                        name: "ipl._bp".to_string(),
+                        offset: 0x200,
+                        packed_size: 96,
+                        unpacked_size: None,
+                        flags: 0,
+                        method: None,
+                    }],
+                },
+            ],
+        };
+        let (by_name, archive_by_name, archive_by_path) = build_resource_lookup(&set);
+        let manager = ResourceManager {
+            inner: Arc::new(ResourceManagerInner {
+                set,
+                by_name,
+                archive_by_name,
+                archive_by_path,
+                archive_files: Vec::new(),
+            }),
+        };
+
+        assert_eq!(manager.find_locator("ipl._bp"), Some((0, 0)));
+        assert_eq!(
+            manager.find_locator_in_archive("SYSPRG.ARC", "IPL._BP"),
+            Some((1, 0))
+        );
+        let entry = manager.find_in_archive("system.arc", "ipl._bp").unwrap();
+        assert_eq!(entry.archive_path, PathBuf::from("game/system.arc"));
+        assert_eq!(entry.packed_size, 64);
     }
 }

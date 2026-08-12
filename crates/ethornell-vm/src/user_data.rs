@@ -74,6 +74,85 @@ impl Vm {
         true
     }
 
+    pub(crate) fn save_config_slot<A: SysApi>(
+        &mut self,
+        api: &mut A,
+        slot: i32,
+        label: &str,
+    ) -> VmResult<bool> {
+        let (encoded_label, _, _) = encoding_rs::SHIFT_JIS.encode(label);
+        if encoded_label.len() >= 40 {
+            return Err(VmError::Runtime(
+                "Sys80:78 save label must be shorter than 40 Shift-JIS bytes".into(),
+            ));
+        }
+        let mut bytes = vec![0u8; 64 + self.global_config.len()];
+        write_native_system_time(&mut bytes[..16]);
+        bytes[16..16 + encoded_label.len()].copy_from_slice(&encoded_label);
+        bytes[16 + encoded_label.len()] = 0;
+        bytes[64..].copy_from_slice(&self.global_config);
+        if self.save_data_integrity_enabled != 0 {
+            encrypt_config_slot(&mut bytes);
+        }
+        Ok(api.write_file_bytes(&config_slot_name(slot), &bytes))
+    }
+
+    pub(crate) fn load_config_slot<A: SysApi>(&mut self, api: &mut A, slot: i32) -> i32 {
+        let preserved_len = self.global_config.len().min(1024);
+        let preserved = self.global_config[..preserved_len].to_vec();
+        let status = match self.read_config_slot(api, slot) {
+            Ok(bytes) => {
+                self.global_config.copy_from_slice(&bytes[64..]);
+                0
+            }
+            Err(status) => status,
+        };
+        self.global_config[..preserved_len].copy_from_slice(&preserved);
+        status
+    }
+
+    pub(crate) fn read_config_slot_header<A: SysApi>(
+        &mut self,
+        api: &mut A,
+        slot: i32,
+    ) -> Result<[u8; 64], i32> {
+        let Some(bytes) = api.read_user_file_bytes(&config_slot_name(slot)) else {
+            return Err(1);
+        };
+        if bytes.is_empty() {
+            return Err(1);
+        }
+        if bytes.len() != 64 + self.global_config.len() {
+            return Err(2);
+        }
+        let mut header = [0u8; 64];
+        header.copy_from_slice(&bytes[..64]);
+        Ok(header)
+    }
+
+    pub(crate) fn validate_config_slot<A: SysApi>(&mut self, api: &mut A, slot: i32) -> i32 {
+        match self.read_config_slot(api, slot) {
+            Ok(_) => 0,
+            Err(status) => status,
+        }
+    }
+
+    fn read_config_slot<A: SysApi>(&mut self, api: &mut A, slot: i32) -> Result<Vec<u8>, i32> {
+        let Some(mut bytes) = api.read_user_file_bytes(&config_slot_name(slot)) else {
+            return Err(1);
+        };
+        if bytes.is_empty() {
+            return Err(1);
+        }
+        if bytes.len() != 64 + self.global_config.len() {
+            return Err(2);
+        }
+        if self.save_data_integrity_enabled != 0 && !decrypt_and_validate_config_slot(&mut bytes) {
+            return Err(3);
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn load_global_user_data<A: SysApi>(
         &mut self,
         api: &mut A,
@@ -138,11 +217,7 @@ impl Vm {
     }
 
     fn serialize_global_data(&self) -> Vec<u8> {
-        let names = self
-            .string_hash_tables
-            .get(&i32::MIN)
-            .cloned()
-            .unwrap_or_default();
+        let names = self.resource_names.clone();
         let names_size = 4usize + names.iter().map(|name| sjis_len(name) + 1).sum::<usize>();
         let read_flags_size = 4usize
             + self
@@ -207,11 +282,7 @@ impl Vm {
         for _ in 0..name_count {
             names.push(read_sjis_c_string(raw, &mut cursor)?);
         }
-        if names.is_empty() {
-            self.string_hash_tables.remove(&i32::MIN);
-        } else {
-            self.string_hash_tables.insert(i32::MIN, names);
-        }
+        self.resource_names = names;
 
         let flag_count = read_u32_at_cursor(raw, &mut cursor)? as usize;
         self.read_flags.clear();
@@ -238,6 +309,83 @@ impl Vm {
             status: 0,
         })
     }
+}
+
+fn config_slot_name(slot: i32) -> String {
+    format!("BGI{slot:04}.cad")
+}
+
+fn write_native_system_time(destination: &mut [u8]) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = now.as_secs();
+    let days = (seconds / 86_400) as i64;
+    let (year, month, day) = civil_from_days_for_save(days);
+    let fields = [
+        year as u16,
+        month as u16,
+        ((seconds / 86_400 + 4) % 7) as u16,
+        day as u16,
+        ((seconds / 3_600) % 24) as u16,
+        ((seconds / 60) % 60) as u16,
+        (seconds % 60) as u16,
+        now.subsec_millis() as u16,
+    ];
+    for (index, value) in fields.into_iter().enumerate() {
+        destination[index * 2..index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn civil_from_days_for_save(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe as i32 + era as i32 * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i32::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+fn slot_random_next(state: &mut u32) -> u16 {
+    let high = ((22_695_477u64 * u64::from(*state)) >> 16) as u16;
+    *state = (u32::from(high) << 16)
+        .wrapping_add(u32::from((20_021u32.wrapping_mul(*state)) as u16))
+        .wrapping_add(1);
+    high & 0x7fff
+}
+
+fn encrypt_config_slot(bytes: &mut [u8]) {
+    let mut state = u32::from(u16::from_le_bytes([bytes[14], bytes[15]]));
+    let mut sum = 0u8;
+    let mut xor = 0u8;
+    for byte in &mut bytes[64..] {
+        *byte = byte.wrapping_add(slot_random_next(&mut state) as u8);
+        sum = sum.wrapping_add(*byte);
+        xor ^= *byte;
+    }
+    bytes[56] = sum;
+    bytes[57] = xor;
+    bytes[58] = slot_random_next(&mut state) as u8;
+    bytes[59] = slot_random_next(&mut state) as u8;
+    bytes[60] = 1;
+}
+
+fn decrypt_and_validate_config_slot(bytes: &mut [u8]) -> bool {
+    let mut state = u32::from(u16::from_le_bytes([bytes[14], bytes[15]]));
+    let mut sum = 0u8;
+    let mut xor = 0u8;
+    for byte in &mut bytes[64..] {
+        let encrypted = *byte;
+        sum = sum.wrapping_add(encrypted);
+        xor ^= encrypted;
+        *byte = encrypted.wrapping_sub(slot_random_next(&mut state) as u8);
+    }
+    bytes[56] == sum && bytes[57] == xor
 }
 
 fn encode_dcfs(raw: &[u8], record_size: usize, record_count: usize) -> VmResult<Vec<u8>> {
@@ -500,8 +648,7 @@ mod tests {
     fn global_payload_round_trips_memory_names_and_flags() {
         let mut vm = Vm::new();
         vm.global_user_data[123..127].copy_from_slice(&[1, 2, 3, 4]);
-        vm.string_hash_tables
-            .insert(i32::MIN, vec!["BG0001".into(), "face".into()]);
+        vm.resource_names = vec!["BG0001".into(), "face".into()];
         vm.read_flags
             .insert("main".into(), crate::ReadFlagBits::new(17));
         vm.read_flags.get_mut("main").unwrap().set(16, true);
@@ -512,12 +659,125 @@ mod tests {
         assert_eq!(result.status, 0);
         assert_eq!(&restored.global_user_data[123..127], &[1, 2, 3, 4]);
         assert_eq!(
-            restored.string_hash_tables.get(&i32::MIN).unwrap(),
-            &["BG0001".to_string(), "face".to_string()]
+            restored.resource_names,
+            vec!["BG0001".to_string(), "face".to_string()]
         );
         assert_eq!(
             restored.read_flags.get("main").unwrap().contains(16),
             Some(true)
         );
+    }
+
+    #[derive(Default)]
+    struct SlotApi {
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+    }
+
+    impl SysApi for SlotApi {
+        fn call_sys(&mut self, _call: &mut crate::NativeCallFrame) -> VmResult<crate::Value> {
+            unreachable!("slot tests invoke only the file hooks")
+        }
+
+        fn write_file_bytes(&mut self, path: &str, bytes: &[u8]) -> bool {
+            self.files.insert(path.to_owned(), bytes.to_vec());
+            true
+        }
+
+        fn read_user_file_bytes(&mut self, path: &str) -> Option<Vec<u8>> {
+            self.files.get(path).cloned()
+        }
+    }
+
+    #[test]
+    fn config_slot_prng_matches_target_first_step() {
+        let mut state = 1u32;
+        assert_eq!(slot_random_next(&mut state), 346);
+        assert_eq!(state, 0x015A_4E36);
+    }
+
+    #[test]
+    fn config_slot_save_validate_header_and_load_match_native_contract() {
+        let mut vm = Vm::new();
+        assert!(vm.allocate_global_config(0));
+        for (index, byte) in vm.global_config.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let original = vm.global_config.clone();
+        vm.save_data_integrity_enabled = 1;
+        let mut api = SlotApi::default();
+
+        assert!(vm.save_config_slot(&mut api, 7, "slot-seven").unwrap());
+        let encoded = api.files.get("BGI0007.cad").unwrap();
+        assert_eq!(encoded.len(), 64 + original.len());
+        assert_eq!(&encoded[16..26], b"slot-seven");
+        assert_eq!(encoded[26], 0);
+        assert_eq!(encoded[60], 1);
+        assert_ne!(&encoded[64..], original.as_slice());
+        assert_eq!(vm.validate_config_slot(&mut api, 7), 0);
+        assert_eq!(
+            &vm.read_config_slot_header(&mut api, 7).unwrap()[16..26],
+            b"slot-seven"
+        );
+
+        vm.global_config.fill(0xEE);
+        assert_eq!(vm.load_config_slot(&mut api, 7), 0);
+        assert!(vm.global_config[..1024].iter().all(|byte| *byte == 0xEE));
+        assert_eq!(&vm.global_config[1024..], &original[1024..]);
+    }
+
+    #[test]
+    fn config_slot_status_codes_distinguish_missing_size_and_integrity() {
+        let mut vm = Vm::new();
+        assert!(vm.allocate_global_config(0));
+        vm.save_data_integrity_enabled = 1;
+        let mut api = SlotApi::default();
+
+        assert_eq!(vm.validate_config_slot(&mut api, 1), 1);
+        api.files.insert("BGI0001.cad".into(), vec![0; 65]);
+        assert_eq!(vm.validate_config_slot(&mut api, 1), 2);
+
+        vm.save_config_slot(&mut api, 1, "valid").unwrap();
+        api.files.get_mut("BGI0001.cad").unwrap()[64] ^= 0x80;
+        assert_eq!(vm.validate_config_slot(&mut api, 1), 3);
+        assert!(vm.save_config_slot(&mut api, 2, &"x".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn config_slot_selectors_use_the_target_vm_dispatch_path() {
+        let mut vm = Vm::new();
+        assert!(vm.allocate_global_config(0));
+        vm.global_config.fill(0x5a);
+        let mut api = SlotApi::default();
+
+        vm.stack
+            .extend([crate::Value::Int(12), crate::Value::Str("dispatch".into())]);
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut api, 0x80, 0x78).unwrap(),
+            Some(crate::Value::None)
+        );
+        assert!(api.files.contains_key("BGI0012.cad"));
+
+        let header = 0x3200;
+        vm.stack
+            .extend([crate::Value::Ptr(header), crate::Value::Int(12)]);
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut api, 0x80, 0x7a).unwrap(),
+            Some(crate::Value::Int(0))
+        );
+        assert_eq!(vm.read_c_string(header + 16).unwrap(), "dispatch");
+
+        vm.stack.push(crate::Value::Int(12));
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut api, 0x80, 0x7b).unwrap(),
+            Some(crate::Value::Int(0))
+        );
+        vm.global_config[1024..].fill(0);
+        vm.stack.push(crate::Value::Int(12));
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut api, 0x80, 0x79).unwrap(),
+            Some(crate::Value::Int(0))
+        );
+        assert!(vm.global_config[1024..].iter().all(|byte| *byte == 0x5a));
+        assert!(vm.stack.is_empty());
     }
 }

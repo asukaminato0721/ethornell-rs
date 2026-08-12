@@ -255,15 +255,9 @@ mod tests {
     #[test]
     fn legacy_device_create_writes_the_output_handle() {
         let mut vm = Vm::new();
-        vm.stack.extend([
-            Value::Ptr(0x1200_0100),
-            Value::Int(0),
-            Value::Int(0),
-        ]);
-        assert_eq!(
-            vm.execute_legacy_3d(0x00).unwrap(),
-            Some(Value::Int(1))
-        );
+        vm.stack
+            .extend([Value::Ptr(0x1200_0100), Value::Int(0), Value::Int(0)]);
+        assert_eq!(vm.execute_legacy_3d(0x00).unwrap(), Some(Value::Int(1)));
         assert_eq!(vm.read_int(0x1200_0100, 2).unwrap(), 1);
     }
 }

@@ -1,4 +1,4 @@
-use crate::{known_call_name, BpInstruction, BpOperand, BpProgram};
+use crate::{candidate_call_name, BpInstruction, BpOperand, BpProgram};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,8 +44,9 @@ impl CallKey {
         CallDomain::from_group(self.group)
     }
 
+    /// Diagnostic candidate label. This is not a target-recovery status.
     pub fn name(self) -> Option<&'static str> {
-        known_call_name(self.group, self.id)
+        candidate_call_name(self.group, self.id)
     }
 
     pub fn arg_count(self) -> Option<usize> {
@@ -76,6 +77,9 @@ pub struct CallSummary {
     pub inferred_arg_counts: Vec<InferredArgCount>,
     pub scripts: Vec<String>,
     pub known: bool,
+    pub registered: bool,
+    pub generic: bool,
+    pub used: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,9 +141,34 @@ pub fn summarize_call_sites(sites: impl IntoIterator<Item = CallSite>) -> Vec<Ca
                 inferred_arg_counts: Vec::new(),
                 scripts: scripts.into_iter().take(12).collect(),
                 known: name.is_some(),
+                registered: crate::native_abi::lookup(key.group, key.id).is_some(),
+                generic: is_generic_native_name(key),
+                used: true,
             }
         })
         .collect()
+}
+
+pub fn registered_call_summary(key: CallKey) -> Option<CallSummary> {
+    crate::native_abi::lookup(key.group, key.id)?;
+    let name = key.name();
+    Some(CallSummary {
+        key,
+        domain: key.domain(),
+        name,
+        count: 0,
+        arg_count: key.arg_count(),
+        inferred_arg_counts: Vec::new(),
+        scripts: Vec::new(),
+        known: name.is_some(),
+        registered: true,
+        generic: is_generic_native_name(key),
+        used: false,
+    })
+}
+
+fn is_generic_native_name(key: CallKey) -> bool {
+    key.name() == crate::native_abi::generic_name(key.group, key.id)
 }
 
 pub fn infer_program_call_arg_counts(program: &BpProgram) -> Vec<CallSiteArgCount> {
@@ -237,7 +266,7 @@ impl StackEffectState {
             }
             "ret" | "script_ret" => self.depth = 0,
             "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shl" | "shr"
-            | "sar" | "eq" | "neq" | "leq" | "geq" | "lt" | "gt" | "dnotzero" | "dnotzero2" => {
+            | "sar" | "eq" | "neq" | "leq" | "geq" | "lt" | "gt" | "boolean_and" | "boolean_or" => {
                 self.pop(1)
             }
             "not" | "bool_zero" | "sin" | "cos" => {}
@@ -268,7 +297,7 @@ fn builtin_stack_effect(name: &str) -> Option<(usize, bool)> {
         "free" | "assert" => (1, false),
         "memclr" | "strcpy" | "message_box" | "dumpmem" => (2, false),
         "streq" => (2, true),
-        "memcmp" => (3, true),
+        "memory_equal" => (3, true),
         "strfind" => (2, true),
         "memcpy" | "memset" | "strconcat" | "sprintf" | "addmemboundary" => (3, false),
         "memrepeat" => (4, false),
@@ -340,7 +369,9 @@ fn native_corrected_call_arg_count(group: u8, id: u16) -> Option<usize> {
         (0x92, 0xf1) | (0x92, 0xf2) => 5,
         (0x80, 0x1f) | (0x92, 0x89) | (0xc0, 0x45) => 6,
         (0x90, 0x19) | (0x92, 0x97) | (0xc0, 0x46) => 7,
+        (0x90, 0x24) => 12,
         (0x90, 0x29) => 12,
+        (0x90, 0x2c) => 9,
         (0x80, 0xf2) => 14,
         (0x90, 0x5d) => 20,
         (0x91, 0x60) | (0x80, 0x80) => 0,
@@ -596,6 +627,7 @@ pub fn known_call_arg_count(group: u8, id: u16) -> Option<usize> {
         | (0x92, 0x16)
         | (0x92, 0x8c)
         | (0x92, 0xf4)
+        | (0x92, 0xf6)
         | (0x92, 0x88) => 2,
         (0x90, 0xd5)
         | (0x90, 0xd6)
@@ -614,15 +646,13 @@ pub fn known_call_arg_count(group: u8, id: u16) -> Option<usize> {
         | (0x91, 0x1e)
         | (0x91, 0x36)
         | (0x91, 0x3e)
-        | (0x91, 0x4a)
-        | (0x92, 0x18) => 4,
+        | (0x91, 0x4a) => 4,
         (0x90, 0x0e) | (0x90, 0x88) | (0x91, 0x0e) | (0x91, 0x10) | (0x91, 0x13) | (0x91, 0x15) => {
             5
         }
         (0x90, 0x18) | (0x90, 0x90) | (0x91, 0x12) | (0x91, 0x98) => 6,
         (0x90, 0x1e) => 8,
-        (0x90, 0x22)
-        | (0x90, 0x56)
+        (0x90, 0x56)
         | (0x90, 0x66)
         | (0x90, 0x85)
         | (0x91, 0x16)
@@ -689,16 +719,15 @@ pub fn known_call_arg_count(group: u8, id: u16) -> Option<usize> {
 /// recovered directly from the eight native secondary dispatch tables and
 /// call `sub_4450D0` more than once on their successful path.
 pub fn known_call_stack_output_count(group: u8, id: u16) -> usize {
-    match (group, id) {
-        (0x80, 0x08) | (0x80, 0x0d) | (0x90, 0xd7) | (0xc0, 0x17) => 2,
-        (0x80, 0x80) | (0x91, 0x8d) => 3,
-        _ => usize::from(known_call_returns_value(group, id)),
+    if let Some(abi) = crate::native_abi::lookup(group, id) {
+        return abi.stack_outputs;
     }
+    usize::from(known_call_returns_value(group, id))
 }
 
 pub fn known_call_returns_value(group: u8, id: u16) -> bool {
     if let Some(abi) = crate::native_abi::lookup(group, id) {
-        return abi.returns_value && !crate::native_abi::installs_procedure(group, id);
+        return abi.returns_value();
     }
     matches!(
         (group, id),
@@ -810,4 +839,15 @@ pub fn known_call_returns_value(group: u8, id: u16) -> bool {
             | (0xb0, 0xc1)
             | (0xb0, 0xc4)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::known_call_arg_count;
+
+    #[test]
+    fn graph_control_selectors_follow_target_abi_descriptor() {
+        assert_eq!(known_call_arg_count(0x90, 0x21), Some(9));
+        assert_eq!(known_call_arg_count(0x90, 0x22), Some(7));
+    }
 }

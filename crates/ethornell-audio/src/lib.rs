@@ -3,7 +3,7 @@ use kira::dsp::Frame;
 use kira::manager::{AudioManager, AudioManagerSettings};
 use kira::sound::{
     static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
-    PlaybackState,
+    PlaybackPosition, PlaybackState,
 };
 use kira::tween::Tween;
 use serde::Serialize;
@@ -191,6 +191,52 @@ impl AudioSystem {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_intro_loop_on_channel(
+        &mut self,
+        channel: i32,
+        intro_bytes: &[u8],
+        loop_bytes: &[u8],
+        looped: bool,
+        volume: f64,
+        decode_gain: f64,
+        playback_rate: f64,
+        panning: f64,
+        fade_in_ms: u64,
+        restart: bool,
+    ) -> Result<bool> {
+        if !restart && self.channel_is_active(channel) {
+            return Ok(false);
+        }
+
+        let intro = decode_static_sound(intro_bytes)?;
+        let loop_sound = decode_static_sound(loop_bytes)?;
+        if intro.sample_rate != loop_sound.sample_rate {
+            return Err(EthornellError::Other(format!(
+                "BGM pair sample-rate mismatch: intro={}Hz loop={}Hz",
+                intro.sample_rate, loop_sound.sample_rate
+            )));
+        }
+
+        let loop_start = intro.frames.len();
+        let mut frames = Vec::with_capacity(loop_start.saturating_add(loop_sound.frames.len()));
+        frames.extend_from_slice(&intro.frames);
+        frames.extend_from_slice(&loop_sound.frames);
+
+        let mut settings = playback_settings(volume, playback_rate, panning, fade_in_ms);
+        if looped {
+            settings = settings
+                .loop_region(PlaybackPosition::Samples(loop_start.min(i64::MAX as usize) as i64)..);
+        }
+        let mut data = StaticSoundData {
+            sample_rate: intro.sample_rate,
+            frames: frames.into(),
+            settings,
+        };
+        apply_decode_gain(&mut data, decode_gain);
+        self.start_static_sound(channel, data)
+    }
+
     fn play_on_channel_inner(
         &mut self,
         channel: i32,
@@ -207,35 +253,17 @@ impl AudioSystem {
             return Ok(false);
         }
         let payload = unwrap_buriko_wave_ogg(bytes).unwrap_or(bytes);
-        let mut settings = StaticSoundSettings::default()
-            .volume(volume.clamp(0.0, 1.0))
-            .playback_rate(playback_rate.clamp(0.01, 16.0))
-            .panning(panning.clamp(0.0, 1.0));
+        let mut settings = playback_settings(volume, playback_rate, panning, fade_in_ms);
         if looped {
             settings = settings.loop_region(..);
         }
-        if fade_in_ms > 0 {
-            settings = settings.fade_in_tween(Tween {
-                duration: Duration::from_millis(fade_in_ms),
-                ..Tween::default()
-            });
-        }
         let mut data = StaticSoundData::from_cursor(Cursor::new(payload.to_vec()), settings)
             .map_err(|err| EthornellError::Other(format!("load audio bytes failed: {err}")))?;
-        let decode_gain = decode_gain.max(0.0) as f32;
-        if (decode_gain - 1.0).abs() > f32::EPSILON {
-            data.frames = data
-                .frames
-                .iter()
-                .map(|frame| {
-                    Frame::new(
-                        (frame.left * decode_gain).clamp(-1.0, 1.0),
-                        (frame.right * decode_gain).clamp(-1.0, 1.0),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into();
-        }
+        apply_decode_gain(&mut data, decode_gain);
+        self.start_static_sound(channel, data)
+    }
+
+    fn start_static_sound(&mut self, channel: i32, data: StaticSoundData) -> Result<bool> {
         let handle = self
             .manager
             .play(data)
@@ -317,4 +345,50 @@ impl AudioSystem {
     pub fn volume(&self) -> f64 {
         self.volume
     }
+}
+
+fn decode_static_sound(bytes: &[u8]) -> Result<StaticSoundData> {
+    let payload = unwrap_buriko_wave_ogg(bytes).unwrap_or(bytes);
+    StaticSoundData::from_cursor(
+        Cursor::new(payload.to_vec()),
+        StaticSoundSettings::default(),
+    )
+    .map_err(|err| EthornellError::Other(format!("load audio bytes failed: {err}")))
+}
+
+fn playback_settings(
+    volume: f64,
+    playback_rate: f64,
+    panning: f64,
+    fade_in_ms: u64,
+) -> StaticSoundSettings {
+    let mut settings = StaticSoundSettings::default()
+        .volume(volume.clamp(0.0, 1.0))
+        .playback_rate(playback_rate.clamp(0.01, 16.0))
+        .panning(panning.clamp(0.0, 1.0));
+    if fade_in_ms > 0 {
+        settings = settings.fade_in_tween(Tween {
+            duration: Duration::from_millis(fade_in_ms),
+            ..Tween::default()
+        });
+    }
+    settings
+}
+
+fn apply_decode_gain(data: &mut StaticSoundData, decode_gain: f64) {
+    let decode_gain = decode_gain.max(0.0) as f32;
+    if (decode_gain - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    data.frames = data
+        .frames
+        .iter()
+        .map(|frame| {
+            Frame::new(
+                (frame.left * decode_gain).clamp(-1.0, 1.0),
+                (frame.right * decode_gain).clamp(-1.0, 1.0),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into();
 }

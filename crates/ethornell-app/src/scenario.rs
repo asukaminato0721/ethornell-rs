@@ -1,3 +1,4 @@
+use crate::timing::duration_ms_to_ticks;
 #[cfg(test)]
 use ethornell_script::bcs::BcsSymbol;
 use ethornell_script::bcs::{parse_bcs, BcsCommand, BcsProgram, BcsValue};
@@ -241,7 +242,7 @@ impl ScenarioPlayback {
                 let action = self.decoder.actions.remove(0);
                 match action {
                     ScenarioAction::Wait { frames } => {
-                        self.wait_frames = frames;
+                        self.wait_frames = frames.saturating_sub(1);
                         return (None, input_consumed);
                     }
                     ScenarioAction::WaitForInput => {
@@ -1178,7 +1179,7 @@ fn visual_hints(values: &[BcsValue]) -> VisualHints {
                     && (-1280..=1280).contains(x)
             }),
             z,
-            opacity: None,
+            opacity: native_transparency_hint(values, slot).map(script_transparency_to_opacity),
             body_layer: None,
         };
     }
@@ -1204,7 +1205,7 @@ fn visual_hints(values: &[BcsValue]) -> VisualHints {
         slot,
         x,
         z,
-        opacity: None,
+        opacity: native_transparency_hint(values, slot).map(script_transparency_to_opacity),
         body_layer: None,
     }
 }
@@ -1235,18 +1236,15 @@ fn transform_hints(values: &[BcsValue]) -> Option<TransformHints> {
         .filter(|slot| (0..=99).contains(slot))?;
     let wait_frames = duration_frames(values).unwrap_or(1);
     let duration_ms = duration_millis(values);
-    let positive_opacity =
-        ints.iter().rev().copied().find(|value| {
-            (2..=256).contains(value) && *value != slot && Some(*value) != duration_ms
-        });
-    let opacity = positive_opacity.map(script_opacity);
+    let transparency_parameter = native_transparency_hint(values, Some(slot));
+    let opacity = transparency_parameter.map(script_transparency_to_opacity);
     let coord_values = ints
         .iter()
         .skip(1)
         .copied()
         .filter(|value| {
             Some(*value) != duration_ms
-                && Some(*value) != positive_opacity
+                && Some(*value) != transparency_parameter
                 && *value != i32::MIN + 1
                 && (-1280..=1280).contains(value)
         })
@@ -1264,8 +1262,26 @@ fn transform_hints(values: &[BcsValue]) -> Option<TransformHints> {
     })
 }
 
-fn script_opacity(value: i32) -> f32 {
-    (value as f32 / 256.0).clamp(0.0, 1.0)
+fn native_transparency_hint(values: &[BcsValue], slot: Option<i32>) -> Option<i32> {
+    let ints = values.iter().filter_map(value_i32).collect::<Vec<_>>();
+    let duration = duration_millis(values);
+    let search_end = duration
+        .and_then(|duration| ints.iter().rposition(|value| *value == duration))
+        .unwrap_or(ints.len());
+    // BCS sprite/transform helpers place the target display alpha immediately
+    // before the duration. Preserve zero: it is the native fully-opaque value,
+    // not a missing argument.
+    ints[..search_end]
+        .iter()
+        .rev()
+        .copied()
+        .find(|value| (0..=256).contains(value) && Some(*value) != slot)
+}
+
+fn script_transparency_to_opacity(value: i32) -> f32 {
+    // BGI display alpha is transparency in 1/256 units, matching CDspObj.
+    // 0 is fully opaque and 256 is fully transparent.
+    (1.0 - value.clamp(0, 256) as f32 / 256.0).clamp(0.0, 1.0)
 }
 
 fn action_wait_frames(action: &ScenarioAction) -> Option<u32> {
@@ -1298,7 +1314,7 @@ fn looks_like_script_name(text: &str) -> bool {
 }
 
 fn duration_frames(values: &[BcsValue]) -> Option<u32> {
-    duration_millis(values).map(|duration| (duration as u32).div_ceil(16).max(1))
+    duration_millis(values).map(duration_ms_to_ticks)
 }
 
 fn duration_millis(values: &[BcsValue]) -> Option<i32> {
@@ -1653,6 +1669,57 @@ mod tests {
         assert_eq!(playback.globals.get(&9), Some(&BcsValue::Int(1)));
         assert!(playback.operand_stack.is_empty());
         assert!(playback.pending_arg_count.is_none());
+    }
+
+    #[test]
+    fn one_tick_wait_resumes_on_the_following_tick() {
+        let program = program(vec![
+            command(0x1c, 0, Some("push_dword"), vec![BcsValue::Int(16)]),
+            command(0x24, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x2c, 0x120, Some("cmd0x120"), Vec::new()),
+            command(
+                0x34,
+                0x3,
+                Some("push_string"),
+                vec![BcsValue::Str("「after one tick」".into())],
+            ),
+            command(0x3c, 0x3f, Some("nargs"), vec![BcsValue::Int(1)]),
+            command(0x44, 0x140, Some("say"), Vec::new()),
+            command(0x4c, 0x1b, Some("ret"), Vec::new()),
+        ]);
+        let mut playback = ScenarioPlayback::from_program(program).expect("program");
+
+        assert!(playback.tick(false).0.is_none());
+        assert!(matches!(
+            playback.tick(false).0,
+            Some(ScenarioAction::Message { text, .. }) if text == "「after one tick」"
+        ));
+    }
+
+    #[test]
+    fn scenario_alpha_values_are_native_transparency() {
+        assert_eq!(script_transparency_to_opacity(0), 1.0);
+        assert!((script_transparency_to_opacity(128) - 0.5).abs() < 0.0001);
+        assert_eq!(script_transparency_to_opacity(256), 0.0);
+    }
+
+    #[test]
+    fn scenario_transparency_hint_preserves_zero_and_uses_the_value_before_duration() {
+        let opaque = [
+            BcsValue::Int(3),
+            BcsValue::Int(640),
+            BcsValue::Int(0),
+            BcsValue::Int(250),
+        ];
+        assert_eq!(native_transparency_hint(&opaque, Some(3)), Some(0));
+
+        let hidden = [
+            BcsValue::Int(3),
+            BcsValue::Int(640),
+            BcsValue::Int(256),
+            BcsValue::Int(250),
+        ];
+        assert_eq!(native_transparency_hint(&hidden, Some(3)), Some(256));
     }
 
     #[test]

@@ -1,51 +1,52 @@
 use super::*;
+use ethornell_vm::SysApi;
 
 #[derive(Default)]
 pub(super) struct NativeSystemState {
     input_mapping_mode: i32,
-    power_wait_mode: i32,
+    pub(super) main_loop_wait_override: i32,
     pub(super) drag_drop_enabled: bool,
+    pub(super) fullscreen_hotkeys_enabled: bool,
+    pub(super) fullscreen_hotkeys: Vec<i32>,
+    pub(super) display_scaling_mode: i32,
+    pub(super) cursor_index: i32,
+    pub(super) native_close_mode: i32,
+    pub(super) raster_wait_enabled: i32,
+    pub(super) bootstrap_root_or_archive: String,
+    pub(super) bootstrap_namespace: String,
     cursor_button_mode: i32,
-    event_base: i32,
-    event_serial: i32,
-    named_threads: BTreeMap<String, i32>,
-    pub(super) save_headers: BTreeMap<i32, [u8; 64]>,
-    uninstaller_product: String,
+    pub(super) uninstaller_mutex_name: String,
+    pub(super) restart_working_directory: String,
+    pub(super) restart_command_line: String,
+    pub(super) restart_error_message: String,
 }
 
 impl RuntimeTraceApi {
     pub(super) fn dispatch_native_system(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> Option<ethornell_vm::VmResult<ethornell_vm::Value>> {
+        let (group, id) = (call.group(), call.id());
+        let stack = call.args_mut();
         if group != 0x80 {
             return None;
         }
 
         let value = match id {
-            // sub_487E90/sub_45FEF0 returns the native renderer's last
-            // presentation status. A completed portable frame has status zero.
-            0x09 => ethornell_vm::Value::Int(0),
-            // VM-owned output: the 64-byte graphics capability record.
-            0x0A => {
-                let _destination = stack.pop();
-                ethornell_vm::Value::None
-            }
-            // sub_461EB0 queries native graphics memory usage. The portable
-            // renderer does not reserve an independently queryable D3D heap.
-            0x0B => ethornell_vm::Value::Int(0),
             // sub_49A240 is the WM_ACTIVATE/minimize latch.
             0x0E => ethornell_vm::Value::Int(i32::from(self.pending_window_minimize)),
             0x10 => {
                 self.native_system.input_mapping_mode = pop_int_value(stack).unwrap_or_default();
                 ethornell_vm::Value::None
             }
-            // VM-owned input and output-pointer calls.
             0x1D => {
-                let _ = pop_args(stack, 2);
-                ethornell_vm::Value::Int(0)
+                let input_descriptor = pop_int_value(stack).unwrap_or_default();
+                let scope = pop_int_value(stack).unwrap_or_default();
+                ethornell_vm::Value::Int(ethornell_vm::SysApi::query_scoped_input_event(
+                    self,
+                    input_descriptor,
+                    scope,
+                ))
             }
             0x1E => {
                 let mode = pop_int_value(stack).unwrap_or_default();
@@ -54,6 +55,23 @@ impl RuntimeTraceApi {
                     self.native_system.cursor_button_mode = mode;
                 }
                 ethornell_vm::Value::Int(i32::from(accepted))
+            }
+            0x1F => {
+                let cancel_on_large_move = pop_int_value(stack).unwrap_or_default();
+                let updates_per_second = pop_int_value(stack).unwrap_or_default();
+                let duration_ms = pop_int_value(stack).unwrap_or_default();
+                let interpolation_mode = pop_int_value(stack).unwrap_or_default();
+                let target_y = pop_int_value(stack).unwrap_or_default();
+                let target_x = pop_int_value(stack).unwrap_or_default();
+                self.configure_cursor_motion(
+                    cancel_on_large_move,
+                    updates_per_second,
+                    duration_ms,
+                    interpolation_mode,
+                    target_y,
+                    target_x,
+                );
+                ethornell_vm::Value::None
             }
             0x24 => {
                 let recursive = pop_int_value(stack).unwrap_or_default() != 0;
@@ -73,8 +91,8 @@ impl RuntimeTraceApi {
                 let from = pop_string_value(stack).unwrap_or_default();
                 let to = pop_string_value(stack).unwrap_or_default();
                 let ok = match (
-                    runtime_file_path(&self.manager, &from),
-                    runtime_file_path(&self.manager, &to),
+                    runtime_file_path_from_root(&self.manager, &self.native_root, &from),
+                    runtime_file_path_from_root(&self.manager, &self.native_root, &to),
                 ) {
                     (Some(from), Some(to)) => {
                         if let Some(parent) = to.parent() {
@@ -87,39 +105,61 @@ impl RuntimeTraceApi {
                 tracing::info!(from, to, ok, "MoveFile");
                 ethornell_vm::Value::Int(i32::from(ok))
             }
-            // Native sub_4667A0 is a retry/quit dialog around file existence.
-            // Headless and GUI share the non-modal result and never spawn it.
+            // Native sub_4667A0 repeatedly resolves the required file and
+            // presents Retry/Quit until media becomes available or the user
+            // quits. The middle string is popped but unused by the target.
             0x3C => {
-                let _message = pop_string_value(stack).unwrap_or_default();
-                let _caption = pop_string_value(stack).unwrap_or_default();
-                let path = pop_string_value(stack).unwrap_or_default();
-                let exists =
-                    runtime_file_path(&self.manager, &path).is_some_and(|path| path.is_file());
-                ethornell_vm::Value::Int(i32::from(exists))
+                let message = pop_string_value(stack).unwrap_or_default();
+                let _ignored_context = pop_string_value(stack).unwrap_or_default();
+                let file = pop_string_value(stack).unwrap_or_default();
+                let title = self
+                    .pending_window_title
+                    .clone()
+                    .unwrap_or_else(|| "Ethornell".to_string());
+                let found = loop {
+                    if find_runtime_file_from_root(&self.manager, &self.native_root, "", &file)
+                        .is_some_and(|path| path.is_file())
+                        || find_runtime_resource(&self.manager, "", &file).is_some()
+                    {
+                        tracing::info!(file, "Sys80_3C_RequiredResourceFound");
+                        break true;
+                    }
+                    tracing::warn!(file, "Sys80_3C_RequiredResourceMissing");
+                    let retry = host_dialog::show_message(
+                        host_dialog::MessageDialogKind::RetryCancel,
+                        &title,
+                        &message,
+                        true,
+                    )
+                    .unwrap_or(false);
+                    if !retry {
+                        break false;
+                    }
+                };
+                ethornell_vm::Value::Int(i32::from(found))
             }
             0x3E => {
                 let path = pop_string_value(stack).unwrap_or_default();
-                let exists =
-                    runtime_file_path(&self.manager, &path).is_some_and(|path| path.is_dir());
+                let exists = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
+                    .is_some_and(|path| path.is_dir());
                 ethornell_vm::Value::Int(i32::from(exists))
             }
-            0x53 => {
-                self.native_system.power_wait_mode = 0;
-                ethornell_vm::Value::None
-            }
-            // CProcWaitWndMsg: one cooperative frame/message-pump boundary.
+            0x53 => ethornell_vm::Value::None,
+            // VM-owned scheduler boundary. Target ABI proves that 0x54
+            // installs CProcedure, but the single argument and wake predicate
+            // remain unrecovered. This host fallback only consumes the value;
+            // it must not invent the legacy guessed WaitWndMsg implementation.
             0x54 => {
-                let _message_mask = pop_int_value(stack).unwrap_or_default();
-                self.frame_yield_requested = true;
+                let _arg0_unrecovered = stack.pop();
                 ethornell_vm::Value::None
             }
             0x5D => {
-                self.native_system.power_wait_mode = pop_int_value(stack).unwrap_or_default();
+                let _enabled = pop_int_value(stack).unwrap_or_default();
                 ethornell_vm::Value::None
             }
             0x63 => {
-                let resize_enabled = pop_int_value(stack).unwrap_or_default() == 0;
-                self.input_requires_focus = resize_enabled;
+                let argument = pop_int_value(stack).unwrap_or_default();
+                self.native_system.display_scaling_mode = i32::from(argument == 0);
                 ethornell_vm::Value::None
             }
             // sub_4650F0 selects a new bootstrap pair and returns interpreter
@@ -133,6 +173,7 @@ impl RuntimeTraceApi {
             0x6C => {
                 self.native_system.drag_drop_enabled =
                     pop_int_value(stack).unwrap_or_default() != 0;
+                self.dropped_files.clear();
                 ethornell_vm::Value::None
             }
             // VM owns the output string.
@@ -141,184 +182,14 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::Int(0)
             }
             0x6E => {
-                self.native_system.cursor_button_mode = pop_int_value(stack).unwrap_or_default();
+                self.native_system.raster_wait_enabled = pop_int_value(stack).unwrap_or_default();
                 ethornell_vm::Value::None
             }
-            0x6F => {
-                let aspect_mismatch = self.screen_width > 0
-                    && self.screen_height > 0
-                    && self.screen_width * 3 != self.screen_height * 4;
-                ethornell_vm::Value::Int(i32::from(aspect_mismatch))
-            }
-            0x78 => {
-                let label = pop_string_value(stack).unwrap_or_default();
-                let slot = pop_int_value(stack).unwrap_or_default();
-                let mut header = [0u8; 64];
-                let encoded = encoding_rs::SHIFT_JIS.encode(&label).0;
-                let length = encoded.len().min(header.len().saturating_sub(1));
-                header[..length].copy_from_slice(&encoded[..length]);
-                self.native_system.save_headers.insert(slot, header);
-                ethornell_vm::Value::None
-            }
-            0x79 => {
-                let slot = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(if self.native_system.save_headers.contains_key(&slot) {
-                    0
-                } else {
-                    1
-                })
-            }
-            0x7A => {
-                let _destination = stack.pop();
-                let slot = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(if self.native_system.save_headers.contains_key(&slot) {
-                    0
-                } else {
-                    1
-                })
-            }
-            0x7B => {
-                let slot = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(if self.native_system.save_headers.contains_key(&slot) {
-                    0
-                } else {
-                    1
-                })
-            }
-            0x90 => {
-                self.native_system.event_base = pop_int_value(stack).unwrap_or_default();
-                self.native_system.event_serial = 0;
-                self.queued_system_events.clear();
-                ethornell_vm::Value::None
-            }
-            0x91 => ethornell_vm::Value::Int(
-                self.queued_system_events.len().min(i32::MAX as usize) as i32,
-            ),
-            0x94 => {
-                let _descriptor = pop_args(stack, 13);
-                self.native_system.event_serial = self.native_system.event_serial.saturating_add(1);
-                ethornell_vm::Value::None
-            }
-            0x95 | 0x97 => {
-                let _descriptor = stack.pop();
-                let event = pop_int_value(stack).unwrap_or_default();
-                let exists = self
-                    .queued_system_events
-                    .iter()
-                    .any(|queued| queued[1] == event);
-                ethornell_vm::Value::Int(i32::from(exists))
-            }
-            0x96 => {
-                let _descriptor = stack.pop();
-                ethornell_vm::Value::None
-            }
-            0xA9 => {
-                let _destination = stack.pop();
-                let object = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(i32::from(self.graph_input_objects.contains_key(&object)))
-            }
-            0xB0 => {
-                let flags = pop_int_value(stack).unwrap_or_default();
-                let name = pop_string_value(stack).unwrap_or_default();
-                let inserted = !self.native_system.named_threads.contains_key(&name);
-                if inserted {
-                    self.native_system.named_threads.insert(name, flags);
-                }
-                ethornell_vm::Value::Int(i32::from(inserted))
-            }
-            0xB1 => {
-                let name = pop_string_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(i32::from(
-                    self.native_system.named_threads.remove(&name).is_some(),
-                ))
-            }
-            0xB4 => {
-                let _flags = pop_int_value(stack).unwrap_or_default();
-                let _name = pop_string_value(stack).unwrap_or_default();
-                self.frame_yield_requested = true;
-                ethornell_vm::Value::None
-            }
-            0xB5 => {
-                let name = pop_string_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(
-                    self.native_system
-                        .named_threads
-                        .get(&name)
-                        .copied()
-                        .unwrap_or(i32::MIN + 1),
-                )
-            }
-            0xB6 => {
-                let flags = pop_int_value(stack).unwrap_or_default();
-                let name = pop_string_value(stack).unwrap_or_default();
-                let result = if let Some(value) = self.native_system.named_threads.get_mut(&name) {
-                    *value = flags;
-                    0
-                } else {
-                    i32::MIN + 1
-                };
-                ethornell_vm::Value::Int(result)
-            }
-            0xCF => {
-                let _args = pop_args(stack, 3);
-                self.frame_yield_requested = true;
-                ethornell_vm::Value::None
-            }
-            0xDE => {
-                let _args = pop_args(stack, 3);
-                ethornell_vm::Value::Int(i32::MIN + 1)
-            }
-            // VM owns the destination vector for external file loading.
-            0xE9 => {
-                let _args = pop_args(stack, 2);
-                ethornell_vm::Value::Int(0)
-            }
-            0xEA => {
-                self.native_system.uninstaller_product =
-                    pop_string_value(stack).unwrap_or_default();
-                ethornell_vm::Value::None
-            }
-            // Native installer dialogs and registry integration have no
-            // portable UI side effect. Their documented failure result keeps
-            // scripts on the same error branch without opening a popup.
-            0xF1 => {
-                let _args = pop_args(stack, 6);
-                ethornell_vm::Value::Int(0)
-            }
-            0xF3 => {
-                let _args = pop_args(stack, 8);
-                ethornell_vm::Value::Int(0)
-            }
-            0xF4 => {
-                let _args = pop_args(stack, 2);
-                ethornell_vm::Value::Int(0)
-            }
-            0xF5 => {
-                let _args = pop_args(stack, 2);
-                ethornell_vm::Value::Int(0)
-            }
-            0xF6 => {
-                let _args = pop_args(stack, 4);
-                ethornell_vm::Value::None
-            }
-            0xF9 => {
-                let _args = pop_args(stack, 2);
-                ethornell_vm::Value::Int(0)
-            }
-            // VM owns output buffers for 0xFA/0xFB/0xFC.
-            0xFA => {
-                let _args = pop_args(stack, 2);
-                ethornell_vm::Value::Int(0)
-            }
-            0xFB => {
-                let _destination = stack.pop();
-                ethornell_vm::Value::None
-            }
-            0xFC => {
-                let _args = pop_args(stack, 5);
-                ethornell_vm::Value::Int(0)
-            }
-            0xFE => ethornell_vm::Value::Int(1),
+            0x6F => ethornell_vm::Value::Int(i32::from(self.display_aspect_mismatch())),
+            // Sys80:78..7B are VM-owned because their payload and output pointers
+            // address BP memory and the global-config buffer.
+            // Sys80:90..B6 are VM-owned process-global record, object-message,
+            // and exclusion primitives. They must not be reinterpreted as app-local events.
             _ => return None,
         };
         Some(Ok(value))
@@ -338,7 +209,11 @@ impl RuntimeTraceApi {
             .and_then(|name| name.to_str())
             .unwrap_or("*");
         let parent = pattern_path.parent().unwrap_or_else(|| Path::new(""));
-        let Some(root) = runtime_file_path(&self.manager, &parent.to_string_lossy()) else {
+        let Some(root) = runtime_file_path_from_root(
+            &self.manager,
+            &self.native_root,
+            &parent.to_string_lossy(),
+        ) else {
             return Vec::new();
         };
         let mut output = Vec::new();
@@ -353,6 +228,53 @@ impl RuntimeTraceApi {
         );
         output
     }
+}
+
+pub(super) fn split_native_command_line(command_line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut backslashes = 0usize;
+    for ch in command_line.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                current.extend(std::iter::repeat('\\').take(backslashes / 2));
+                if backslashes % 2 == 0 {
+                    quoted = !quoted;
+                } else {
+                    current.push('"');
+                }
+                backslashes = 0;
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                current.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            ch => {
+                current.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                current.push(ch);
+            }
+        }
+    }
+    current.extend(std::iter::repeat('\\').take(backslashes));
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+pub(super) fn decode_native_text(bytes: &[u8]) -> String {
+    let (decoded, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
+    decoded.into_owned()
+}
+
+pub(super) fn encode_native_text(text: &str) -> Vec<u8> {
+    encoding_rs::SHIFT_JIS.encode(text).0.into_owned()
 }
 
 fn enumerate_native_directory(
@@ -414,17 +336,14 @@ fn enumerate_native_directory(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn registered_group_80_handlers_are_explicitly_owned() {
-        let source = include_str!("native_system.rs");
+    fn vm_dispatched_group_80_handlers_are_explicitly_owned() {
         for id in [
-            0x09u16, 0x0A, 0x0B, 0x0E, 0x10, 0x1D, 0x1E, 0x24, 0x26, 0x27, 0x3C, 0x3E, 0x53, 0x54,
-            0x5D, 0x63, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x78, 0x79, 0x7A, 0x7B, 0x90, 0x91, 0x94,
-            0x95, 0x96, 0x97, 0xA9, 0xB0, 0xB1, 0xB4, 0xB5, 0xB6, 0xCF, 0xDE, 0xE9, 0xEA, 0xF1,
-            0xF3, 0xF4, 0xF5, 0xF6, 0xF9, 0xFA, 0xFB, 0xFC, 0xFE,
+            0x26u16, 0x6D, 0x7A, 0xA9, 0xCF, 0xDE, 0xE9, 0xEA, 0xF1, 0xF3, 0xF4, 0xF5, 0xF6, 0xF9,
+            0xFA, 0xFB, 0xFC, 0xFE,
         ] {
             assert!(
-                source.contains(&format!("0x{id:02X}")),
-                "missing explicit group 80 handler 0x{id:02X}"
+                ethornell_vm::native_ownership::owns_before_host_dispatch(0x80, id),
+                "System80:{id:02X} has a VM dispatch but no VM ownership declaration"
             );
         }
     }

@@ -3,10 +3,10 @@ use super::*;
 impl RuntimeTraceApi {
     pub(super) fn dispatch_native_system_ext(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> Option<ethornell_vm::VmResult<ethornell_vm::Value>> {
+        let (group, id) = (call.group(), call.id());
+        let stack = call.args_mut();
         let value = match (group, id) {
             // sub_498820 accepts a presentation interval in [50, 60000].
             (0x81, 0x04) => {
@@ -38,7 +38,8 @@ impl RuntimeTraceApi {
                 let descriptor = pop_int_value(stack).unwrap_or_default();
                 let value = pop_int_value(stack).unwrap_or_default();
                 let previous = i32::from(
-                    self.pending_input_descriptor == Some(descriptor)
+                    !self.pending_input_consumed
+                        && self.pending_input_descriptor == Some(descriptor)
                         && self.pending_input_state.unwrap_or_default() == value,
                 );
                 ethornell_vm::Value::Int(previous)
@@ -78,11 +79,19 @@ impl RuntimeTraceApi {
                 if let Some(descriptor) = descriptor {
                     self.pending_input_descriptor = Some(descriptor);
                     self.pending_input_state = Some(0x6);
+                    self.pending_input_consumed = false;
                 }
                 ethornell_vm::Value::Int(i32::from(descriptor.is_some()))
             }
             (0x81, 0x1F) => {
-                let _mode = pop_int_value(stack).unwrap_or_default();
+                // sub_48B7D0 -> sub_46E5A0 -> sub_4319F0 writes the exact
+                // message/procedure auxiliary input mask dword_507690.
+                let mask = pop_int_value(stack).unwrap_or_default();
+                self.message_auxiliary_input_mask = mask;
+                tracing::info!(
+                    mask = format_args!("0x{mask:08X}"),
+                    "SysSetMessageAuxiliaryInputMask"
+                );
                 ethornell_vm::Value::None
             }
             // 0x28..0x32 are native crypto/time/file helpers. VM owns every

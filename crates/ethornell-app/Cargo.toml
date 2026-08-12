@@ -12,6 +12,8 @@ ethornell-audio = { path = "../ethornell-audio" }
 ethornell-script = { path = "../ethornell-script" }
 ethornell-vm = { path = "../ethornell-vm" }
 na_mpeg2_decoder = { path = "../na_mpeg2_decoder", default-features = false, features = ["video-only"] }
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle.git", tag = "v0.4.1", features = ["default_font", "lzma", "mp3", "aac", "nellymoser"] }
+ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle.git", tag = "v0.4.1" }
 ab_glyph.workspace = true
 encoding_rs.workspace = true
 pollster.workspace = true

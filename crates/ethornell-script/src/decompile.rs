@@ -322,8 +322,12 @@ impl DecompileState {
                 self.push(format!("{}", operand_i32(instruction).unwrap_or_default()));
             }
             "push_base_offset" => {
-                let value = operand_u32(instruction).unwrap_or_default();
-                self.push(format!("base[-0x{value:X}]"));
+                let displacement = operand_i32(instruction).unwrap_or_default();
+                if displacement < 0 {
+                    self.push(format!("base[+0x{:X}]", displacement.unsigned_abs()));
+                } else {
+                    self.push(format!("base[-0x{displacement:X}]"));
+                }
             }
             "push_string" => {
                 self.push(match instruction.operands.first() {
@@ -408,7 +412,7 @@ impl DecompileState {
             }
             "ret" | "script_ret" => self.emit(offset, "return;".to_string()),
             "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor" | "shl" | "shr"
-            | "sar" | "eq" | "neq" | "leq" | "geq" | "lt" | "gt" | "dnotzero" | "dnotzero2" => {
+            | "sar" | "eq" | "neq" | "leq" | "geq" | "lt" | "gt" | "boolean_and" | "boolean_or" => {
                 let right = self.pop();
                 let left = self.pop();
                 self.push(format!("({left} {} {right})", binary_symbol(name)));
@@ -437,10 +441,10 @@ impl DecompileState {
                 let value = self.pop();
                 self.push(format!("{name}({value})"));
             }
-            "memcpy" | "memclr" | "memset" | "memcmp" | "memrepeat" | "memfind" | "strfind"
-            | "strreplace" | "strlen" | "streq" | "strcpy" | "strconcat" | "getchar"
-            | "tolower" | "sprintf" | "malloc" | "free" | "addmemboundary" | "confirm"
-            | "message_box" | "assert" | "dumpmem" => {
+            "memcpy" | "memclr" | "memset" | "memory_equal" | "memrepeat" | "memfind"
+            | "strfind" | "strreplace" | "strlen" | "streq" | "strcpy" | "strconcat"
+            | "getchar" | "tolower" | "sprintf" | "malloc" | "free" | "addmemboundary"
+            | "confirm" | "message_box" | "assert" | "dumpmem" => {
                 self.emit_builtin(offset, name);
             }
             "sys1" | "sys2" | "grp1" | "grp2" | "grp3" | "snd1" | "usr1" | "usr2" => {
@@ -496,7 +500,7 @@ impl DecompileState {
         let arity = match name {
             "strlen" | "getchar" | "tolower" | "malloc" | "free" | "confirm" | "assert" => 1,
             "memclr" | "streq" | "strcpy" | "strfind" | "message_box" | "dumpmem" => 2,
-            "memcpy" | "memset" | "memcmp" | "strconcat" | "sprintf" => 3,
+            "memcpy" | "memset" | "memory_equal" | "strconcat" | "sprintf" => 3,
             "memrepeat" | "memfind" | "strreplace" => 4,
             "addmemboundary" => 3,
             _ => 0,
@@ -504,7 +508,7 @@ impl DecompileState {
         let mut args = self.pop_args(arity);
         if matches!(
             name,
-            "memcmp"
+            "memory_equal"
                 | "memfind"
                 | "strfind"
                 | "strlen"
@@ -656,8 +660,8 @@ fn binary_symbol(name: &str) -> &'static str {
         "geq" => ">=",
         "lt" => "<",
         "gt" => ">",
-        "dnotzero" => "&&",
-        "dnotzero2" => "||",
+        "boolean_and" => "&&",
+        "boolean_or" => "||",
         _ => "?",
     }
 }
@@ -671,5 +675,25 @@ fn condition_for_jc(kind: u32, condition: &str) -> String {
         4 => format!("({condition} <= 0)"),
         5 => format!("({condition} < 0)"),
         _ => format!("jc{kind}({condition})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_bp_program;
+
+    #[test]
+    fn base_pointer_displacement_is_signed_like_target_sub_4735f0() {
+        let program = parse_bp_program(None, &[0x04, 0xff, 0xff, 0x17]);
+        let output = decompile_bp(
+            &program,
+            &DecompileOptions {
+                show_stack: true,
+                ..DecompileOptions::default()
+            },
+        );
+
+        assert!(output.contains("base[+0x1]"), "{output}");
     }
 }

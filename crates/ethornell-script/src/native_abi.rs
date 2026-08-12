@@ -5,8 +5,23 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeCallAbi {
+    /// Number of values popped from the BP operand ring by the handler.
     pub argc: usize,
-    pub returns_value: bool,
+    /// Number of values written immediately to the BP operand ring.
+    /// This is independent from cooperative CProcedure installation.
+    pub stack_outputs: usize,
+    /// Whether the handler installs a cooperative native procedure.
+    pub installs_procedure: bool,
+    /// Raw descriptor bit 8 from the target table. It means either an
+    /// immediate result or a procedure and must never be used alone as a
+    /// Boolean return contract.
+    pub raw_descriptor_bit8: bool,
+}
+
+impl NativeCallAbi {
+    pub const fn returns_value(self) -> bool {
+        self.stack_outputs != 0
+    }
 }
 
 const GROUP_80: [u16; 256] = [
@@ -222,9 +237,31 @@ pub fn lookup(group: u8, id: u16) -> Option<NativeCallAbi> {
         _ => return None,
     };
     let packed = *table.get(id as usize)?;
-    (packed & 0x8000 != 0).then_some(NativeCallAbi {
+    if packed & 0x8000 == 0 {
+        return None;
+    }
+    let raw_descriptor_bit8 = packed & 0x0100 != 0;
+    let procedure = installs_procedure(group, id);
+    let stack_outputs = if (group, id) == (0x80, 0x5A) {
+        // sub_489160 pushes `(remaining_time != 0)` immediately even though a
+        // positive value also installs CProcWaitTiming.
+        1
+    } else if procedure {
+        0
+    } else {
+        match (group, id) {
+            // Native handlers that call the BP operand push helper more than
+            // once on their successful path.
+            (0x80, 0x08) | (0x80, 0x0D) | (0x90, 0xD7) | (0xB0, 0x17) => 2,
+            (0x80, 0x80) | (0x91, 0x8D) => 3,
+            _ => usize::from(raw_descriptor_bit8),
+        }
+    };
+    Some(NativeCallAbi {
         argc: (packed & 0x00FF) as usize,
-        returns_value: packed & 0x0100 != 0,
+        stack_outputs,
+        installs_procedure: procedure,
+        raw_descriptor_bit8,
     })
 }
 
@@ -260,6 +297,8 @@ pub fn installs_procedure(group: u8, id: u16) -> bool {
             | (0x92, 0xF1)
             | (0x90, 0x10)
             | (0x90, 0xF4)
+            | (0x91, 0x90)
+            | (0x91, 0x92)
             | (0xB0, 0x08)
     )
 }
@@ -287,8 +326,20 @@ mod tests {
 
     #[test]
     fn distinguishes_procedure_installation_from_stack_results() {
-        assert!(lookup(0x80, 0x5c).unwrap().returns_value);
+        assert!(!lookup(0x80, 0x5c).unwrap().returns_value());
+        assert_eq!(lookup(0x80, 0x5c).unwrap().stack_outputs, 0);
+        assert!(lookup(0x80, 0x5c).unwrap().installs_procedure);
+        assert_eq!(lookup(0x80, 0x5a).unwrap().stack_outputs, 1);
+        assert!(lookup(0x80, 0x5a).unwrap().installs_procedure);
         assert!(installs_procedure(0x80, 0x5c));
         assert!(!installs_procedure(0x90, 0x12));
+    }
+
+    #[test]
+    fn input_master_gate_write_has_no_immediate_output() {
+        let abi = lookup(0x80, 0x14).unwrap();
+        assert_eq!(abi.argc, 1);
+        assert_eq!(abi.stack_outputs, 0);
+        assert!(!abi.installs_procedure);
     }
 }

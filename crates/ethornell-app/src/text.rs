@@ -1,6 +1,11 @@
-use super::{value_to_i32, RuntimeTraceApi};
+use super::{value_to_i32, RuntimeTraceApi, NATIVE_DISPLAY_Z};
+use crate::display_tree::NativeDisplayKind;
 use crate::graph::{RuntimeGraphLayer, RuntimeUserControl};
-use crate::text_anim::{normalize_message_text, parse_message_markup, RuntimeRubySpan};
+use crate::text_anim::{
+    normalize_message_text, parse_message_markup_styled, ParsedMessageMarkup, RuntimeRubySpan,
+    RuntimeTextStyleSpan,
+};
+use std::collections::BTreeMap;
 
 const MESSAGE_TEXT_NODE_ID: i32 = -20_000;
 const MESSAGE_NAME_TEXT_NODE_ID: i32 = -20_001;
@@ -67,14 +72,39 @@ impl MessageControlTemplate {
 pub(crate) struct RuntimeTextNode {
     pub(crate) text: String,
     pub(crate) enabled: bool,
+    pub(crate) owner_object: Option<i32>,
     pub(crate) screen_attached: bool,
     pub(crate) target_surface: Option<i32>,
     pub(crate) x: f32,
     pub(crate) y: f32,
     pub(crate) size: f32,
+    pub(crate) line_height: f32,
+    pub(crate) formatted_layout: bool,
     pub(crate) color: [f32; 4],
     pub(crate) z: i32,
     pub(crate) ruby_spans: Vec<RuntimeRubySpan>,
+    pub(crate) style_spans: Vec<RuntimeTextStyleSpan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimeFormattedTextLayout {
+    pub(crate) body_y_offset: f32,
+    pub(crate) line_height: f32,
+    ruby_height: f32,
+    ruby_x_offset: f32,
+    ruby_y_offset: f32,
+}
+
+impl RuntimeFormattedTextLayout {
+    pub(crate) fn plain(node: &RuntimeTextNode) -> Self {
+        Self {
+            body_y_offset: 0.0,
+            line_height: node.line_height.max(node.size).max(1.0),
+            ruby_height: 0.0,
+            ruby_x_offset: 0.0,
+            ruby_y_offset: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +153,15 @@ impl RuntimeTraceApi {
     }
 
     pub(crate) fn render_graph_text(&mut self, args: &[ethornell_vm::Value]) {
-        let Some(text) = args.iter().find_map(value_to_text_string) else {
+        let text = match args.len() {
+            // GraphDrawTextEx(target, x, y, text, mode, annotation, ...).
+            // pop_args stores native arguments in top-to-bottom pop order.
+            14 => args.get(10).and_then(value_to_text_string),
+            // RenderText(target, x, y, text, ...).
+            21 => args.get(17).and_then(value_to_text_string),
+            _ => args.iter().find_map(value_to_text_string),
+        };
+        let Some(text) = text else {
             self.trace_graph(format!(
                 "RenderText without string args={:?}",
                 args.iter().map(value_to_i32).collect::<Vec<_>>()
@@ -135,16 +173,18 @@ impl RuntimeTraceApi {
         }
         if args.len() == 21 {
             let target = args.get(20).map(value_to_i32).unwrap_or_default();
-            if target > 0 && self.graph_surfaces.contains_key(&target) {
+            if target != -1 && self.graph_surfaces.contains_key(&target) {
                 let x = args.get(19).map(value_to_i32).unwrap_or_default() as f32;
                 let y = args.get(18).map(value_to_i32).unwrap_or_default() as f32;
+                // sub_4867D0 pop slot 9 is source argument 11 (font size).
                 let size = args
-                    .get(11)
+                    .get(9)
                     .map(value_to_i32)
                     .filter(|size| (8..=96).contains(size))
                     .unwrap_or(self.text_state.font_size as i32) as f32;
+                // pop slot 4 is the packed RGB argument passed to sub_434E30.
                 let color = args
-                    .get(16)
+                    .get(4)
                     .map(value_to_i32)
                     .filter(|color| (0..=0xFF_FFFF).contains(color))
                     .map(|color| {
@@ -157,24 +197,78 @@ impl RuntimeTraceApi {
                     })
                     .unwrap_or(self.text_state.color);
                 let normalized = normalize_message_text(&text);
-                self.text_nodes.insert(
+                self.store_bitmap_text_run(
                     target,
                     RuntimeTextNode {
                         text: normalized.clone(),
                         enabled: true,
+                        owner_object: None,
                         screen_attached: false,
                         target_surface: None,
                         x,
                         y,
                         size,
+                        line_height: size * 1.35,
+                        formatted_layout: false,
                         color,
                         z: target,
                         ruby_spans: Vec::new(),
+                        style_spans: Vec::new(),
                     },
                 );
                 tracing::info!(target, x, y, size, text = %normalized, "RenderBitmapText");
                 self.trace_graph(format!(
                     "render text into bitmap #{target} at ({x:.0},{y:.0}) {normalized:?}"
+                ));
+                return;
+            }
+        }
+        if args.len() == 14 {
+            let target = args.get(13).map(value_to_i32).unwrap_or_default();
+            if target != -1 && self.graph_surfaces.contains_key(&target) {
+                let x = args.get(12).map(value_to_i32).unwrap_or_default() as f32;
+                let y = args.get(11).map(value_to_i32).unwrap_or_default() as f32;
+                let size = args
+                    .get(6)
+                    .map(value_to_i32)
+                    .filter(|size| (8..=96).contains(size))
+                    .unwrap_or(self.text_state.font_size as i32) as f32;
+                let color = args
+                    .first()
+                    .map(value_to_i32)
+                    .filter(|color| (0..=0xFF_FFFF).contains(color))
+                    .map(|color| {
+                        [
+                            ((color >> 16) & 0xff) as f32 / 255.0,
+                            ((color >> 8) & 0xff) as f32 / 255.0,
+                            (color & 0xff) as f32 / 255.0,
+                            1.0,
+                        ]
+                    })
+                    .unwrap_or(self.text_state.color);
+                let normalized = normalize_message_text(&text);
+                self.store_bitmap_text_run(
+                    target,
+                    RuntimeTextNode {
+                        text: normalized.clone(),
+                        enabled: true,
+                        owner_object: None,
+                        screen_attached: false,
+                        target_surface: None,
+                        x,
+                        y,
+                        size,
+                        line_height: size * 1.35,
+                        formatted_layout: false,
+                        color,
+                        z: target,
+                        ruby_spans: Vec::new(),
+                        style_spans: Vec::new(),
+                    },
+                );
+                tracing::info!(target, x, y, size, text = %normalized, "GraphDrawBitmapText");
+                self.trace_graph(format!(
+                    "draw text into bitmap #{target} at ({x:.0},{y:.0}) {normalized:?}"
                 ));
                 return;
             }
@@ -193,6 +287,448 @@ impl RuntimeTraceApi {
         ));
     }
 
+    pub(crate) fn store_bitmap_text_run(&mut self, bitmap: i32, node: RuntimeTextNode) {
+        self.text_nodes.insert(bitmap, node.clone());
+        self.bitmap_text_runs.entry(bitmap).or_default().push(node);
+        self.refresh_bitmap_nodes(bitmap);
+    }
+
+    pub(crate) fn clear_bitmap_text(&mut self, bitmap: i32) {
+        self.bitmap_text_runs.remove(&bitmap);
+        self.text_nodes.remove(&bitmap);
+        self.refresh_bitmap_nodes(bitmap);
+    }
+
+    pub(crate) fn composite_bitmap_text(
+        &mut self,
+        destination: i32,
+        source: i32,
+        x: i32,
+        y: i32,
+        alpha: i32,
+    ) {
+        if destination <= 0 || source <= 0 || destination == source {
+            return;
+        }
+        let mut runs = self
+            .bitmap_text_runs
+            .get(&source)
+            .cloned()
+            .or_else(|| self.text_nodes.get(&source).cloned().map(|node| vec![node]))
+            .unwrap_or_default();
+        if runs.is_empty() {
+            return;
+        }
+        // GraphObjectApply uses 1 for the ordinary opaque copy path and 128
+        // for explicit half-byte alpha. Both forms are emitted by logwnd._bp.
+        let opacity = if alpha == 1 {
+            1.0
+        } else {
+            (alpha as f32 / 128.0).clamp(0.0, 1.0)
+        };
+        for run in &mut runs {
+            run.x += x as f32;
+            run.y += y as f32;
+            run.color[3] *= opacity;
+            run.screen_attached = false;
+            run.target_surface = None;
+        }
+        self.text_nodes
+            .insert(destination, runs.last().cloned().unwrap());
+        self.bitmap_text_runs
+            .entry(destination)
+            .or_default()
+            .extend(runs);
+        self.refresh_bitmap_nodes(destination);
+        self.trace_graph(format!(
+            "bitmap text apply source=#{source} destination=#{destination} x={x} y={y} alpha={alpha}"
+        ));
+    }
+
+    pub(crate) fn copy_bitmap_text(&mut self, source: i32, destination: i32) -> usize {
+        if source <= 0 || destination <= 0 || source == destination {
+            return 0;
+        }
+        let runs = self
+            .bitmap_text_runs
+            .get(&source)
+            .cloned()
+            .or_else(|| self.text_nodes.get(&source).cloned().map(|node| vec![node]))
+            .unwrap_or_default();
+        if runs.is_empty() {
+            self.bitmap_text_runs.remove(&destination);
+            self.text_nodes.remove(&destination);
+            self.refresh_bitmap_nodes(destination);
+            return 0;
+        }
+        self.text_nodes
+            .insert(destination, runs.last().cloned().unwrap());
+        let count = runs.len();
+        self.bitmap_text_runs.insert(destination, runs);
+        self.refresh_bitmap_nodes(destination);
+        count
+    }
+
+    /// Portable text runs stand in for glyphs already rasterized into target
+    /// bitmap storage. Region creation must therefore clip and translate them
+    /// with the same source rectangle as the pixel copy.
+    pub(crate) fn copy_bitmap_text_region(
+        &mut self,
+        source: i32,
+        destination: i32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> usize {
+        if source <= 0 || destination <= 0 || source == destination || width <= 0 || height <= 0 {
+            return 0;
+        }
+        let source_left = x as f32;
+        let source_top = y as f32;
+        let source_right = source_left + width as f32;
+        let source_bottom = source_top + height as f32;
+        let mut runs = self
+            .bitmap_text_runs
+            .get(&source)
+            .cloned()
+            .or_else(|| self.text_nodes.get(&source).cloned().map(|node| vec![node]))
+            .unwrap_or_default();
+        runs.retain(|run| {
+            let mut line_width = 0.0f32;
+            let mut maximum_width = 0.0f32;
+            let mut line_count = 1usize;
+            for ch in run.text.chars() {
+                if ch == '\n' {
+                    maximum_width = maximum_width.max(line_width);
+                    line_width = 0.0;
+                    line_count += 1;
+                } else {
+                    line_width += wrap_char_units(ch) * run.size;
+                }
+            }
+            maximum_width = maximum_width.max(line_width).max(run.size);
+            let run_height = line_count as f32 * run.line_height.max(run.size).max(1.0);
+            run.x < source_right
+                && run.x + maximum_width > source_left
+                && run.y < source_bottom
+                && run.y + run_height > source_top
+        });
+        for run in &mut runs {
+            run.x -= source_left;
+            run.y -= source_top;
+            run.owner_object = None;
+            run.screen_attached = false;
+            run.target_surface = None;
+        }
+        if runs.is_empty() {
+            self.bitmap_text_runs.remove(&destination);
+            self.text_nodes.remove(&destination);
+            self.refresh_bitmap_nodes(destination);
+            return 0;
+        }
+        self.text_nodes
+            .insert(destination, runs.last().cloned().unwrap());
+        let count = runs.len();
+        self.bitmap_text_runs.insert(destination, runs);
+        self.refresh_bitmap_nodes(destination);
+        count
+    }
+
+    pub(crate) fn configure_bitmap_text_node(
+        &mut self,
+        node: i32,
+        bitmap: i32,
+        values: &[i32],
+        owner_object: Option<i32>,
+    ) -> bool {
+        self.release_screen_text_node(node);
+        let runs = self
+            .bitmap_text_runs
+            .get(&bitmap)
+            .cloned()
+            .or_else(|| self.text_nodes.get(&bitmap).cloned().map(|node| vec![node]))
+            .unwrap_or_default();
+        if runs.is_empty() {
+            return false;
+        }
+        let flags = values.first().copied().unwrap_or_default();
+        let (bitmap_width, bitmap_height) = self
+            .graph_surfaces
+            .get(&bitmap)
+            .map(|surface| (surface.width, surface.height))
+            .unwrap_or((0.0, 0.0));
+        let origin_x = values.get(5).copied().unwrap_or_default() as f32;
+        let origin_y = values.get(4).copied().unwrap_or_default() as f32;
+        let z = values.first().copied().unwrap_or(NATIVE_DISPLAY_Z);
+        let mut children = Vec::with_capacity(runs.len());
+        for (index, mut run) in runs.into_iter().enumerate() {
+            let child = if index == 0 {
+                node
+            } else {
+                while self.text_nodes.contains_key(&self.next_screen_text_child) {
+                    self.next_screen_text_child = self.next_screen_text_child.saturating_sub(1);
+                }
+                let child = self.next_screen_text_child;
+                self.next_screen_text_child = self.next_screen_text_child.saturating_sub(1);
+                child
+            };
+            run.screen_attached = true;
+            run.owner_object = owner_object;
+            run.target_surface = None;
+            run.x += origin_x;
+            run.y += origin_y;
+            if flags & 0x4 == 0 {
+                run.x -= bitmap_width;
+            }
+            if flags & 0x2 != 0 {
+                run.y -= bitmap_height;
+            }
+            run.z = z;
+            self.register_display_layer(child, owner_object);
+            self.text_nodes.insert(child, run);
+            children.push(child);
+        }
+        self.screen_text_children.insert(node, children);
+        true
+    }
+
+    pub(crate) fn configure_image_bitmap_text_node(
+        &mut self,
+        node: i32,
+        bitmap: i32,
+        origin_x: f32,
+        origin_y: f32,
+        z: i32,
+        owner_object: Option<i32>,
+    ) -> bool {
+        self.release_screen_text_node(node);
+        let runs = self
+            .bitmap_text_runs
+            .get(&bitmap)
+            .cloned()
+            .or_else(|| self.text_nodes.get(&bitmap).cloned().map(|node| vec![node]))
+            .unwrap_or_default();
+        if runs.is_empty() {
+            return false;
+        }
+        let mut children = Vec::with_capacity(runs.len());
+        for (index, mut run) in runs.into_iter().enumerate() {
+            let child = if index == 0 {
+                node
+            } else {
+                while self.text_nodes.contains_key(&self.next_screen_text_child) {
+                    self.next_screen_text_child = self.next_screen_text_child.saturating_sub(1);
+                }
+                let child = self.next_screen_text_child;
+                self.next_screen_text_child = self.next_screen_text_child.saturating_sub(1);
+                child
+            };
+            run.screen_attached = true;
+            run.owner_object = owner_object;
+            run.target_surface = None;
+            run.x += origin_x;
+            run.y += origin_y;
+            run.z = z;
+            self.register_display_layer(child, owner_object);
+            self.text_nodes.insert(child, run);
+            children.push(child);
+        }
+        self.screen_text_children.insert(node, children);
+        true
+    }
+
+    pub(crate) fn configure_transition_bitmap_text_node(
+        &mut self,
+        node: i32,
+        primary: i32,
+        secondary: i32,
+        alpha_parameter: i32,
+        origin_x: f32,
+        origin_y: f32,
+        z: i32,
+        owner_object: Option<i32>,
+    ) -> bool {
+        self.release_screen_text_node(node);
+        let primary_runs = self
+            .bitmap_text_runs
+            .get(&primary)
+            .cloned()
+            .or_else(|| {
+                self.text_nodes
+                    .get(&primary)
+                    .cloned()
+                    .map(|node| vec![node])
+            })
+            .unwrap_or_default();
+        let secondary_runs = self
+            .bitmap_text_runs
+            .get(&secondary)
+            .cloned()
+            .or_else(|| {
+                self.text_nodes
+                    .get(&secondary)
+                    .cloned()
+                    .map(|node| vec![node])
+            })
+            .unwrap_or_default();
+        if primary_runs.is_empty() && secondary_runs.is_empty() {
+            return false;
+        }
+
+        let same_content = primary_runs.len() == secondary_runs.len()
+            && primary_runs
+                .iter()
+                .zip(&secondary_runs)
+                .all(|(left, right)| {
+                    left.text == right.text
+                        && left.x == right.x
+                        && left.y == right.y
+                        && left.size == right.size
+                        && left.color == right.color
+                        && left.ruby_spans == right.ruby_spans
+                        && left.style_spans == right.style_spans
+                });
+        let mut runs = if same_content {
+            primary_runs
+        } else {
+            let secondary_weight = alpha_parameter.clamp(0, 256) as f32 / 256.0;
+            let primary_weight = 1.0 - secondary_weight;
+            let mut runs = primary_runs;
+            for run in &mut runs {
+                run.color[3] *= primary_weight;
+            }
+            let mut secondary_runs = secondary_runs;
+            for run in &mut secondary_runs {
+                run.color[3] *= secondary_weight;
+            }
+            runs.extend(secondary_runs);
+            runs
+        };
+        runs.retain(|run| run.color[3] > 0.001);
+
+        let mut children = Vec::with_capacity(runs.len());
+        for (index, mut run) in runs.into_iter().enumerate() {
+            // When the bitmap transition belongs to a real CDspObjSprite,
+            // never reuse that native sprite handle as the compatibility text
+            // node. Doing so makes release_screen_text_node() tear the sprite
+            // itself out of the display tree on the next 90:58 configure.
+            let use_root_handle = index == 0 && owner_object != Some(node);
+            let child = if use_root_handle {
+                node
+            } else {
+                while self.text_nodes.contains_key(&self.next_screen_text_child) {
+                    self.next_screen_text_child = self.next_screen_text_child.saturating_sub(1);
+                }
+                let child = self.next_screen_text_child;
+                self.next_screen_text_child = self.next_screen_text_child.saturating_sub(1);
+                child
+            };
+            run.screen_attached = true;
+            run.owner_object = owner_object;
+            run.target_surface = None;
+            run.x += origin_x;
+            run.y += origin_y;
+            run.z = z;
+            self.register_display_layer(child, owner_object);
+            self.text_nodes.insert(child, run);
+            children.push(child);
+        }
+        if children.is_empty() {
+            return false;
+        }
+        self.screen_text_children.insert(node, children);
+        true
+    }
+
+    pub(crate) fn release_screen_text_node(&mut self, node: i32) -> bool {
+        let root_was_text = self.text_nodes.remove(&node).is_some();
+        let mut removed = root_was_text;
+        // A screen-text compatibility root may share its numeric key with a
+        // real native display object (notably CDspObjSprite mode 1). Only
+        // remove a display-tree object when this routine actually owned a
+        // text node at that handle.
+        if root_was_text {
+            self.display_tree.remove(node);
+        }
+        if let Some(children) = self.screen_text_children.remove(&node) {
+            for child in children {
+                let child_was_text = self.text_nodes.remove(&child).is_some();
+                removed |= child_was_text;
+                if child_was_text {
+                    self.display_tree.remove(child);
+                }
+            }
+        }
+        removed
+    }
+
+    pub(crate) fn clear_transient_screen_text_nodes(&mut self) -> usize {
+        let roots = self
+            .screen_text_children
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut removed = 0;
+        for root in roots {
+            let count = self
+                .screen_text_children
+                .get(&root)
+                .map(Vec::len)
+                .unwrap_or_default()
+                .max(usize::from(self.text_nodes.contains_key(&root)));
+            if self.release_screen_text_node(root) {
+                removed += count;
+            }
+            self.remove_bitmap_node_binding(root);
+        }
+
+        let orphaned = self
+            .text_nodes
+            .iter()
+            .filter_map(|(&id, node)| {
+                (node.screen_attached
+                    && id != MESSAGE_TEXT_NODE_ID
+                    && id != MESSAGE_NAME_TEXT_NODE_ID
+                    && id != MESSAGE_OVERLAY_TEXT_NODE_ID)
+                    .then_some(id)
+            })
+            .collect::<Vec<_>>();
+        removed += orphaned.len();
+        for id in orphaned {
+            self.text_nodes.remove(&id);
+            self.display_tree.remove(id);
+            self.remove_bitmap_node_binding(id);
+        }
+        removed
+    }
+
+    pub(crate) fn set_screen_text_node_surface(&mut self, node: i32, surface: Option<i32>) {
+        if let Some(record) = self.text_nodes.get_mut(&node) {
+            record.target_surface = surface;
+        }
+        if let Some(children) = self.screen_text_children.get(&node) {
+            for child in children {
+                if let Some(record) = self.text_nodes.get_mut(child) {
+                    record.target_surface = surface;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_screen_text_node_enabled(&mut self, node: i32, enabled: bool) {
+        if let Some(record) = self.text_nodes.get_mut(&node) {
+            record.enabled = enabled;
+        }
+        if let Some(children) = self.screen_text_children.get(&node) {
+            for child in children {
+                if let Some(record) = self.text_nodes.get_mut(child) {
+                    record.enabled = enabled;
+                }
+            }
+        }
+    }
+
     pub(crate) fn start_scenario_message(&mut self, speaker: Option<String>, text: String) {
         if text.is_empty() {
             return;
@@ -208,13 +744,20 @@ impl RuntimeTraceApi {
             self.hide_message_name();
         }
         let target = self.ensure_message_text_node();
-        let (display_text, ruby_spans) = parse_and_wrap_message(&text, &self.text_state);
-        self.text_runtime
-            .start_styled_message(display_text, ruby_spans, target);
-        self.apply_text_to_node(target, String::new());
-        if self.graph_defaults.instant_reveal {
-            self.reveal_text_on_input();
+        if let Some(node) = self.text_nodes.get_mut(&target) {
+            node.line_height = self.text_state.line_height.max(node.size);
+            node.formatted_layout = true;
         }
+        let parsed = parse_and_wrap_styled_message(&text, &self.text_state);
+        self.text_runtime
+            .set_glyph_delay_ms(self.graph_defaults.text_animation.glyph_delay_ms);
+        self.text_runtime.start_styled_message(
+            parsed.text,
+            parsed.ruby_spans,
+            parsed.style_spans,
+            target,
+        );
+        self.apply_text_to_node(target, String::new());
         tracing::info!(target, text = %normalize_message_text(&text), "ScenarioMessage");
         self.trace_graph(format!(
             "scenario message node #{target} start {:?}",
@@ -222,32 +765,157 @@ impl RuntimeTraceApi {
         ));
     }
 
-    pub(crate) fn start_native_message(&mut self, text: String) -> i32 {
-        let (text, ruby_spans) = parse_and_wrap_message(&text, &self.text_state);
-        if text.is_empty() {
-            return 1;
+    pub(crate) fn start_native_message(
+        &mut self,
+        text: String,
+        target_surface: Option<i32>,
+    ) -> i32 {
+        let mut state = self.text_state.clone();
+        if let Some(surface) = target_surface.and_then(|id| self.graph_surfaces.get(&id)) {
+            let cursor = self
+                .surface_text_states
+                .get(&surface.id)
+                .copied()
+                .unwrap_or_default();
+            state.x = cursor.cursor_x as f32;
+            state.y = cursor.cursor_y as f32;
+            state.width = (surface.viewport_width - state.x).max(1.0);
+            state.height = (surface.viewport_height - state.y).max(1.0);
+            if cursor.font_size > 0 {
+                state.font_size = cursor.font_size as f32;
+            }
+            if cursor.scale_percent > 0 {
+                state.line_height =
+                    (state.font_size * cursor.scale_percent as f32 / 100.0).max(1.0);
+            }
         }
-        self.ensure_message_window_layer();
+        let parsed = parse_and_wrap_styled_message(&text, &state);
+        // The target wrapper installs CProcDspMsg even for an empty or
+        // control-only string. In particular, a lone 0x0A is a zero-delay
+        // layout control, not a synthetic one-glyph message.
         self.user_controls.remove(&MESSAGE_INPUT_OBJECT_ID);
-        self.ensure_message_control_layers();
         let target = self.ensure_message_text_node();
+        if let Some(node) = self.text_nodes.get_mut(&target) {
+            node.owner_object = target_surface;
+            node.screen_attached = target_surface.is_none();
+            node.target_surface = target_surface;
+            node.x = state.x;
+            node.y = state.y;
+            node.size = state.font_size.max(1.0);
+            node.line_height = state.line_height.max(node.size);
+            node.formatted_layout = true;
+            node.color = state.color;
+            node.z = target_surface
+                .and_then(|surface| self.graph_surfaces.get(&surface))
+                .map(|surface| surface.z)
+                .unwrap_or(MESSAGE_TEXT_Z);
+        }
         self.text_runtime
-            .start_styled_message(text.clone(), ruby_spans, target);
-        self.apply_text_to_node(target, String::new());
-        if self.graph_defaults.instant_reveal {
-            self.reveal_text_on_input();
+            .set_glyph_delay_ms(self.graph_defaults.text_animation.glyph_delay_ms);
+        self.text_runtime.start_styled_message(
+            parsed.text.clone(),
+            parsed.ruby_spans,
+            parsed.style_spans,
+            target,
+        );
+        // Graph90:9B is owned by CProcDspMsg (+0x44/+0x48).  Do not also
+        // delay the glyph runtime: doing so applies the native procedure
+        // wait twice and incorrectly postpones typewriter reveal.
+        // CProcDspMsg control-only records (notably 0x0A/newline) mutate
+        // formatter/procedure state without replacing the glyphs already
+        // committed to the destination surface.  Graph92:8E is the explicit
+        // text-surface reset.  Treating a control-only Graph92:90 invocation
+        // as a new visible string makes the completed sentence disappear as
+        // soon as the following newline/wait record starts.
+        let has_visible_glyph = parsed.text.chars().any(|ch| ch != '\n');
+        let initial_visible_text = self.text_runtime.current_visible_text();
+        if let Some(node) = self.text_nodes.get_mut(&target) {
+            if has_visible_glyph {
+                node.text = initial_visible_text;
+            }
+            node.enabled = true;
         }
         self.native_message_active = true;
-        let duration_ms = if self.graph_defaults.instant_reveal {
-            1
-        } else {
-            self.text_runtime.duration_ms()
-        };
-        tracing::info!(target, duration_ms, text = %text, "NativeMessage");
+        let duration_ms = self.text_runtime.duration_ms();
+        tracing::info!(target, duration_ms, text = %parsed.text, "NativeMessage");
         self.trace_graph(format!(
-            "native message node #{target} duration={duration_ms}ms {text:?}"
+            "native message node #{target} duration={duration_ms}ms {:?}",
+            parsed.text
         ));
         duration_ms
+    }
+
+    pub(crate) fn formatted_text_layout(
+        &self,
+        node: &RuntimeTextNode,
+    ) -> RuntimeFormattedTextLayout {
+        if !node.formatted_layout {
+            return RuntimeFormattedTextLayout::plain(node);
+        }
+        let explicit_height = self.graph_defaults.text_style.ruby_height;
+        let ruby_height = if explicit_height > 0 {
+            explicit_height
+        } else {
+            (node.size.max(0.0) as i32).saturating_mul(self.graph_defaults.text_layout.font_percent)
+                / 100
+        }
+        .max(4) as f32;
+        let ruby_x_offset = self.graph_defaults.text_style.ruby_x_offset as f32;
+        let ruby_y_offset = self.graph_defaults.text_style.ruby_y_offset as f32;
+        let apply_y_offset = self
+            .graph_config
+            .text_global_properties
+            .get(&0x8000_0002)
+            .copied()
+            .unwrap_or_default()
+            != 0;
+        RuntimeFormattedTextLayout {
+            body_y_offset: ruby_height - if apply_y_offset { ruby_y_offset } else { 0.0 },
+            line_height: node.line_height.max(node.size).max(1.0),
+            ruby_height,
+            ruby_x_offset,
+            ruby_y_offset,
+        }
+    }
+
+    pub(crate) fn native_message_procedure_config(
+        &self,
+        class: ethornell_vm::NativeMessageProcedureClass,
+        display_object: i32,
+    ) -> ethornell_vm::NativeMessageProcedureConfig {
+        ethornell_vm::NativeMessageProcedureConfig {
+            class,
+            initial_delay_enabled: self.graph_defaults.message_delay_enabled,
+            initial_delay_ms: self
+                .graph_defaults
+                .message_delay_enabled
+                .then_some(self.graph_defaults.message_delay_ms.max(0))
+                .unwrap_or(0),
+            reveal_duration_ms: self.text_runtime.duration_ms(),
+            reveal_steps: self.graph_defaults.text_animation.reveal_steps,
+            reveal_step_delay_ms: self.graph_defaults.text_animation.reveal_step_delay_ms,
+            settle_steps: self.graph_defaults.text_animation.settle_steps,
+            settle_step_delay_ms: self.graph_defaults.text_animation.settle_step_delay_ms,
+            auto_advance_delay_ms: self
+                .graph_defaults
+                .text_animation
+                .auto_advance_enabled
+                .then_some(
+                    self.graph_defaults
+                        .text_animation
+                        .auto_advance_delay_ms
+                        .max(0),
+                ),
+            input_scope: self
+                .graph_defaults
+                .resolved_message_input_scope(display_object),
+            completion_control: 0,
+            end_wait_policy: 0,
+            allow_high_bit_input: false,
+            allow_auxiliary_input: true,
+            auxiliary_input_mask: self.message_auxiliary_input_mask,
+            input_forces_completion: self.graph_defaults.message_input_forces_completion,
+        }
     }
 
     pub(crate) fn render_native_message_text(&mut self, text: &str) {
@@ -257,27 +925,34 @@ impl RuntimeTraceApi {
         self.ensure_message_window_layer();
         self.ensure_message_control_layers();
         let target = self.ensure_message_text_node();
-        let (display_text, ruby_spans) = parse_and_wrap_message(text, &self.text_state);
-        self.apply_text_to_node(target, display_text);
+        let parsed = parse_and_wrap_styled_message(text, &self.text_state);
+        self.apply_text_to_node(target, parsed.text);
         if let Some(node) = self.text_nodes.get_mut(&target) {
-            node.ruby_spans = ruby_spans;
+            node.line_height = self.text_state.line_height.max(node.size);
+            node.formatted_layout = true;
+            node.ruby_spans = parsed.ruby_spans;
+            node.style_spans = parsed.style_spans;
         }
         self.native_message_active = true;
     }
 
     pub(crate) fn reset_native_message_text(&mut self) {
         self.text_runtime = Default::default();
+        self.text_runtime
+            .set_glyph_delay_ms(self.graph_defaults.text_animation.glyph_delay_ms);
         if let Some(node) = self.text_nodes.get_mut(&MESSAGE_TEXT_NODE_ID) {
             node.text.clear();
             node.ruby_spans.clear();
+            node.style_spans.clear();
         }
         self.native_message_active = false;
     }
 
-    pub(crate) fn tick_text(&mut self) {
-        if let Some((target, text)) = self.text_runtime.tick() {
+    pub(crate) fn tick_text(&mut self, elapsed_ms: u64) {
+        if let Some((target, text)) = self.text_runtime.tick(elapsed_ms) {
             self.apply_text_to_node(target, text);
             self.apply_visible_ruby_to_node(target);
+            self.apply_visible_styles_to_node(target);
         }
     }
 
@@ -405,6 +1080,7 @@ impl RuntimeTraceApi {
         if let Some((target, text)) = self.text_runtime.reveal_all() {
             self.apply_text_to_node(target, text);
             self.apply_visible_ruby_to_node(target);
+            self.apply_visible_styles_to_node(target);
             self.trace_graph(format!("message node #{target} reveal all"));
         }
     }
@@ -421,14 +1097,18 @@ impl RuntimeTraceApi {
             RuntimeTextNode {
                 text: String::new(),
                 enabled: true,
+                owner_object: None,
                 screen_attached: true,
                 target_surface: None,
                 x: self.text_state.x,
                 y: self.text_state.y,
                 size: self.text_state.font_size,
+                line_height: self.text_state.line_height,
+                formatted_layout: false,
                 color: self.text_state.color,
                 z: MESSAGE_TEXT_Z,
                 ruby_spans: Vec::new(),
+                style_spans: Vec::new(),
             },
         );
         self.text_runtime.target_node = Some(target);
@@ -444,20 +1124,30 @@ impl RuntimeTraceApi {
             .or_insert_with(|| RuntimeTextNode {
                 text: String::new(),
                 enabled: true,
+                owner_object: None,
                 screen_attached: true,
                 target_surface: None,
                 x: state.x,
                 y: state.y,
                 size: state.font_size,
+                line_height: state.line_height,
+                formatted_layout: false,
                 color: state.color,
                 z: MESSAGE_TEXT_Z,
                 ruby_spans: Vec::new(),
+                style_spans: Vec::new(),
             });
+        if node.target_surface.is_some() {
+            node.text = text;
+            node.enabled = true;
+            return;
+        }
         node.text = wrap_text_to_state(&text, &state);
         node.enabled = true;
         node.x = if state.x > 0.0 { state.x } else { 36.0 };
         node.y = if state.y > 0.0 { state.y } else { 520.0 };
         node.size = state.font_size.max(18.0);
+        node.line_height = state.line_height.max(node.size);
         node.color = state.color;
         node.z = MESSAGE_TEXT_Z;
     }
@@ -466,6 +1156,13 @@ impl RuntimeTraceApi {
         let spans = self.text_runtime.visible_ruby_spans();
         if let Some(node) = self.text_nodes.get_mut(&target) {
             node.ruby_spans = spans;
+        }
+    }
+
+    fn apply_visible_styles_to_node(&mut self, target: i32) {
+        let spans = self.text_runtime.visible_style_spans();
+        if let Some(node) = self.text_nodes.get_mut(&target) {
+            node.style_spans = spans;
         }
     }
 
@@ -479,6 +1176,8 @@ impl RuntimeTraceApi {
         let width = image.width as f32;
         let height = image.height as f32;
         self.scenario_scene_layers.insert(MESSAGE_WINDOW_LAYER_ID);
+        self.display_tree
+            .register(MESSAGE_WINDOW_LAYER_ID, NativeDisplayKind::Sprite);
         self.graph_layers.insert(
             MESSAGE_WINDOW_LAYER_ID,
             RuntimeGraphLayer {
@@ -539,6 +1238,8 @@ impl RuntimeTraceApi {
         let height = image.height as f32;
         self.scenario_scene_layers
             .insert(MESSAGE_NAME_WINDOW_LAYER_ID);
+        self.display_tree
+            .register(MESSAGE_NAME_WINDOW_LAYER_ID, NativeDisplayKind::Sprite);
         self.graph_layers.insert(
             MESSAGE_NAME_WINDOW_LAYER_ID,
             RuntimeGraphLayer {
@@ -574,14 +1275,18 @@ impl RuntimeTraceApi {
         self.text_nodes.entry(target).or_insert(RuntimeTextNode {
             text: String::new(),
             enabled: true,
+            owner_object: None,
             screen_attached: true,
             target_surface: None,
             x: MESSAGE_NAME_TEXT_X,
             y: MESSAGE_NAME_TEXT_Y,
             size: 24.0,
+            line_height: 32.0,
+            formatted_layout: false,
             color: [1.0, 1.0, 1.0, 1.0],
             z: MESSAGE_NAME_TEXT_Z,
             ruby_spans: Vec::new(),
+            style_spans: Vec::new(),
         });
         target
     }
@@ -590,14 +1295,18 @@ impl RuntimeTraceApi {
         let node = self.text_nodes.entry(target).or_insert(RuntimeTextNode {
             text: String::new(),
             enabled: true,
+            owner_object: None,
             screen_attached: true,
             target_surface: None,
             x: MESSAGE_NAME_TEXT_X,
             y: MESSAGE_NAME_TEXT_Y,
             size: 24.0,
+            line_height: 32.0,
+            formatted_layout: false,
             color: [1.0, 1.0, 1.0, 1.0],
             z: MESSAGE_NAME_TEXT_Z,
             ruby_spans: Vec::new(),
+            style_spans: Vec::new(),
         });
         node.text = normalize_message_text(&text);
         node.enabled = true;
@@ -635,6 +1344,8 @@ impl RuntimeTraceApi {
             if !self.graph_images.contains_key(&key) {
                 continue;
             }
+            self.display_tree
+                .register(template.layer_id, NativeDisplayKind::Sprite);
             self.graph_layers.insert(
                 template.layer_id,
                 RuntimeGraphLayer {
@@ -684,6 +1395,15 @@ impl RuntimeTraceApi {
     }
 
     pub(crate) fn has_active_message_window(&self) -> bool {
+        if self.native_message_active
+            && self.native_message_surface_target.is_some_and(|surface| {
+                self.graph_surfaces
+                    .get(&surface)
+                    .is_some_and(|record| self.surface_display_chain_visible(surface, record))
+            })
+        {
+            return true;
+        }
         let layer_enabled = self
             .graph_layers
             .get(&MESSAGE_WINDOW_LAYER_ID)
@@ -727,8 +1447,12 @@ impl RuntimeTraceApi {
 
     pub(crate) fn message_control_layer_draw_key(
         &self,
+        layer_id: i32,
         layer: &RuntimeGraphLayer,
     ) -> Option<&'static str> {
+        if self.surface_controls.contains_layer(layer_id) {
+            return None;
+        }
         let control = self.user_controls.get(&layer.hit_id)?;
         if control.owner_id != MESSAGE_CONTROL_OWNER_ID {
             return None;
@@ -778,14 +1502,18 @@ impl RuntimeTraceApi {
             RuntimeTextNode {
                 text: format!("{title}\n{body}"),
                 enabled: true,
+                owner_object: None,
                 screen_attached: true,
                 target_surface: None,
                 x: 64.0,
                 y: 80.0,
                 size: 24.0,
+                line_height: 32.0,
+                formatted_layout: false,
                 color: [1.0, 1.0, 1.0, 1.0],
                 z: 20_000,
                 ruby_spans: Vec::new(),
+                style_spans: Vec::new(),
             },
         );
     }
@@ -796,13 +1524,22 @@ impl RuntimeTraceApi {
 }
 
 pub(crate) fn wrap_text_to_state(text: &str, state: &TextState) -> String {
-    wrap_text_to_state_with_map(text, state).0
+    wrap_text_to_state_with_map(text, &[], state).0
 }
 
-fn parse_and_wrap_message(text: &str, state: &TextState) -> (String, Vec<RuntimeRubySpan>) {
-    let (plain, spans) = parse_message_markup(text);
-    let (wrapped, map) = wrap_text_to_state_with_map(&plain, state);
-    let spans = spans
+pub(crate) fn parse_and_wrap_message(
+    text: &str,
+    state: &TextState,
+) -> (String, Vec<RuntimeRubySpan>) {
+    let parsed = parse_and_wrap_styled_message(text, state);
+    (parsed.text, parsed.ruby_spans)
+}
+
+pub(crate) fn parse_and_wrap_styled_message(text: &str, state: &TextState) -> ParsedMessageMarkup {
+    let parsed = parse_message_markup_styled(text);
+    let (wrapped, map) = wrap_text_to_state_with_map(&parsed.text, &parsed.ruby_spans, state);
+    let ruby_spans = parsed
+        .ruby_spans
         .into_iter()
         .filter_map(|span| {
             Some(RuntimeRubySpan {
@@ -812,35 +1549,84 @@ fn parse_and_wrap_message(text: &str, state: &TextState) -> (String, Vec<Runtime
             })
         })
         .collect();
-    (wrapped, spans)
+    let style_spans = parsed
+        .style_spans
+        .into_iter()
+        .filter_map(|span| {
+            let start_char = *map.get(span.start_char)?;
+            let end_char = *map.get(span.end_char)?;
+            (start_char < end_char).then_some(RuntimeTextStyleSpan {
+                start_char,
+                end_char,
+                style: span.style,
+            })
+        })
+        .collect();
+    ParsedMessageMarkup {
+        text: wrapped,
+        ruby_spans,
+        style_spans,
+    }
 }
 
-fn wrap_text_to_state_with_map(text: &str, state: &TextState) -> (String, Vec<usize>) {
+fn wrap_text_to_state_with_map(
+    text: &str,
+    protected_spans: &[RuntimeRubySpan],
+    state: &TextState,
+) -> (String, Vec<usize>) {
     let max_units = (state.width.max(120.0) / state.font_size.max(8.0))
         .floor()
         .max(8.0);
     let max_lines = ((state.height.max(state.line_height) / state.line_height.max(1.0)).floor()
         as usize)
         .max(1);
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut protected_ends = BTreeMap::new();
+    for span in protected_spans {
+        if span.start_char < span.end_char && span.end_char <= chars.len() {
+            protected_ends.insert(span.start_char, span.end_char);
+        }
+    }
     let mut out = String::new();
-    let mut map = Vec::with_capacity(text.chars().count() + 1);
+    let mut map = vec![0usize; chars.len() + 1];
     let mut output_chars = 0usize;
     let mut line_units = 0.0f32;
     let mut lines = 1usize;
-    for ch in text.chars() {
-        map.push(output_chars);
-        if ch == '\n' {
+    let mut index = 0usize;
+    while index < chars.len() {
+        map[index] = output_chars;
+        if chars[index] == '\n' {
             if lines >= max_lines {
                 break;
             }
-            out.push(ch);
+            out.push('\n');
             output_chars += 1;
             line_units = 0.0;
             lines += 1;
+            index += 1;
             continue;
         }
-        let units = wrap_char_units(ch);
-        if line_units > 0.0 && line_units + units > max_units {
+
+        let chunk_end = protected_ends.get(&index).copied().unwrap_or(index + 1);
+        let chunk_units = chars[index..chunk_end]
+            .iter()
+            .map(|ch| wrap_char_units(*ch))
+            .sum::<f32>();
+        let mut projected_units = chunk_units;
+        if chunk_end == index + 1 && is_kinsoku_line_end(chars[index]) {
+            projected_units += chars
+                .get(chunk_end)
+                .filter(|ch| **ch != '\n')
+                .map(|ch| wrap_char_units(*ch))
+                .unwrap_or_default();
+        } else {
+            projected_units += chars[chunk_end..]
+                .iter()
+                .take_while(|ch| **ch != '\n' && is_kinsoku_line_start(**ch))
+                .map(|ch| wrap_char_units(*ch))
+                .sum::<f32>();
+        }
+        if line_units > 0.0 && line_units + projected_units > max_units {
             if lines >= max_lines {
                 break;
             }
@@ -849,18 +1635,35 @@ fn wrap_text_to_state_with_map(text: &str, state: &TextState) -> (String, Vec<us
             line_units = 0.0;
             lines += 1;
         }
-        out.push(ch);
-        output_chars += 1;
-        line_units += units;
+        for ch in &chars[index..chunk_end] {
+            map[index] = output_chars;
+            out.push(*ch);
+            output_chars += 1;
+            line_units += wrap_char_units(*ch);
+            index += 1;
+        }
     }
-    map.push(output_chars);
+    map[index..].fill(output_chars);
     (out, map)
 }
 
-pub(crate) fn ruby_draw_runs(node: &RuntimeTextNode) -> Vec<(String, f32, f32, f32)> {
+fn is_kinsoku_line_start(ch: char) -> bool {
+    "\"':;?!ﾞﾟ･，．、。：；？！”゛゜‐]})）〕］｝〉≫》」』】ヽヾゝゞ々ー～っゃゅょッャュョ"
+        .contains(ch)
+}
+
+fn is_kinsoku_line_end(ch: char) -> bool {
+    "[{(（〔［｛〈≪《「『【“".contains(ch)
+}
+
+pub(crate) fn ruby_draw_runs(
+    node: &RuntimeTextNode,
+    layout: RuntimeFormattedTextLayout,
+) -> Vec<(String, f32, f32, f32)> {
     let chars = node.text.chars().collect::<Vec<_>>();
-    let line_height = (node.size + 6.0).max(18.0);
-    let ruby_size = (node.size * 0.46).max(10.0);
+    if layout.ruby_height <= 0.0 {
+        return Vec::new();
+    }
     node.ruby_spans
         .iter()
         .filter_map(|span| {
@@ -889,10 +1692,15 @@ pub(crate) fn ruby_draw_runs(node: &RuntimeTextNode) -> Vec<(String, f32, f32, f
                 .sum::<f32>();
             let reading_units = span.reading.chars().map(wrap_char_units).sum::<f32>();
             let body_width = body_units * node.size;
-            let reading_width = reading_units * ruby_size;
-            let x = node.x + x_units * node.size + (body_width - reading_width) * 0.5;
-            let y = node.y + line as f32 * line_height - ruby_size * 0.78;
-            Some((span.reading.clone(), x, y, ruby_size))
+            let reading_width = reading_units * layout.ruby_height;
+            let x = node.x
+                + x_units * node.size
+                + (body_width - reading_width) * 0.5
+                + node.size * 0.125
+                + layout.ruby_x_offset;
+            let main_y = node.y + layout.body_y_offset + line as f32 * layout.line_height;
+            let y = main_y + layout.ruby_y_offset - layout.ruby_height;
+            Some((span.reading.clone(), x, y, layout.ruby_height))
         })
         .collect()
 }
@@ -913,5 +1721,66 @@ fn value_to_text_string(value: &ethornell_vm::Value) -> Option<String> {
     match value {
         ethornell_vm::Value::Str(text) => Some(text.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_and_wrap_message, parse_and_wrap_styled_message, wrap_text_to_state, TextState,
+    };
+
+    fn narrow_text_state() -> TextState {
+        TextState {
+            x: 0.0,
+            y: 0.0,
+            width: 120.0,
+            height: 100.0,
+            font_size: 15.0,
+            color: [1.0; 4],
+            line_height: 20.0,
+        }
+    }
+
+    #[test]
+    fn wrapping_keeps_target_line_start_punctuation_with_its_predecessor() {
+        assert_eq!(
+            wrap_text_to_state("甲乙丙丁戊己庚辛。壬", &narrow_text_state()),
+            "甲乙丙丁戊己庚\n辛。壬"
+        );
+    }
+
+    #[test]
+    fn wrapping_does_not_leave_an_opening_bracket_at_line_end() {
+        assert_eq!(
+            wrap_text_to_state("甲乙丙丁戊己庚「辛壬", &narrow_text_state()),
+            "甲乙丙丁戊己庚\n「辛壬"
+        );
+    }
+
+    #[test]
+    fn wrapping_moves_a_ruby_base_as_one_target_text_fragment() {
+        let (text, spans) =
+            parse_and_wrap_message("甲乙丙丁戊己庚<Rしんじん>辛壬</R>癸", &narrow_text_state());
+        assert_eq!(text, "甲乙丙丁戊己庚\n辛壬癸");
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start_char, spans[0].end_char), (8, 10));
+        assert_eq!(spans[0].reading, "しんじん");
+    }
+
+    #[test]
+    fn wrapping_remaps_target_style_spans_across_inserted_newlines() {
+        let parsed =
+            parse_and_wrap_styled_message("甲乙丙丁戊己庚<b>辛壬</b>癸", &narrow_text_state());
+        assert_eq!(parsed.text, "甲乙丙丁戊己庚辛\n壬癸");
+        assert_eq!(parsed.style_spans.len(), 1);
+        assert_eq!(
+            (
+                parsed.style_spans[0].start_char,
+                parsed.style_spans[0].end_char
+            ),
+            (7, 10)
+        );
+        assert!(parsed.style_spans[0].style.bold);
     }
 }

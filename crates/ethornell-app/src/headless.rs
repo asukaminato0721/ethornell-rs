@@ -6,6 +6,7 @@ pub enum HeadlessInputEvent {
     MousePress { x: f32, y: f32 },
     MouseRelease { x: f32, y: f32 },
     KeyPress { key: String },
+    KeyRelease { key: String },
 }
 
 #[derive(Clone, Debug)]
@@ -22,7 +23,7 @@ enum HeadlessInputAction {
 pub struct HeadlessInputScript {
     actions: VecDeque<HeadlessInputAction>,
     wait_remaining: u32,
-    queued_release: Option<(f32, f32)>,
+    queued_release: Option<HeadlessInputEvent>,
 }
 
 impl HeadlessInputScript {
@@ -80,8 +81,8 @@ impl HeadlessInputScript {
     }
 
     pub fn tick(&mut self) -> Option<HeadlessInputEvent> {
-        if let Some((x, y)) = self.queued_release.take() {
-            return Some(HeadlessInputEvent::MouseRelease { x, y });
+        if let Some(event) = self.queued_release.take() {
+            return Some(event);
         }
         loop {
             if self.wait_remaining > 0 {
@@ -103,14 +104,35 @@ impl HeadlessInputScript {
                     return Some(HeadlessInputEvent::MouseRelease { x, y });
                 }
                 HeadlessInputAction::Click { x, y } => {
-                    self.queued_release = Some((x, y));
+                    self.queued_release = Some(HeadlessInputEvent::MouseRelease { x, y });
                     return Some(HeadlessInputEvent::MousePress { x, y });
                 }
                 HeadlessInputAction::KeyPress { key } => {
+                    self.queued_release = Some(HeadlessInputEvent::KeyRelease { key: key.clone() });
                     return Some(HeadlessInputEvent::KeyPress { key });
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HeadlessInputEvent, HeadlessInputScript};
+
+    #[test]
+    fn key_action_replays_the_platform_press_and_release_pair() {
+        let mut script = HeadlessInputScript::parse("key:enter").expect("parse input script");
+
+        assert!(matches!(
+            script.tick(),
+            Some(HeadlessInputEvent::KeyPress { key }) if key == "enter"
+        ));
+        assert!(matches!(
+            script.tick(),
+            Some(HeadlessInputEvent::KeyRelease { key }) if key == "enter"
+        ));
+        assert!(script.tick().is_none());
     }
 }
 

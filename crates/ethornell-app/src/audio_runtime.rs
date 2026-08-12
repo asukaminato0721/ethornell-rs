@@ -5,13 +5,31 @@ pub(crate) struct AudioAsset {
     pub(crate) bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NativeCdAudioState {
+    /// Whether the target-style CD audio device is currently open.
+    pub(crate) opened: bool,
+    /// Target public mode mapping: 0=not ready, 1=seek, 2=play,
+    /// 3=stop, 4=pause, 5=open, 6=record, -1=unknown.
+    pub(crate) mode: i32,
+    pub(crate) current_track: Option<u8>,
+    pub(crate) notify_requested: bool,
+    /// Portable CD-DA replacement tracks keyed by the one-based TMSF track
+    /// number used by the target MCI backend.
+    pub(crate) tracks: std::collections::BTreeMap<u8, AudioAsset>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SoundSlot {
     pub(crate) asset: AudioAsset,
+    pub(crate) loop_asset: Option<AudioAsset>,
     pub(crate) looped: bool,
     pub(crate) decode_gain: f64,
     pub(crate) playback_rate: f64,
-    pub(crate) fade_in_ms: u64,
+    pub(crate) panning: f64,
+    /// Raw target loader/start parameter forwarded to the sound object's
+    /// virtual configuration method. It is not a duration.
+    pub(crate) native_start_parameter: i32,
     pub(crate) needs_restart: bool,
 }
 
@@ -70,6 +88,7 @@ impl NativeAudioClock {
 pub(crate) enum AudioCommand {
     Play {
         asset: AudioAsset,
+        loop_asset: Option<AudioAsset>,
         channel: i32,
         looped: bool,
         volume: f64,
@@ -138,6 +157,7 @@ pub(crate) fn execute_audio_command(
     match command {
         AudioCommand::Play {
             asset,
+            loop_asset,
             channel,
             looped,
             volume,
@@ -147,7 +167,20 @@ pub(crate) fn execute_audio_command(
             fade_ms,
             restart,
         } => {
-            let result = if restart {
+            let result = if let Some(loop_asset) = loop_asset.as_ref() {
+                audio.play_intro_loop_on_channel(
+                    channel,
+                    &asset.bytes,
+                    &loop_asset.bytes,
+                    looped,
+                    volume,
+                    decode_gain,
+                    playback_rate,
+                    panning,
+                    fade_ms,
+                    restart,
+                )
+            } else if restart {
                 audio
                     .play_on_channel(
                         channel,
@@ -185,6 +218,8 @@ pub(crate) fn execute_audio_command(
                     started,
                     archive = asset.archive,
                     file = asset.file,
+                    loop_archive = loop_asset.as_ref().map(|asset| asset.archive.as_str()),
+                    loop_file = loop_asset.as_ref().map(|asset| asset.file.as_str()),
                     "script audio playback requested"
                 ),
                 Err(err) => tracing::warn!(

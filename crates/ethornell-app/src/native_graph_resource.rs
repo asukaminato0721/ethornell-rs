@@ -1,79 +1,32 @@
 use super::*;
-use crate::native_graph::NativeBitmapOperation;
 use ethornell_vm::GraphApi;
 
 impl RuntimeTraceApi {
     pub(super) fn dispatch_native_graph_resource(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> Option<ethornell_vm::VmResult<ethornell_vm::Value>> {
+        let (group, id) = (call.group(), call.id());
         if group != 0x92 {
             return None;
         }
+        if id <= 0x1f {
+            return self.dispatch_system92_00_1f(call);
+        }
+        let stack = call.args_mut();
 
         let value = match id {
-            // sub_4854A0 -> sub_409AF0 installs one of eight compact sine
-            // displacement tables.
-            0x00 => {
-                let args = pop_args(stack, 5);
-                let configured = self.effects.configure_compact_wave_table(&args);
-                tracing::debug!(?args, configured, "GraphConfigureCompactWaveTable");
-                ethornell_vm::Value::None
-            }
-            // sub_404E70 initializes every format-6 vector-map sample.
-            0x11 => {
-                let mode = pop_int_value(stack).unwrap_or_default();
-                let bitmap = pop_int_value(stack).unwrap_or_default();
-                let generated = if (0..4).contains(&mode) {
-                    self.effects.generate_ripple_map(bitmap, mode & 1, 0, 0, 1)
-                } else {
-                    false
-                };
-                tracing::debug!(bitmap, mode, generated, "GraphInitializeVectorMap");
-                ethornell_vm::Value::None
-            }
-            // sub_4024A0 replaces matching RGB/RGBA pixels in the selected
-            // native bitmap and returns its native status family.
-            0x13 => {
-                let replacement = pop_int_value(stack).unwrap_or_default();
-                let needle = pop_int_value(stack).unwrap_or_default();
-                let bitmap = pop_int_value(stack).unwrap_or_default();
-                ethornell_vm::Value::Int(self.replace_native_bitmap_color(
-                    bitmap,
-                    needle as u32,
-                    replacement as u32,
-                ))
-            }
-            0x1A => {
-                let args = pop_args(stack, 6);
-                self.apply_native_bitmap_operation(&args, NativeBitmapOperation::Composite);
-                ethornell_vm::Value::None
-            }
-            // sub_403600/sub_403680 are immediate text rasterization paths
-            // that return the updated cursor/output coordinate.
-            0x1C | 0x1D => {
-                let count = if id == 0x1C { 10 } else { 11 };
-                let args = pop_args(stack, count);
-                self.render_native_text_args(&args);
-                let cursor = args
-                    .iter()
-                    .map(value_to_i32)
-                    .find(|value| *value > 0)
-                    .unwrap_or_default();
-                ethornell_vm::Value::Int(cursor)
-            }
-            // sub_4020D0 loads an in-memory BMP payload into a bitmap slot.
-            0x1F => {
-                let file = pop_string_value(stack).unwrap_or_default();
-                let bitmap = pop_int_value(stack).unwrap_or_default();
-                let loaded = self.load_graph_image_resource(bitmap, "", &file);
-                ethornell_vm::Value::Int(if loaded { 0 } else { -1 })
-            }
             0x8A => {
-                let args = pop_args(stack, 2);
-                self.apply_graph_layer_property(&args);
+                // sub_440B50 resolves the text object and forwards the value
+                // to sub_42B3C0 (native object substructure at +0x164).
+                let value = pop_int_value(stack).unwrap_or_default();
+                let object = pop_int_value(stack).unwrap_or_default();
+                self.graph_object_properties
+                    .entry(object)
+                    .or_default()
+                    .properties
+                    .insert(0x8a, (value, 0));
+                tracing::debug!(object, value, "GraphSetTextObjectAuxiliaryValue");
                 ethornell_vm::Value::None
             }
             // sub_432E40 configures one of the fixed font/image atlas slots.
@@ -95,38 +48,61 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             0x9B => {
-                let font_name = pop_string_value(stack).unwrap_or_default();
-                let value = pop_int_value(stack).unwrap_or_default();
-                self.graph_defaults.text_style.font_name =
-                    (!font_name.is_empty()).then_some(font_name);
-                self.graph_default_priority = value;
-                ethornell_vm::Value::None
+                unreachable!("Graph92:9B is handled by the VM output-pair pointer bridge")
             }
-            // sub_437FA0 validates and installs native font face, dimensions,
-            // weight, and italic state; wrappers map its HRESULT family.
+            // sub_486A50 pops italic, registry/context, creation field,
+            // height and face selector. sub_463350 resolves the face from the
+            // final selector plus registry/context before sub_437FA0 performs
+            // platform-native font validation.
             0x9D => {
                 let args = pop_args(stack, 5);
-                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let font_name = args.iter().find_map(value_to_optional_string);
-                if let Some(name) = font_name.filter(|name| !name.is_empty()) {
-                    self.graph_defaults.text_style.font_name = Some(name);
+                let italic = args.first().map(value_to_i32).unwrap_or_default();
+                let registry_context = args.get(1).map(value_to_i32).unwrap_or_default();
+                let creation_field = args.get(2).map(value_to_i32).unwrap_or_default();
+                let height = args.get(3).map(value_to_i32).unwrap_or_default();
+                let face_selector = args.get(4).cloned().unwrap_or(ethornell_vm::Value::None);
+                match &face_selector {
+                    ethornell_vm::Value::Str(name) => {
+                        self.graph_defaults.text_font_override.face_name =
+                            (!name.is_empty()).then(|| name.clone());
+                    }
+                    ethornell_vm::Value::Int(0)
+                    | ethornell_vm::Value::Ptr(0)
+                    | ethornell_vm::Value::None => {
+                        self.graph_defaults.text_font_override.face_name = None;
+                    }
+                    _ => {}
                 }
-                if let Some(size) = values
-                    .iter()
-                    .copied()
-                    .find(|value| (1..=200).contains(value))
-                {
-                    self.text_state.font_size = size as f32;
+                if (1..=200).contains(&height) {
+                    self.text_state.font_size = height as f32;
                 }
+                self.graph_defaults.text_font_override.height = height;
+                self.graph_defaults.text_font_override.creation_field_0 = creation_field;
+                self.graph_defaults.text_font_override.creation_field_1 = registry_context;
+                self.graph_defaults.text_font_override.italic = italic != 0;
+                tracing::debug!(
+                    ?face_selector,
+                    height,
+                    creation_field,
+                    registry_context,
+                    italic,
+                    "GraphConfigureFontOverride"
+                );
+                // Exact GDI face lookup and HRESULT-to-script status mapping
+                // remain platform-specific, so this stays Partial.
                 ethornell_vm::Value::Int(0)
             }
-            // The VM owns and clears the destination record buffer.
+            // The VM owns the destination record buffer and exact 128-byte
+            // serialization. Reaching host dispatch would double-pop.
             0x9E => {
-                let _destination = stack.pop();
-                ethornell_vm::Value::Int(0)
+                unreachable!("Graph92:9E is handled by the VM fragment-record pointer bridge")
             }
             0x9F => {
-                self.graph_default_priority = pop_int_value(stack).unwrap_or_default();
+                self.system92_text_render_override = pop_int_value(stack).unwrap_or_default();
+                tracing::debug!(
+                    value = self.system92_text_render_override,
+                    "GraphSetTextRenderOverride"
+                );
                 ethornell_vm::Value::None
             }
             0xF6 => {
@@ -143,26 +119,51 @@ impl RuntimeTraceApi {
         Some(Ok(value))
     }
 
-    fn replace_native_bitmap_color(&mut self, bitmap: i32, needle: u32, replacement: u32) -> i32 {
+    pub(super) fn replace_native_bitmap_color(
+        &mut self,
+        bitmap: i32,
+        needle: u32,
+        replacement: u32,
+    ) -> i32 {
+        let Some(format) = self.bitmap_formats.get(&bitmap).copied() else {
+            return 1;
+        };
+        let Some(bytes_per_pixel) =
+            super::graph_bitmap_nodes::target_bitmap_bytes_per_pixel(format)
+        else {
+            return 2;
+        };
+        if bytes_per_pixel != 4 {
+            return 2;
+        }
+        if !matches!(format, 1 | 2) {
+            return 0;
+        }
         let Some(mut image) = self.graph_bitmap_image(bitmap) else {
             return 1;
         };
-        let needle_rgb = [
-            (needle & 0xff) as u8,
-            ((needle >> 8) & 0xff) as u8,
-            ((needle >> 16) & 0xff) as u8,
-        ];
-        let replacement_rgb = [
-            (replacement & 0xff) as u8,
-            ((replacement >> 8) & 0xff) as u8,
-            ((replacement >> 16) & 0xff) as u8,
-        ];
+        let unpack = |packed: u32| {
+            [
+                ((packed >> 16) & 0xff) as u8,
+                ((packed >> 8) & 0xff) as u8,
+                (packed & 0xff) as u8,
+                (packed >> 24) as u8,
+            ]
+        };
+        let needle_rgba = unpack(needle);
+        let replacement_rgba = unpack(replacement);
         for pixel in image.rgba.chunks_exact_mut(4) {
-            if pixel[..3] == needle_rgb {
-                pixel[..3].copy_from_slice(&replacement_rgb);
-                if needle & 0xff00_0000 != 0 {
-                    pixel[3] = (replacement >> 24) as u8;
+            if format == 1 {
+                if pixel[..3] == needle_rgba[..3] {
+                    pixel[..3].copy_from_slice(&replacement_rgba[..3]);
+                    pixel[3] = 0xff;
                 }
+            } else if needle_rgba[3] == 0 {
+                if pixel[..3] == needle_rgba[..3] {
+                    pixel[..3].copy_from_slice(&replacement_rgba[..3]);
+                }
+            } else if pixel == needle_rgba {
+                pixel.copy_from_slice(&replacement_rgba);
             }
         }
         let key = format!("runtime:color-replace:{bitmap}");

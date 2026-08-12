@@ -2,8 +2,8 @@ use ethornell_archive::{detect_magic, scan_game_root, MagicKind, ResourceManager
 use ethornell_audio::AudioSystem;
 use ethornell_core::{EthornellError, GameRoot, Result};
 use ethornell_image::{decode_image, DecodedImage};
-use ethornell_render::{RenderCommand, Renderer, TextureHandle};
-use ethornell_script::{calls::known_call_arg_count, known_call_name};
+use ethornell_render::{RenderCommand, Renderer, TextStyleSpan, TextureHandle};
+use ethornell_script::calls::known_call_arg_count;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,23 +13,40 @@ mod audio_runtime;
 mod auto_input;
 mod character_image;
 mod debug_trace;
+mod display_tree;
 mod effects;
 mod graph;
+mod graph_bitmap_nodes;
+mod graph_color;
+mod graph_config;
 mod graph_defaults;
 mod graph_effect;
+mod graph_flash;
+mod graph_group;
 mod graph_input;
-mod graph_scroll;
+mod graph_knob;
+mod graph_links;
+mod graph_movie;
+mod graph_sprite_targets;
 mod headless;
+mod host_dialog;
+mod host_installer;
+mod input_state;
+mod native_background;
+mod native_display;
 mod native_effect;
 mod native_graph;
 mod native_graph_ext;
 mod native_graph_resource;
+mod native_graph_sys91;
+mod native_graph_sys92;
 mod native_sound;
 mod native_system;
 mod native_system_ext;
 mod native_user;
 mod platform;
 mod resource_lookup;
+mod runtime_frontend;
 mod scenario;
 mod scene;
 mod snapshot;
@@ -37,25 +54,37 @@ mod surface_controls;
 mod text;
 mod text_anim;
 mod timeline;
+mod timing;
 mod title;
 mod user_files;
 use animation::{GraphAnimationRegistry, LayerAnimationSystem};
 use audio_runtime::{
-    execute_audio_command, AudioAsset, AudioCommand, NativeAudioClock, SoundSlot,
+    execute_audio_command, AudioAsset, AudioCommand, NativeAudioClock, NativeCdAudioState,
+    SoundSlot,
 };
 use character_image::decode_scenario_resource_image;
+use display_tree::{NativeDisplayKind, NativeDisplayTree};
 use graph::{
-    blend_decoded_image_parameter, blit_decoded_image, blit_decoded_image_parameter,
-    crop_decoded_image, crossfade_decoded_images, fixed_16_to_f32, native_draw_order,
-    scale_decoded_image_fixed, NativeImageNodeArgs, RuntimeClipRect, RuntimeGraphDrawItem,
-    RuntimeGraphLayer, RuntimeGraphObjectProperties, RuntimeGraphResource,
-    RuntimeGraphTransitionNode, RuntimeSurface, RuntimeUserControl, NATIVE_DISPLAY_Z,
-    NATIVE_SCREEN_BITMAP,
+    apply_alpha_mask, backf_mask_weight, blit_decoded_image,
+    blit_decoded_image_format2_source_over, blit_decoded_image_parameter,
+    blit_decoded_image_raw_copy, crop_decoded_image, crossfade_decoded_images,
+    crossfade_decoded_images_straight_alpha, fit_decoded_image_canvas, fixed_16_to_f32,
+    native_draw_order, scale_decoded_image_fixed, NativeMode5DynamicState, NativeMode5NodeArgs, RuntimeClipRect,
+    RuntimeGraphDrawItem, RuntimeGraphLayer, RuntimeGraphObjectProperties, RuntimeGraphResource,
+    RuntimeGraphTransitionNode, RuntimeSurface, RuntimeUserControl,
+    NATIVE_DISPLAY_Z, NATIVE_SCREEN_BITMAP,
 };
 use graph_defaults::{GraphRuntimeDefaults, SurfaceTextState};
+use graph_group::GraphGroupState;
 use graph_input::{pack_words, RuntimeGraphInputObject};
-use graph_scroll::GraphScrollState;
+use graph_knob::GraphKnobState;
+use graph_movie::BurikoMovieRegistry;
+use graph_sprite_targets::GraphSpriteTargetRegistry;
 use headless::{HeadlessInputEvent, HeadlessInputScript};
+use native_background::{
+    NativeBackgroundClass, NativeBackgroundSecondaryResource, NativeBackgroundState,
+    BACK_B_SECONDARY_LAYER_ID, BACK_F_SECONDARY_LAYER_ID, BACK_S_ADDITIONAL_LAYER_IDS,
+};
 use resource_lookup::find_scenario_image;
 use scenario::{ScenarioAction, ScenarioPlayback};
 use scene::{
@@ -66,10 +95,13 @@ use surface_controls::SurfaceControlRegistry;
 use text::{RuntimeTextNode, TextState, MESSAGE_NAME_TEXT_Z, MESSAGE_TEXT_Z};
 use text_anim::TextRuntime;
 use timeline::{TimelineEvent, TimelineSystem};
+use timing::{duration_ms_to_ticks, normalize_engine_elapsed_ms, NATIVE_TICK_MS};
 use user_files::{
-    find_runtime_file, game_root_path, is_empty_archive_arg, read_runtime_bytes,
-    runtime_file_cache_key, runtime_file_path,
+    bgi_xxx_pattern_matches, find_runtime_file_from_root, game_root_path, is_empty_archive_arg,
+    read_runtime_bytes, resolve_existing_path_case_insensitive, runtime_file_cache_key,
+    runtime_file_exists_from_root, runtime_file_path, runtime_file_path_from_root,
 };
+use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -101,23 +133,38 @@ pub struct AppConfig {
 }
 
 pub fn run(config: AppConfig) -> Result<()> {
-    let scan = scan_game_root(&config.game_root)?;
-    tracing::info!(
-        files = scan.file_count,
-        arcs = scan.arc_candidates,
-        bp = scan.bp_scripts,
-        cbg = scan.compressed_bg_candidates,
-        ogg = scan.ogg_candidates,
-        "game resource scan complete"
-    );
+    let headless = config.headless || std::env::var_os("ETHORNELL_GUI_HEADLESS").is_some();
+    // A full recursive magic probe opens every loose file in the game tree and
+    // is diagnostic work, not runtime initialization. Keep it behind --trace;
+    // normal GUI/headless startup should build only the ARC indices it uses.
+    if config.trace {
+        let scan = scan_game_root(&config.game_root)?;
+        tracing::info!(
+            files = scan.file_count,
+            arcs = scan.arc_candidates,
+            bp = scan.bp_scripts,
+            cbg = scan.compressed_bg_candidates,
+            ogg = scan.ogg_candidates,
+            "game resource scan complete"
+        );
+    }
     let manager = ResourceManager::open_game(config.game_root.path())?;
     tracing::info!(
         archives = manager.archives().archives.len(),
-        resources = manager.list().len(),
+        resources = manager.resource_count(),
         "archive-backed resource manager ready"
     );
 
     let bgm = load_runtime_bgm(&manager);
+    let native_root = std::env::var_os("ETHORNELL_NATIVE_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| game_root_path(&manager));
+    tracing::info!(
+        root = %native_root.display(),
+        resource_root = %manager.archives().root.display(),
+        "target native filesystem root configured"
+    );
     // sub_4650F0/sub_465090 in the native executable select this pair for the
     // ordinary bootstrap. autoload.arc is a separate shortcut entry point
     // which deliberately sets the auto-load mode flag before chaining here.
@@ -134,8 +181,10 @@ pub fn run(config: AppConfig) -> Result<()> {
                 script,
                 &bytes,
                 manager.clone(),
+                native_root,
                 config.trace,
                 config.fail_on_stub,
+                !headless,
             )),
             Err(err) => {
                 tracing::warn!(script, %err, "startup script unavailable");
@@ -161,7 +210,7 @@ pub fn run(config: AppConfig) -> Result<()> {
     let text = config
         .force_text_test
         .then(|| "こんにちは\nHello Ethornell".to_string());
-    if config.headless || std::env::var_os("ETHORNELL_GUI_HEADLESS").is_some() {
+    if headless {
         run_headless("ethornell-rs runtime", image, text, bgm.ok(), runtime)
     } else {
         run_window("ethornell-rs runtime", image, text, bgm.ok(), runtime)
@@ -180,14 +229,218 @@ pub fn view_image_file(path: &Path) -> Result<()> {
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RuntimeCursorMotion {
+    start: (i32, i32),
+    target: (i32, i32),
+    last_generated: (i32, i32),
+    duration_ms: u32,
+    steps: u32,
+    step: u32,
+    elapsed_ms: u32,
+    next_step_ms: u32,
+    interpolation_mode: i32,
+    cancel_on_large_move: bool,
+}
+
+impl RuntimeCursorMotion {
+    fn new(
+        start: (i32, i32),
+        target: (i32, i32),
+        duration_ms: u32,
+        updates_per_second: u32,
+        interpolation_mode: i32,
+        cancel_on_large_move: bool,
+    ) -> Self {
+        let steps = updates_per_second
+            .saturating_mul(duration_ms)
+            .checked_div(1_000)
+            .unwrap_or(0)
+            .max(1);
+        Self {
+            start,
+            target,
+            last_generated: start,
+            duration_ms,
+            steps,
+            step: 0,
+            elapsed_ms: 0,
+            next_step_ms: duration_ms / steps,
+            interpolation_mode,
+            cancel_on_large_move,
+        }
+    }
+
+    fn point_for_step(&self, step: u32) -> (i32, i32) {
+        if step >= self.steps {
+            return self.target;
+        }
+        // sub_48E930 performs the interpolation in signed 16.16 fixed point.
+        // Preserve its arithmetic-right-shift rounding for negative deltas
+        // instead of relying on floating-point truncation toward zero.
+        let factor_fixed = if self.interpolation_mode == 1 {
+            let progress = step as f64 / self.steps as f64;
+            (((1.0 - (std::f64::consts::PI * progress).cos()) * 32_768.0) as i64).clamp(0, 65_536)
+        } else {
+            (i64::from(step) << 16) / i64::from(self.steps)
+        };
+        let interpolate = |start: i32, target: i32| {
+            let delta = i64::from(target) - i64::from(start);
+            let offset = delta.saturating_mul(factor_fixed) >> 16;
+            i64::from(start)
+                .saturating_add(offset)
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        (
+            interpolate(self.start.0, self.target.0),
+            interpolate(self.start.1, self.target.1),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimePerformanceProfile {
+    enabled: bool,
+    sample_count: u32,
+    total_duration_ns: u128,
+    within_budget_count: u32,
+    budget_ns: u64,
+}
+
+impl Default for RuntimePerformanceProfile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_count: 0,
+            total_duration_ns: 0,
+            within_budget_count: 0,
+            budget_ns: NATIVE_TICK_MS.saturating_mul(1_000_000).saturating_mul(96) / 100,
+        }
+    }
+}
+
+impl RuntimePerformanceProfile {
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if enabled {
+            self.sample_count = 0;
+            self.total_duration_ns = 0;
+            self.within_budget_count = 0;
+        }
+    }
+
+    fn record_present(&mut self, duration: Duration) {
+        if !self.enabled {
+            return;
+        }
+        let duration_ns = duration.as_nanos();
+        self.sample_count = self.sample_count.saturating_add(1);
+        self.total_duration_ns = self.total_duration_ns.saturating_add(duration_ns);
+        if duration_ns < u128::from(self.budget_ns) {
+            self.within_budget_count = self.within_budget_count.saturating_add(1);
+        }
+    }
+
+    fn metric(&self, selector: i32) -> i32 {
+        let clamp_i32 = |value: u128| value.min(i32::MAX as u128) as i32;
+        match selector {
+            0 => self.sample_count.min(i32::MAX as u32) as i32,
+            1 if self.sample_count != 0 => clamp_i32(
+                self.total_duration_ns
+                    .checked_div(u128::from(self.sample_count))
+                    .unwrap_or(0)
+                    .checked_div(1_000)
+                    .unwrap_or(0),
+            ),
+            2 if self.total_duration_ns != 0 => clamp_i32(
+                u128::from(self.budget_ns / 2)
+                    .saturating_mul(u128::from(self.sample_count))
+                    .saturating_mul(10_000)
+                    .checked_div(self.total_duration_ns)
+                    .unwrap_or(0),
+            ),
+            3 if self.sample_count != 0 => {
+                let within = u128::from(self.within_budget_count);
+                let samples = u128::from(self.sample_count);
+                clamp_i32(
+                    within
+                        .saturating_mul(within)
+                        .saturating_mul(10_000)
+                        .checked_div(samples.saturating_mul(samples))
+                        .unwrap_or(0),
+                )
+            }
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_performance_profile_tests {
+    use super::RuntimePerformanceProfile;
+    use std::time::Duration;
+
+    #[test]
+    fn target_metric_formulas_and_enable_reset_are_preserved() {
+        let mut profile = RuntimePerformanceProfile {
+            budget_ns: 10_000_000,
+            ..RuntimePerformanceProfile::default()
+        };
+        profile.set_enabled(true);
+        profile.record_present(Duration::from_millis(4));
+        profile.record_present(Duration::from_millis(12));
+
+        assert_eq!(profile.metric(0), 2);
+        assert_eq!(profile.metric(1), 8_000);
+        assert_eq!(profile.metric(2), 6_250);
+        assert_eq!(profile.metric(3), 2_500);
+        assert_eq!(profile.metric(99), 0);
+
+        profile.set_enabled(false);
+        profile.record_present(Duration::from_millis(1));
+        assert_eq!(profile.metric(0), 2);
+
+        profile.set_enabled(true);
+        assert_eq!(profile.metric(0), 0);
+        assert_eq!(profile.metric(1), 0);
+        assert_eq!(profile.metric(2), 0);
+        assert_eq!(profile.metric(3), 0);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeControlInputLatch {
+    scope: i32,
+    previous_pointer_eligible: bool,
+    previous_keyboard_eligible: bool,
+    pointer_serial: u64,
+    auxiliary_serial: u64,
+}
+
 struct RuntimeTraceApi {
     manager: ResourceManager,
+    native_root: PathBuf,
     text_state: TextState,
     text_runtime: TextRuntime,
     graph_defaults: GraphRuntimeDefaults,
+    /// Target dword_565D34/dword_565D38, updated by Graph92:9C and
+    /// copied through the VM-owned Graph92:9B pointer bridge.
+    system92_text_output_pair: [i32; 2],
+    /// Target unk_50E240/dword_565CF8 fragment table. Graph92:9C produces
+    /// records and Graph92:9E drains them through BP memory.
+    system92_text_fragment_records: Vec<ethornell_vm::System92TextFragmentRecord>,
+    /// Target dword_507650 configured by Graph92:9F.
+    system92_text_render_override: i32,
     window_mode: i32,
     screen_width: i32,
     screen_height: i32,
+    window_surface_width: i32,
+    window_surface_height: i32,
+    engine_time_ms: u64,
+    presentation_state: i32,
+    performance_profile: RuntimePerformanceProfile,
+    graphics_capabilities: [u32; 16],
+    graphics_memory_metric: i32,
     debug_graph: bool,
     trace_render_tree: bool,
     graph_trace: VecDeque<String>,
@@ -197,49 +450,146 @@ struct RuntimeTraceApi {
     graphic_resource_keys: BTreeMap<(i32, i32), String>,
     graph_resources: BTreeMap<i32, RuntimeGraphResource>,
     graph_bindings: BTreeMap<i32, i32>,
+    graph_links: graph_links::GraphLinkRegistry,
+    display_tree: NativeDisplayTree,
     graph_layers: BTreeMap<i32, RuntimeGraphLayer>,
+    graph_bitmap_node_bindings: BTreeMap<i32, graph_bitmap_nodes::RuntimeBitmapNodeBinding>,
+    graph_color_luts: BTreeMap<i32, graph_color::RuntimeColorLut>,
+    graph_config: graph_config::RuntimeGraphConfig,
+    graph_node_enabled: BTreeMap<i32, bool>,
+    graph_node_masks: BTreeMap<i32, i32>,
+    graph_node_sources: BTreeMap<i32, (String, RuntimeClipRect)>,
     graph_transition_nodes: BTreeMap<i32, RuntimeGraphTransitionNode>,
     graph_object_layers: BTreeMap<i32, BTreeSet<i32>>,
     graph_object_enabled: BTreeMap<i32, bool>,
+    /// Target CDspObj+0x14 (virtual setter slot +4) is a second draw gate,
+    /// distinct from the recursively propagated CDspObj+0x04 enable flag.
+    graph_object_draw_enabled: BTreeMap<i32, bool>,
     graph_object_properties: BTreeMap<i32, RuntimeGraphObjectProperties>,
+    /// Per-concrete-CDspObj constructor counters passed in ECX to the
+    /// recovered base constructor and stored at +0x20. These counters are
+    /// monotonic per class and are independent of reusable public handle slots.
+    graph_native_constructor_serials: BTreeMap<NativeDisplayKind, u32>,
     graph_object_input_tables: BTreeMap<i32, i32>,
     graph_input_objects: BTreeMap<i32, RuntimeGraphInputObject>,
+    graph_key_assignments: [Option<[i32; 24]>; 4],
+    graph_active_input_handle: i32,
+    graph_item_selection_highlight_styles: [i32; 2],
+    graph_item_selection_input_mask: i32,
+    graph_item_selection_navigation: [i32; 4],
+    graph_item_selection_column_layouts: BTreeMap<i32, [i32; 16]>,
+    graph_interactive_procedure_poll_gate: i32,
     current_graph_object: Option<i32>,
     primary_bitmap: Option<i32>,
     bitmap_dimensions: BTreeMap<i32, (u32, u32)>,
+    bitmap_formats: BTreeMap<i32, i32>,
+    /// Target bitmap descriptor +0x28/+0x2c auxiliary pair. These fields are
+    /// independent of width/height and are initialized to (-1, -1).
+    bitmap_auxiliary_pairs: BTreeMap<i32, [i32; 2]>,
     graph_surfaces: BTreeMap<i32, RuntimeSurface>,
+    /// Graph90:9E horizontal glyph strip registration state.
+    fullwidth_glyph_bitmap: Option<i32>,
+    fullwidth_glyph_count: i32,
+    fullwidth_glyph_cell_width: i32,
     surface_text_states: BTreeMap<i32, SurfaceTextState>,
     surface_text_buffers: BTreeMap<i32, String>,
-    graph_scroll_states: BTreeMap<i32, GraphScrollState>,
+    /// Target CDspObjKnob registry: 32 slots, handles 0xF0000000 | slot.
+    graph_knob_states: BTreeMap<i32, GraphKnobState>,
+    graph_knob_target_owners: BTreeMap<i32, i32>,
+    graph_knob_watches: BTreeSet<i32>,
+    graph_knob_input_mode: i32,
+    /// Target CDspObjGroup registry: 8 slots, handles 0xF1000000 | slot.
+    graph_groups: BTreeMap<i32, GraphGroupState>,
+    graph_native_owners: BTreeMap<i32, i32>,
     surface_controls: SurfaceControlRegistry,
     graph_default_priority: i32,
     graph_driver_mode: i32,
+    /// Target 90:0A globals: enable automatic redraw after object updates and
+    /// choose full versus ordinary redraw when the gate is enabled.
+    graph_object_update_redraw_enabled: bool,
+    graph_object_update_redraw_full: bool,
+    /// Target dword_565B18 used by format-2 alpha unblending.
+    graph_bitmap_unblend_color: i32,
+    /// Target pixel/raster format mode and the derived component layout.
+    graph_raster_format_mode: i32,
+    graph_raster_layout: (i32, i32, i32),
+    graph_scheduler_enabled: bool,
+    graph_frame_rate: u32,
+    graph_memory_limit: u32,
+    graph_redraw_requested: Option<bool>,
     graph_global_offset: (f32, f32),
+    /// SystemB0:08 CProcShakeScreen transient screen displacement.
+    screen_shake_offset: (f32, f32),
     graph_special_watches: BTreeSet<i32>,
     graph_special_events: VecDeque<i32>,
     graph_process_handles: BTreeSet<i32>,
+    /// Target BF_Movie resource list used by Graph90:F4-F7.
+    graph_buriko_movies: BurikoMovieRegistry,
+    /// Target Sprite input-target list used by Graph90:F8/FA-FD.
+    graph_sprite_targets: GraphSpriteTargetRegistry,
+    global_movie_handle: Option<i32>,
+    global_movie_volume: i32,
     graph_blob_cache: BTreeMap<(String, String), Vec<u8>>,
+    /// Target System91:0B gate: bind the screen bitmap context around each BP tick.
+    graph91_script_bitmap_context_binding_enabled: bool,
+    /// Target System91:0C glyph coverage conversion mode (0=linear, 1=sine).
+    graph91_glyph_coverage_mode: i32,
+    /// Target System91:0D GDI font pitch/family auto-detection gate.
+    graph91_font_pitch_detection_enabled: bool,
+    /// Target System91:0E named 16.16 font transforms.
+    graph91_font_transforms: BTreeMap<String, native_graph_sys91::Graph91FontTransform>,
+    /// Target System91:0F font rasterizer records keyed by script font number.
+    graph91_fonts: BTreeMap<i32, native_graph_sys91::Graph91FontConfig>,
+    /// Target System91:31/33/36/37 CDspObj transform and suppression fields.
+    graph91_object_transforms: BTreeMap<i32, native_graph_sys91::Graph91ObjectTransformState>,
+    /// Target System91:40-4A singleton CDspObjBackML state with eight 84-byte layer records.
+    graph91_multilayer_background: native_graph_sys91::Graph91MultiLayerBackgroundState,
+    /// Target System91:55 Sprite-to-Sprite relation registry.
+    graph91_sprite_relations: BTreeMap<i32, i32>,
+    /// Target System91:60-69 CDspObjEffector registry: 8 tagged slots.
+    graph91_effectors: BTreeMap<i32, native_graph_sys91::Graph91EffectorState>,
+    /// Target System91:70-7F CDspObjLandscape registry: 4 tagged slots.
+    graph91_landscapes: BTreeMap<i32, native_graph_sys91::Graph91LandscapeState>,
     queued_system_events: VecDeque<[i32; 3]>,
     dropped_files: VecDeque<String>,
     quit_requested: bool,
     graph_animations: GraphAnimationRegistry,
     graph_effects: graph_effect::GraphEffectRegistry,
+    graph_flash_controls: graph_flash::RuntimeFlashRegistry,
     effects: effects::RuntimeEffects,
     layer_animations: LayerAnimationSystem,
     timelines: TimelineSystem,
     user_controls: BTreeMap<i32, RuntimeUserControl>,
     text_nodes: BTreeMap<i32, RuntimeTextNode>,
+    bitmap_text_runs: BTreeMap<i32, Vec<RuntimeTextNode>>,
+    screen_text_children: BTreeMap<i32, Vec<i32>>,
+    next_screen_text_child: i32,
     sound_slots: BTreeMap<i32, SoundSlot>,
     bgm_slots: BTreeMap<i32, SoundSlot>,
-    sound_group_volumes: [u8; 16],
-    bgm_channel_volumes: [u8; 16],
-    sound_channel_volumes: [u8; 64],
+    /// Target BGM gain bank set by A0:08 (dword_55FF18 / sub_4A3270).
+    bgm_primary_volumes: [u8; 16],
+    /// Target BGM gain bank set by A0:1C (sub_4A2BB0).
+    bgm_secondary_volumes: [u8; 16],
+    /// Per-BGM channel volume selected by load/A0:16 (target record +0x28).
+    bgm_play_volumes: [u8; 16],
+    /// Independent BGM fade envelope selected by A0:18/A0:19 (target record +0x40).
+    bgm_fade_volumes: [u8; 16],
+    /// Target SE gain bank set by A0:09 (dword_55EE18 / sub_4A2DF0).
+    sound_primary_volumes: [u8; 64],
+    /// Target SE gain bank set by A0:2C (sub_4A2890).
+    sound_secondary_volumes: [u8; 64],
+    /// Per-SE play volume selected by A0:24 (target record +0x28).
+    sound_play_volumes: [u8; 64],
+    /// Independent SE fade envelope selected by A0:26 (target record +0x40).
+    sound_fade_volumes: [u8; 64],
     bgm_channel_active: [bool; 16],
     sound_channel_active: [bool; 64],
     bgm_playback_clocks: [NativeAudioClock; 16],
     sound_playback_clocks: [NativeAudioClock; 64],
+    /// Target A0:80-86 CD-audio device. On portable hosts this is backed by
+    /// actual decoded track assets rather than an inert unsupported stub.
+    native_cd_audio: NativeCdAudioState,
     audio_requests: VecDeque<AudioCommand>,
-    current_bgm: Option<(String, String)>,
     program_cache: HashMap<String, ethornell_script::BpProgram>,
     file_exists_cache: HashMap<String, bool>,
     file_size_cache: HashMap<String, i32>,
@@ -258,23 +608,58 @@ struct RuntimeTraceApi {
     scenario_auto_mode: bool,
     scenario_skip_mode: bool,
     scenario_auto_wait_frames: u32,
+    /// Host-synthesized AUTO/SKIP mouse input belongs to the shadow scenario
+    /// interpreter, not to a recovered target engine object. It is disabled
+    /// in target-strict mode because it can cross native wait boundaries.
+    legacy_scenario_mode_input: bool,
+    scenario_mode_release_pending: bool,
     scenario_loaded_scripts: BTreeSet<String>,
     scenario_sprite_sequence: u32,
     scenario_scene_layers: BTreeSet<i32>,
     last_scenario_sound: Option<String>,
     next_node_handle: i32,
     next_object_handle: i32,
-    next_surface_handle: i32,
     next_timeline_handle: i32,
     mouse_pos: Option<(f32, f32)>,
+    cursor_motion: Option<RuntimeCursorMotion>,
+    pending_cursor_position: Option<(f32, f32)>,
     mouse_pressed: bool,
     pending_click: Option<(f32, f32)>,
     pending_click_age_frames: u8,
     pending_object_state: Option<(f32, f32)>,
     pending_input_state: Option<i32>,
     pending_input_descriptor: Option<i32>,
+    input_message_serial: i32,
+    window_messages: VecDeque<RuntimeWindowMessage>,
+    input_configuration_enabled: i32,
     input_master_gate: i32,
     input_latched_state: i32,
+    input_poll_active: bool,
+    /// Target global dword_507690 set by Sys81:1F and consumed by
+    /// CProcDspMsg/CProcedure input filtering.
+    message_auxiliary_input_mask: i32,
+    registered_keyboard_input_scopes: input_state::NativeInputScopeRegistry,
+    registered_pointer_input_scopes: input_state::NativeInputScopeRegistry,
+    configured_input_classes: BTreeMap<i32, Vec<i32>>,
+    /// Target dword_518CA0 table: accumulated activation counts per logical input.
+    input_event_counts: BTreeMap<i32, u32>,
+    /// Target dword_518CA4 table: non-consuming activation accumulator queried
+    /// by Sys80:12 and Sys80:1C.
+    input_descriptor_accumulators: BTreeMap<i32, u32>,
+    /// Target dword_518C98 table: descriptors currently held down.
+    input_down_descriptors: BTreeSet<i32>,
+    /// Target dword_518C9C table: first-held query high-bit latch.
+    input_down_reported: BTreeSet<i32>,
+    /// Per-CProcCtrlDspObj input edge state recovered from +0x88..+0x94.
+    /// Unlike `query_runtime_input_event_bits`, animation interruption uses
+    /// non-consuming activation serials and requires scope eligibility on two
+    /// consecutive samples before a serial increase can terminate a control.
+    native_control_input_latches: BTreeMap<u64, NativeControlInputLatch>,
+    /// Engine-time snapshot of the last cooperative-scheduler poll for each
+    /// exact CProcCtrlDspObj-family control. Multiple VM polls in one host
+    /// frame therefore receive zero elapsed time instead of double-counting
+    /// the GUI frame delta.
+    native_control_last_poll_ms: BTreeMap<u64, u64>,
     pending_input_consumed: bool,
     suppress_message_mouse_release: bool,
     last_hit_control: i32,
@@ -289,6 +674,7 @@ struct RuntimeTraceApi {
     auto_title_release_after_state: bool,
     auto_user_click: bool,
     auto_user_click_id: Option<i32>,
+    auto_user_click_stop_payload: Option<i32>,
     auto_user_click_done: bool,
     auto_user_click_repeat: bool,
     auto_user_click_point: Option<(f32, f32)>,
@@ -297,36 +683,68 @@ struct RuntimeTraceApi {
     auto_user_click_hover_frames: u32,
     auto_user_click_hovered_frames: u32,
     frame_yield_requested: bool,
-    pending_graph_procedure_schedule: Option<ethornell_vm::GraphProcedureSchedule>,
-    animation_queue_remaining: u32,
+    native_dialog_presentation: bool,
     pending_transition_destination: Option<i32>,
     pending_window_title: Option<String>,
+    pending_window_position: Option<(i32, i32)>,
     pending_fullscreen: Option<bool>,
     pending_window_visible: Option<bool>,
     pending_window_minimize: bool,
+    pending_cursor_visible: Option<bool>,
+    // Target dword_503E70: physical ShowCursor state.
+    cursor_visible: bool,
+    // Target dword_503E74: script-visible state returned by User B0:06.
+    cursor_visibility_latch: bool,
+    // Target dword_5668F8: current state of the idle-visibility controller.
+    cursor_idle_visible: bool,
+    cursor_idle_timeout_ms: u64,
+    cursor_idle_remaining_ms: u64,
     window_focused: bool,
     input_requires_focus: bool,
     system_mode_flag: i32,
     system_extension_state: i32,
+    window_monitor_adapter_mode: i32,
     system_config_input_mode: i32,
+    shader_effect_enabled: bool,
     native_system: native_system::NativeSystemState,
     native_user: native_user::NativeUserState,
     native_effect: native_effect::NativeEffectState,
+    /// Portable backend for Windows-only registry/installer metadata. Native
+    /// selectors remain unbound until their target parameter contracts close.
+    platform_store: platform::PortablePlatformStore,
     call_coverage_enabled: bool,
     call_coverage: BTreeMap<(u8, u16), usize>,
+    total_native_calls: u64,
+    last_native_call: Option<ethornell_vm::NativeOpcode>,
     runtime_stubbed: bool,
 }
 
 impl RuntimeTraceApi {
     fn new(manager: ResourceManager) -> Self {
+        let native_root = game_root_path(&manager);
+        Self::new_with_native_root(manager, native_root)
+    }
+
+    fn new_with_native_root(manager: ResourceManager, native_root: PathBuf) -> Self {
         Self {
             manager,
+            native_root,
             text_state: TextState::default(),
             text_runtime: TextRuntime::default(),
             graph_defaults: GraphRuntimeDefaults::default(),
+            system92_text_output_pair: [0, 0],
+            system92_text_fragment_records: Vec::new(),
+            system92_text_render_override: 0,
             window_mode: 0,
             screen_width: 0,
             screen_height: 0,
+            window_surface_width: 0,
+            window_surface_height: 0,
+            engine_time_ms: 0,
+            presentation_state: 0,
+            performance_profile: RuntimePerformanceProfile::default(),
+            graphics_capabilities: ethornell_vm::default_graphics_capability_record(),
+            graphics_memory_metric: 0,
             debug_graph: std::env::var("DEBUG").ok().as_deref() == Some("1"),
             trace_render_tree: std::env::var_os("TRACE_RENDER_TREE").is_some(),
             graph_trace: VecDeque::new(),
@@ -336,49 +754,110 @@ impl RuntimeTraceApi {
             graphic_resource_keys: BTreeMap::new(),
             graph_resources: BTreeMap::new(),
             graph_bindings: BTreeMap::new(),
+            graph_links: graph_links::GraphLinkRegistry::default(),
+            display_tree: NativeDisplayTree::default(),
             graph_layers: BTreeMap::new(),
+            graph_bitmap_node_bindings: BTreeMap::new(),
+            graph_color_luts: BTreeMap::new(),
+            graph_config: graph_config::RuntimeGraphConfig::default(),
+            graph_node_enabled: BTreeMap::new(),
+            graph_node_masks: BTreeMap::new(),
+            graph_node_sources: BTreeMap::new(),
             graph_transition_nodes: BTreeMap::new(),
             graph_object_layers: BTreeMap::new(),
             graph_object_enabled: BTreeMap::new(),
+            graph_object_draw_enabled: BTreeMap::new(),
             graph_object_properties: BTreeMap::new(),
+            graph_native_constructor_serials: BTreeMap::new(),
             graph_object_input_tables: BTreeMap::new(),
             graph_input_objects: BTreeMap::new(),
+            graph_key_assignments: [None; 4],
+            graph_active_input_handle: 0,
+            graph_item_selection_highlight_styles: [0; 2],
+            graph_item_selection_input_mask: 0,
+            graph_item_selection_navigation: [0; 4],
+            graph_item_selection_column_layouts: BTreeMap::new(),
+            graph_interactive_procedure_poll_gate: 0,
             current_graph_object: None,
             primary_bitmap: None,
             bitmap_dimensions: BTreeMap::new(),
+            bitmap_formats: BTreeMap::new(),
+            bitmap_auxiliary_pairs: BTreeMap::new(),
             graph_surfaces: BTreeMap::new(),
+            fullwidth_glyph_bitmap: None,
+            fullwidth_glyph_count: 0,
+            fullwidth_glyph_cell_width: 0,
             surface_text_states: BTreeMap::new(),
             surface_text_buffers: BTreeMap::new(),
-            graph_scroll_states: BTreeMap::new(),
+            graph_knob_states: BTreeMap::new(),
+            graph_knob_target_owners: BTreeMap::new(),
+            graph_knob_watches: BTreeSet::new(),
+            graph_knob_input_mode: 0,
+            graph_groups: BTreeMap::new(),
+            graph_native_owners: BTreeMap::new(),
             surface_controls: SurfaceControlRegistry::default(),
             graph_default_priority: 0,
             graph_driver_mode: 0,
+            graph_object_update_redraw_enabled: false,
+            graph_object_update_redraw_full: false,
+            graph_bitmap_unblend_color: 0,
+            graph_raster_format_mode: 0,
+            graph_raster_layout: (0, 0, 1),
+            graph_scheduler_enabled: true,
+            graph_frame_rate: 60,
+            graph_memory_limit: 0,
+            graph_redraw_requested: None,
             graph_global_offset: (0.0, 0.0),
+            screen_shake_offset: (0.0, 0.0),
             graph_special_watches: BTreeSet::new(),
             graph_special_events: VecDeque::new(),
             graph_process_handles: BTreeSet::new(),
+            graph_buriko_movies: BurikoMovieRegistry::default(),
+            graph_sprite_targets: GraphSpriteTargetRegistry::default(),
+            global_movie_handle: None,
+            global_movie_volume: 128,
             graph_blob_cache: BTreeMap::new(),
+            graph91_script_bitmap_context_binding_enabled: false,
+            graph91_glyph_coverage_mode: 0,
+            graph91_font_pitch_detection_enabled: false,
+            graph91_font_transforms: BTreeMap::new(),
+            graph91_fonts: BTreeMap::new(),
+            graph91_object_transforms: BTreeMap::new(),
+            graph91_multilayer_background:
+                native_graph_sys91::Graph91MultiLayerBackgroundState::default(),
+            graph91_sprite_relations: BTreeMap::new(),
+            graph91_effectors: BTreeMap::new(),
+            graph91_landscapes: BTreeMap::new(),
             queued_system_events: VecDeque::new(),
             dropped_files: VecDeque::new(),
             quit_requested: false,
             graph_animations: GraphAnimationRegistry::default(),
             graph_effects: graph_effect::GraphEffectRegistry::default(),
+            graph_flash_controls: graph_flash::RuntimeFlashRegistry::default(),
             effects: effects::RuntimeEffects::default(),
             layer_animations: LayerAnimationSystem::default(),
             timelines: TimelineSystem::default(),
             user_controls: BTreeMap::new(),
             text_nodes: BTreeMap::new(),
+            bitmap_text_runs: BTreeMap::new(),
+            screen_text_children: BTreeMap::new(),
+            next_screen_text_child: -100_000,
             sound_slots: BTreeMap::new(),
             bgm_slots: BTreeMap::new(),
-            sound_group_volumes: [128; 16],
-            bgm_channel_volumes: [128; 16],
-            sound_channel_volumes: [128; 64],
+            bgm_primary_volumes: [128; 16],
+            bgm_secondary_volumes: [128; 16],
+            bgm_play_volumes: [128; 16],
+            bgm_fade_volumes: [128; 16],
+            sound_primary_volumes: [128; 64],
+            sound_secondary_volumes: [128; 64],
+            sound_play_volumes: [128; 64],
+            sound_fade_volumes: [128; 64],
             bgm_channel_active: [false; 16],
             sound_channel_active: [false; 64],
             bgm_playback_clocks: [NativeAudioClock::default(); 16],
             sound_playback_clocks: [NativeAudioClock::default(); 64],
+            native_cd_audio: NativeCdAudioState::default(),
             audio_requests: VecDeque::new(),
-            current_bgm: None,
             program_cache: HashMap::new(),
             file_exists_cache: HashMap::new(),
             file_size_cache: HashMap::new(),
@@ -397,23 +876,41 @@ impl RuntimeTraceApi {
             scenario_auto_mode: false,
             scenario_skip_mode: false,
             scenario_auto_wait_frames: 0,
+            legacy_scenario_mode_input: std::env::var_os("ETHORNELL_LEGACY_SCENARIO_AUTO_INPUT")
+                .is_some(),
+            scenario_mode_release_pending: false,
             scenario_loaded_scripts: BTreeSet::new(),
             scenario_sprite_sequence: 0,
             scenario_scene_layers: BTreeSet::new(),
             last_scenario_sound: None,
             next_node_handle: 1,
             next_object_handle: 10_000,
-            next_surface_handle: 20_000,
             next_timeline_handle: 30_000,
             mouse_pos: None,
+            cursor_motion: None,
+            pending_cursor_position: None,
             mouse_pressed: false,
             pending_click: None,
             pending_click_age_frames: 0,
             pending_object_state: None,
             pending_input_state: None,
             pending_input_descriptor: None,
-            input_master_gate: 0,
+            input_message_serial: 0,
+            window_messages: VecDeque::new(),
+            input_configuration_enabled: 1,
+            input_master_gate: 1,
             input_latched_state: 0,
+            input_poll_active: false,
+            message_auxiliary_input_mask: 0,
+            registered_keyboard_input_scopes: input_state::NativeInputScopeRegistry::default(),
+            registered_pointer_input_scopes: input_state::NativeInputScopeRegistry::default(),
+            configured_input_classes: input_state::target_default_input_classes(),
+            input_event_counts: BTreeMap::new(),
+            input_descriptor_accumulators: BTreeMap::new(),
+            input_down_descriptors: BTreeSet::new(),
+            input_down_reported: BTreeSet::new(),
+            native_control_input_latches: BTreeMap::new(),
+            native_control_last_poll_ms: BTreeMap::new(),
             pending_input_consumed: false,
             suppress_message_mouse_release: false,
             last_hit_control: 0,
@@ -440,6 +937,9 @@ impl RuntimeTraceApi {
             auto_user_click_id: std::env::var("ETHORNELL_AUTO_USER_CLICK_ID")
                 .ok()
                 .and_then(|value| parse_i32_env(&value)),
+            auto_user_click_stop_payload: std::env::var("ETHORNELL_AUTO_USER_CLICK_STOP_PAYLOAD")
+                .ok()
+                .and_then(|value| parse_i32_env(&value)),
             auto_user_click_done: false,
             auto_user_click_repeat: std::env::var("ETHORNELL_AUTO_USER_CLICK_REPEAT")
                 .ok()
@@ -460,23 +960,34 @@ impl RuntimeTraceApi {
                 .unwrap_or(2),
             auto_user_click_hovered_frames: 0,
             frame_yield_requested: false,
-            pending_graph_procedure_schedule: None,
-            animation_queue_remaining: 0,
+            native_dialog_presentation: false,
             pending_transition_destination: None,
             pending_window_title: None,
+            pending_window_position: None,
             pending_fullscreen: None,
             pending_window_visible: None,
             pending_window_minimize: false,
+            pending_cursor_visible: None,
+            cursor_visible: true,
+            cursor_visibility_latch: true,
+            cursor_idle_visible: true,
+            cursor_idle_timeout_ms: 0,
+            cursor_idle_remaining_ms: 0,
             window_focused: true,
             input_requires_focus: false,
             system_mode_flag: 0,
             system_extension_state: 0,
+            window_monitor_adapter_mode: 0,
             system_config_input_mode: 0,
+            shader_effect_enabled: false,
             native_system: native_system::NativeSystemState::default(),
             native_user: native_user::NativeUserState::default(),
             native_effect: native_effect::NativeEffectState::default(),
+            platform_store: platform::PortablePlatformStore::from_environment(),
             call_coverage_enabled: std::env::var_os("ETHORNELL_CALL_COVERAGE").is_some(),
             call_coverage: BTreeMap::new(),
+            total_native_calls: 0,
+            last_native_call: None,
             runtime_stubbed: false,
         }
     }
@@ -488,11 +999,160 @@ impl RuntimeTraceApi {
         self.graph_image_revisions.insert(key, revision);
     }
 
+    fn store_movie_frame(&mut self, update: graph_effect::MovieFrameUpdate) {
+        let bitmap = update.bitmap;
+        let width = update.image.width;
+        let height = update.image.height;
+        let key = format!("runtime:movie:{bitmap}");
+        self.store_graph_image(key.clone(), update.image);
+        self.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key));
+        self.graph_bindings.remove(&bitmap);
+        self.bitmap_dimensions.insert(bitmap, (width, height));
+        self.bitmap_formats.insert(bitmap, 2);
+        let surface = self
+            .graph_surfaces
+            .entry(bitmap)
+            .or_insert_with(|| RuntimeSurface::bitmap(bitmap, width as f32, height as f32));
+        surface.width = width as f32;
+        surface.height = height as f32;
+        surface.viewport_width = width as f32;
+        surface.viewport_height = height as f32;
+        surface.resource_id = Some(bitmap);
+        self.refresh_bitmap_nodes(bitmap);
+    }
+
+    fn open_runtime_movie(&mut self, archive: &str, resource: &str) -> Option<(i32, i32)> {
+        let bytes = read_runtime_bytes(&self.manager, archive, resource)?;
+        let handle = self.alloc_object();
+        if self.graph_effects.configure_media(
+            handle,
+            archive.to_string(),
+            resource.to_string(),
+            &bytes,
+        ) != 0
+        {
+            return None;
+        }
+        let invocation = self.graph_effects.invoke(handle);
+        if invocation.status != 0 {
+            self.graph_effects.release(handle);
+            return None;
+        }
+        let _ = self
+            .graph_effects
+            .set_volume(handle, self.global_movie_volume);
+        self.graph_process_handles.insert(handle);
+        self.global_movie_handle = Some(handle);
+        Some((handle, invocation.duration_ms))
+    }
+
+    fn create_native_work_bitmap(&mut self, bitmap: i32, priority: Option<i32>) -> bool {
+        if !(0..0x4000).contains(&bitmap)
+            || priority.is_some_and(|priority| !(0..0x1_0000).contains(&priority))
+        {
+            return false;
+        }
+        let (width, height) = snapshot::runtime_frame_size(self);
+        let captured = priority.map(|priority| {
+            snapshot::compose_runtime_frame_through_priority(self, true, Some(priority))
+        });
+        self.clear_bitmap_text(bitmap);
+        self.effects.remove_bitmap(bitmap);
+        self.graph_resources.remove(&bitmap);
+        self.graph_bindings.remove(&bitmap);
+        self.bitmap_dimensions.insert(bitmap, (width, height));
+        self.bitmap_formats.insert(bitmap, 2);
+        self.graph_surfaces.insert(
+            bitmap,
+            RuntimeSurface::bitmap(bitmap, width as f32, height as f32),
+        );
+        if let Some(priority) = priority {
+            self.graph_config.bitmap_priorities.insert(bitmap, priority);
+            let key = format!("runtime:priority-bitmap:{bitmap}");
+            self.store_graph_image(
+                key.clone(),
+                captured.expect("priority capture exists for prioritized bitmap"),
+            );
+            self.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key));
+            if let Some(surface) = self.graph_surfaces.get_mut(&bitmap) {
+                surface.resource_id = Some(bitmap);
+            }
+        } else {
+            self.graph_config.bitmap_priorities.remove(&bitmap);
+        }
+        true
+    }
+
     fn graph_image_revision(&self, key: &str) -> u64 {
         self.graph_image_revisions
             .get(key)
             .copied()
             .unwrap_or_default()
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) {
+        if self.cursor_visible != visible {
+            self.cursor_visible = visible;
+            self.pending_cursor_visible = Some(visible);
+        }
+    }
+
+    fn set_cursor_visibility_latch(&mut self, visible: bool) {
+        if self.cursor_visibility_latch == visible {
+            return;
+        }
+        self.cursor_visibility_latch = visible;
+        if let Some((object, _, _)) = self.native_user.cursor_object {
+            self.set_graph_object_enabled(object, visible);
+        } else {
+            self.set_cursor_visible(visible);
+        }
+    }
+
+    fn query_cursor_visibility_latch(&mut self, platform_suppressed: bool) -> bool {
+        let previous = self.cursor_visibility_latch;
+        if self.native_user.cursor_object.is_none() && previous {
+            // sub_48EE20 returns the old value even when this refresh changes
+            // dword_503E74 for the following call.
+            self.cursor_visibility_latch = !platform_suppressed;
+        }
+        previous
+    }
+
+    fn set_cursor_idle_timeout(&mut self, timeout_ms: i32) {
+        let timeout_ms = u64::try_from(timeout_ms).unwrap_or_default();
+        let was_enabled = self.cursor_idle_timeout_ms != 0;
+        self.cursor_idle_timeout_ms = timeout_ms;
+        self.cursor_idle_remaining_ms = timeout_ms;
+        if !was_enabled && timeout_ms != 0 {
+            self.cursor_idle_visible = true;
+        } else if was_enabled && timeout_ms == 0 && !self.cursor_idle_visible {
+            self.set_cursor_visibility_latch(true);
+        }
+        tracing::debug!(timeout_ms, "SetCursorIdleTimeout");
+    }
+
+    fn note_cursor_activity(&mut self) {
+        if self.cursor_idle_timeout_ms != 0 {
+            self.cursor_idle_remaining_ms = self.cursor_idle_timeout_ms;
+            if !self.cursor_idle_visible {
+                self.cursor_idle_visible = true;
+                self.set_cursor_visibility_latch(true);
+            }
+        }
+    }
+
+    fn advance_cursor_idle(&mut self, elapsed_ms: u64) {
+        if self.cursor_idle_timeout_ms == 0 || self.cursor_idle_remaining_ms == 0 {
+            return;
+        }
+        self.cursor_idle_remaining_ms = self.cursor_idle_remaining_ms.saturating_sub(elapsed_ms);
+        if self.cursor_idle_remaining_ms == 0 && self.cursor_idle_visible {
+            self.cursor_idle_visible = false;
+            self.set_cursor_visibility_latch(false);
+        }
     }
 
     fn is_primary_framebuffer(&self, bitmap: i32) -> bool {
@@ -519,9 +1179,76 @@ impl RuntimeTraceApi {
                 self.is_primary_framebuffer(bitmap)
                     .then(|| snapshot::compose_runtime_frame(self, true))
             })
+            .or_else(|| {
+                let (width, height) =
+                    self.bitmap_dimensions.get(&bitmap).copied().or_else(|| {
+                        self.graph_surfaces.get(&bitmap).map(|surface| {
+                            (
+                                surface.width.max(1.0) as u32,
+                                surface.height.max(1.0) as u32,
+                            )
+                        })
+                    })?;
+                (width > 0 && height > 0).then(|| DecodedImage {
+                    width,
+                    height,
+                    rgba: vec![0; width as usize * height as usize * 4],
+                })
+            })
+    }
+
+    fn convert_bitmap_to_alpha_mask(&mut self, source: i32, destination: i32) -> i32 {
+        let Some(source_format @ (1 | 2)) = self.bitmap_formats.get(&source).copied() else {
+            return 9;
+        };
+        let Some(mut source_image) = self.graph_bitmap_image(source) else {
+            return 9;
+        };
+        if let Some((width, height)) = self.bitmap_dimensions.get(&source).copied() {
+            source_image = fit_decoded_image_canvas(&source_image, width, height);
+        }
+        let mut rgba = Vec::with_capacity(source_image.rgba.len());
+        for pixel in source_image.rgba.chunks_exact(4) {
+            let weighted =
+                77 * u32::from(pixel[0]) + 151 * u32::from(pixel[1]) + 28 * u32::from(pixel[2]);
+            let luma = if source_format == 1 {
+                (weighted >> 8) as u8
+            } else {
+                ((weighted * u32::from(pixel[3])) >> 16) as u8
+            };
+            rgba.extend_from_slice(&[luma, luma, luma, luma]);
+        }
+        let width = source_image.width;
+        let height = source_image.height;
+        let key = format!("runtime:bitmap:{destination}:alpha-mask");
+        self.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width,
+                height,
+                rgba,
+            },
+        );
+        self.graph_resources
+            .insert(destination, RuntimeGraphResource::whole(key));
+        self.graph_bindings.remove(&destination);
+        self.bitmap_dimensions.insert(destination, (width, height));
+        self.bitmap_formats.insert(destination, 3);
+        self.clear_bitmap_text(destination);
+        self.effects.remove_bitmap(destination);
+        let mut surface = RuntimeSurface::bitmap(destination, width as f32, height as f32);
+        surface.resource_id = Some(destination);
+        self.graph_surfaces.insert(destination, surface);
+        trace_graph!(
+            self,
+            "alpha mask source=#{source} format={source_format} destination=#{destination} {width}x{height}"
+        );
+        0
     }
 
     fn record_call(&mut self, group: u8, id: u16) {
+        self.total_native_calls = self.total_native_calls.wrapping_add(1);
+        self.last_native_call = Some(ethornell_vm::NativeOpcode { group, id });
         if !self.call_coverage_enabled {
             return;
         }
@@ -532,10 +1259,18 @@ impl RuntimeTraceApi {
         let Some(path) = std::env::var_os("ETHORNELL_CALL_COVERAGE") else {
             return;
         };
-        let mut out = String::from("group,id,name,count\n");
+        let mut out = String::from("group,id,name,recovery,implementation,count\n");
         for ((group, id), count) in &self.call_coverage {
-            let name = known_call_name(*group, *id).unwrap_or("unknown");
-            out.push_str(&format!("0x{group:02X},0x{id:02X},{name},{count}\n"));
+            let opcode = ethornell_vm::NativeOpcode {
+                group: *group,
+                id: *id,
+            };
+            let name = ethornell_vm::native_display_name(opcode);
+            let recovery = ethornell_vm::recovery_level(opcode);
+            let implementation = ethornell_vm::implementation_level(opcode);
+            out.push_str(&format!(
+                "0x{group:02X},0x{id:02X},{name},{recovery:?},{implementation:?},{count}\n"
+            ));
         }
         if let Err(err) = std::fs::write(&path, out) {
             tracing::warn!(path = ?path, %err, "write call coverage failed");
@@ -558,6 +1293,12 @@ impl RuntimeTraceApi {
             && self.vm_after_yield_blockers().is_empty()
     }
 
+    fn has_active_graph_animation(&self) -> bool {
+        self.layer_animations.active_count() > 0
+            || self.graph_animations.active_count() > 0
+            || self.has_active_native_screen_shake()
+    }
+
     fn vm_after_yield_blockers(&self) -> Vec<&'static str> {
         let mut blockers = Vec::new();
         if self.title_ui_active {
@@ -569,7 +1310,7 @@ impl RuntimeTraceApi {
         if self.has_blocking_user_controls() {
             blockers.push("user_controls");
         }
-        if self.animation_queue_remaining > 0 {
+        if self.has_active_graph_animation() {
             blockers.push("animation");
         }
         blockers
@@ -586,15 +1327,8 @@ impl RuntimeTraceApi {
         })
     }
 
-    fn should_continue_input_yield(&self) -> bool {
-        self.title_ui_active
-            && (self.pending_click.is_some()
-                || self.pending_object_state.is_some()
-                || self.pending_input_state.is_some())
-    }
-
     fn trace_graph(&mut self, message: impl Into<String>) {
-        if !self.debug_graph {
+        if !self.debug_graph && !self.trace_render_tree {
             return;
         }
         let message = message.into();
@@ -643,9 +1377,7 @@ impl RuntimeTraceApi {
         if let Some(exists) = self.file_exists_cache.get(&key).copied() {
             return exists;
         }
-        let exists = find_runtime_file(&self.manager, archive, file)
-            .map(|path| path.exists())
-            .unwrap_or_else(|| find_runtime_resource(&self.manager, archive, file).is_some());
+        let exists = runtime_file_exists_from_root(&self.manager, &self.native_root, archive, file);
         self.file_exists_cache.insert(key, exists);
         exists
     }
@@ -655,7 +1387,7 @@ impl RuntimeTraceApi {
         if let Some(size) = self.file_size_cache.get(&key).copied() {
             return size;
         }
-        let size = find_runtime_file(&self.manager, archive, file)
+        let size = find_runtime_file_from_root(&self.manager, &self.native_root, archive, file)
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|meta| meta.len() as i32)
             .or_else(|| {
@@ -676,8 +1408,19 @@ impl RuntimeTraceApi {
         let key = format!("{archive_name}:{resource_name}");
         if self.graph_images.contains_key(&key) {
             if target_id != 0 {
+                let dimensions = self
+                    .graph_images
+                    .get(&key)
+                    .map(|image| (image.width, image.height))
+                    .unwrap_or_default();
                 self.graph_resources
                     .insert(target_id, RuntimeGraphResource::whole(key.clone()));
+                self.bitmap_dimensions.insert(target_id, dimensions);
+                self.bitmap_formats.insert(target_id, 2);
+                let mut surface =
+                    RuntimeSurface::bitmap(target_id, dimensions.0 as f32, dimensions.1 as f32);
+                surface.resource_id = Some(target_id);
+                self.graph_surfaces.insert(target_id, surface);
             }
             trace_graph!(self, "load image #{target_id} {key} (cached)");
             return true;
@@ -706,6 +1449,13 @@ impl RuntimeTraceApi {
         if target_id != 0 {
             self.graph_resources
                 .insert(target_id, RuntimeGraphResource::whole(key.clone()));
+            self.bitmap_dimensions
+                .insert(target_id, (image.width, image.height));
+            self.bitmap_formats.insert(target_id, 2);
+            let mut surface =
+                RuntimeSurface::bitmap(target_id, image.width as f32, image.height as f32);
+            surface.resource_id = Some(target_id);
+            self.graph_surfaces.insert(target_id, surface);
         }
         self.store_graph_image(key, image);
         true
@@ -796,6 +1546,7 @@ impl RuntimeTraceApi {
                 };
                 self.audio_requests.push_back(AudioCommand::Play {
                     asset,
+                    loop_asset: None,
                     channel,
                     looped,
                     volume: 1.0,
@@ -881,7 +1632,7 @@ impl RuntimeTraceApi {
         let fade_frames = sprite_fade_frames(placement.class, wait_frames);
         let target_opacity =
             opacity.unwrap_or_else(|| sprite_target_opacity(sprite_name, placement.class));
-        let initial_opacity = if fade_frames > 1 { 0.0 } else { target_opacity };
+        let initial_opacity = if fade_frames > 0 { 0.0 } else { target_opacity };
         let viewport_sprite = scene::is_viewport_sprite_class(placement.class);
         let layer_width = if viewport_sprite {
             1280.0_f32.min(width)
@@ -909,6 +1660,8 @@ impl RuntimeTraceApi {
                 _ => (720.0 - height).max(0.0) * 0.5,
             })
         };
+        self.display_tree
+            .register(placement.layer_id, NativeDisplayKind::Sprite);
         self.graph_layers.insert(
             placement.layer_id,
             RuntimeGraphLayer {
@@ -934,7 +1687,7 @@ impl RuntimeTraceApi {
                 clip: None,
             },
         );
-        if fade_frames > 1 {
+        if fade_frames > 0 {
             self.layer_animations
                 .fade_to(placement.layer_id, 0.0, target_opacity, fade_frames);
         }
@@ -971,6 +1724,9 @@ impl RuntimeTraceApi {
     fn clear_transition_cover_layers(&mut self) {
         for layer_id in [SCENARIO_OVERLAY_LAYER_ID, scene::FADE_PLATE_LAYER_ID] {
             if self.graph_layers.remove(&layer_id).is_some() {
+                self.display_tree.remove(layer_id);
+                self.graph_node_sources.remove(&layer_id);
+                self.graph_node_masks.remove(&layer_id);
                 self.layer_animations.clear_layer(layer_id);
                 self.scenario_scene_layers.remove(&layer_id);
                 trace_graph!(self, "BCS playback clear transition cover layer={layer_id}");
@@ -1055,19 +1811,49 @@ impl RuntimeTraceApi {
     fn alloc_node(&mut self) -> i32 {
         let handle = self.next_node_handle;
         self.next_node_handle += 1;
+        self.display_tree
+            .register(handle, NativeDisplayKind::Sprite);
         handle
     }
 
     fn alloc_object(&mut self) -> i32 {
         let handle = self.next_object_handle;
         self.next_object_handle += 1;
+        self.display_tree
+            .register(handle, NativeDisplayKind::Generic);
         handle
     }
 
-    fn alloc_surface(&mut self) -> i32 {
-        let handle = self.next_surface_handle;
-        self.next_surface_handle += 1;
-        handle
+    fn alloc_window_surface(&mut self, width: i32, height: i32) -> Option<i32> {
+        const WINDOW_TAG: u32 = 0xB000_0000;
+        const WINDOW_SLOTS: u32 = 16;
+        for slot in 0..WINDOW_SLOTS {
+            let handle = (WINDOW_TAG | slot) as i32;
+            if self.graph_surfaces.contains_key(&handle) || self.graph_handle_exists(handle) {
+                continue;
+            }
+            self.display_tree
+                .register(handle, NativeDisplayKind::Window);
+            self.graph90_initialize_native_constructor_sort(handle, NativeDisplayKind::Window);
+            self.graph_surfaces.insert(
+                handle,
+                RuntimeSurface::display(handle, width as f32, height as f32),
+            );
+            return Some(handle);
+        }
+        None
+    }
+
+    fn is_window_surface_handle(handle: i32) -> bool {
+        (handle as u32).wrapping_sub(0xB000_0000) < 16
+    }
+
+    fn register_display_layer(&mut self, layer: i32, owner: Option<i32>) {
+        self.display_tree.register(layer, NativeDisplayKind::Sprite);
+        if let Some(owner) = owner {
+            self.display_tree.register_inferred(owner);
+            let _ = self.display_tree.set_parent(layer, owner);
+        }
     }
 
     fn alloc_timeline(&mut self) -> i32 {
@@ -1077,14 +1863,22 @@ impl RuntimeTraceApi {
     }
 
     fn set_current_graph_object(&mut self, object: i32) {
-        if object > 0 {
+        // Native display handles are unsigned tagged values and therefore may
+        // be negative when carried through the BP VM as i32. Handle zero is
+        // the real root background object; only -1 is the conventional invalid
+        // sentinel in this layer.
+        if object != -1 {
+            self.display_tree.register_inferred(object);
             self.current_graph_object = Some(object);
             self.graph_object_enabled.entry(object).or_insert(true);
+            self.graph_object_draw_enabled.entry(object).or_insert(true);
             self.graph_object_properties.entry(object).or_default();
             self.graph_object_layers.entry(object).or_default();
         }
     }
 
+    /// Legacy compatibility heuristic. This is not target-engine behavior and
+    /// is disabled unless `ETHORNELL_LEGACY_LAYER_ADOPTION` is set.
     fn adopt_previous_graph_object_layers(&mut self, object: i32) -> Option<usize> {
         let is_empty = self
             .graph_object_layers
@@ -1129,23 +1923,237 @@ impl RuntimeTraceApi {
     }
 
     fn object_enabled_for_layer(&self, owner_object: Option<i32>) -> bool {
-        owner_object
-            .and_then(|object| self.graph_object_enabled.get(&object).copied())
-            .unwrap_or(true)
+        let Some(mut object) = owner_object else {
+            return true;
+        };
+        let native_member_leaf = self.graph_native_owners.contains_key(&object);
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(object) {
+                return false;
+            }
+            if !self
+                .graph_object_enabled
+                .get(&object)
+                .copied()
+                .unwrap_or(true)
+                || !self
+                    .graph_object_draw_enabled
+                    .get(&object)
+                    .copied()
+                    .unwrap_or(true)
+                || self
+                    .graph_object_properties
+                    .get(&object)
+                    .is_some_and(|properties| properties.native.suppress_draw != 0)
+            {
+                return false;
+            }
+
+            // A native CDspObj member is not a renderer-time scene-graph
+            // child. Position, draw-enable, transparency and vector-bank
+            // changes are eagerly copied/materialized by the native setters.
+            // Re-walking its member owner here would apply a second hierarchy
+            // gate that the target display chain does not have.
+            if native_member_leaf {
+                return true;
+            }
+
+            if !self.display_tree.chain_drawable(object) {
+                return false;
+            }
+            let parent = self
+                .display_tree
+                .parent(object)
+                .or_else(|| self.graph_links.parent(object));
+            let Some(parent) = parent else {
+                return true;
+            };
+            object = parent;
+        }
+    }
+
+    pub(crate) fn object_chain_opacity(&self, owner_object: Option<i32>) -> f32 {
+        let Some(object) = owner_object else {
+            return 1.0;
+        };
+        // Native CDspObj setters copy alpha state into every current child.
+        // Rendering therefore samples the leaf object's field; multiplying
+        // ancestor fields here would apply the same transition more than once.
+        self.graph_object_properties
+            .get(&object)
+            .map(RuntimeGraphObjectProperties::opacity)
+            .unwrap_or(1.0)
+    }
+
+    pub(crate) fn display_order_serial(&self, handle: i32, owner: Option<i32>) -> u64 {
+        self.display_tree
+            .chain_position(handle)
+            .or_else(|| owner.and_then(|owner| self.display_tree.chain_position(owner)))
+            .or_else(|| self.display_tree.creation_serial(handle))
+            .or_else(|| owner.and_then(|owner| self.display_tree.creation_serial(owner)))
+            // Legacy handles were allocated monotonically. Preserve that as a
+            // deterministic fallback without confusing a resource id with the
+            // native CObjectManager insertion chain.
+            .unwrap_or_else(|| u64::from(handle as u32))
+    }
+
+    pub(crate) fn surface_world_position(&self, surface: i32) -> (f32, f32) {
+        let mut chain = Vec::new();
+        let mut current = Some(surface);
+        let mut visited = BTreeSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                break;
+            }
+            let Some(record) = self.graph_surfaces.get(&id) else {
+                break;
+            };
+            chain.push((
+                record.parent_surface,
+                record.local_x,
+                record.local_y,
+                record.x,
+                record.y,
+            ));
+            current = record.parent_surface;
+        }
+        let mut x = 0.0;
+        let mut y = 0.0;
+        for (parent, local_x, local_y, absolute_x, absolute_y) in chain.into_iter().rev() {
+            if parent.is_some() {
+                x += local_x;
+                y += local_y;
+            } else {
+                x += absolute_x;
+                y += absolute_y;
+            }
+        }
+        (x, y)
+    }
+
+    fn surface_chain_clip(&self, surface: i32) -> Option<RuntimeClipRect> {
+        let mut current = Some(surface);
+        let mut visited = BTreeSet::new();
+        let mut clip: Option<RuntimeClipRect> = None;
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                return Some(RuntimeClipRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                });
+            }
+            let Some(record) = self.graph_surfaces.get(&id) else {
+                break;
+            };
+            let (x, y) = self.surface_world_position(id);
+            let width = if record.viewport_width > 0.0 {
+                record.viewport_width
+            } else {
+                record.width
+            };
+            let height = if record.viewport_height > 0.0 {
+                record.viewport_height
+            } else {
+                record.height
+            };
+            let bounds = RuntimeClipRect {
+                x,
+                y,
+                width: width.max(0.0),
+                height: height.max(0.0),
+            };
+            clip = Some(match clip {
+                Some(existing) => existing.intersection(bounds),
+                None => bounds,
+            });
+            current = record.parent_surface;
+        }
+        clip
+    }
+
+    fn layer_display_clip(&self, layer: &RuntimeGraphLayer) -> Option<RuntimeClipRect> {
+        let surface_clip = layer
+            .target_surface
+            .and_then(|surface| self.surface_chain_clip(surface));
+        match (layer.clip, surface_clip) {
+            (Some(layer_clip), Some(surface_clip)) => Some(layer_clip.intersection(surface_clip)),
+            (Some(layer_clip), None) => Some(layer_clip),
+            (None, Some(surface_clip)) => Some(surface_clip),
+            (None, None) => None,
+        }
+    }
+
+    fn graph_object_global_display_offset(&self, object: i32) -> (f32, f32) {
+        self.graph_object_properties
+            .get(&object)
+            .filter(|properties| properties.native.global_display_offset_enabled != 0)
+            .map(|_| self.graph_global_offset)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn layer_world_transform(
+        &self,
+        layer_id: i32,
+        layer: &RuntimeGraphLayer,
+    ) -> (f32, f32, i32) {
+        let transform_handle = layer.owner_object.unwrap_or(layer_id);
+        // Graph91 attach, group and knob owners materialize their children's
+        // renderer-facing position as an absolute coordinate. The display-tree
+        // relation still carries target-local offsets for propagation and
+        // visibility, but applying that owner again here double-translates the
+        // layer.
+        let has_materialized_owner = self.graph_native_owners.contains_key(&transform_handle);
+        let (surface_x, surface_y) = if has_materialized_owner {
+            (0.0, 0.0)
+        } else {
+            layer
+                .target_surface
+                .map(|surface| self.surface_world_position(surface))
+                .unwrap_or_default()
+        };
+        let (ancestor_x, ancestor_y, _ancestor_z) = if has_materialized_owner {
+            (0.0, 0.0, 0)
+        } else {
+            self.display_tree.ancestor_transform(transform_handle)
+        };
+        let (global_x, global_y) = self.graph_object_global_display_offset(transform_handle);
+        let base_depth = layer.z.saturating_add(layer.transform_z);
+        let depth = if has_materialized_owner {
+            // Native member setters already materialize the child's resolved
+            // state. Adding the member parent's z here would introduce a
+            // scene-graph transform that the target does not perform.
+            base_depth
+        } else {
+            self.display_tree.effective_depth(transform_handle, base_depth)
+        };
+        (
+            surface_x
+                + layer.x
+                + layer.transform_x
+                + ancestor_x
+                + global_x
+                + self.screen_shake_offset.0,
+            surface_y
+                + layer.y
+                + layer.transform_y
+                + ancestor_y
+                + global_y
+                + self.screen_shake_offset.1,
+            depth,
+        )
     }
 
     fn set_graph_object_enabled(&mut self, object: i32, enabled: bool) {
+        self.display_tree.set_enabled(object, enabled);
         self.graph_object_enabled.insert(object, enabled);
-        let layer_ids = self
-            .graph_object_layers
-            .get(&object)
-            .cloned()
-            .unwrap_or_default();
-        for layer_id in layer_ids {
-            if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                layer.enabled = enabled && !is_default_hidden_object_state(&layer.key);
-            }
-        }
+        self.graph_object_properties
+            .entry(object)
+            .or_default()
+            .native
+            .enabled = if enabled { 1 } else { 0 };
         trace_graph!(
             self,
             "object #{object} enabled={enabled} layers={}",
@@ -1156,10 +2164,98 @@ impl RuntimeTraceApi {
         );
     }
 
+    fn set_graph_object_draw_enabled(&mut self, object: i32, enabled: bool) {
+        if object == -1 {
+            return;
+        }
+        self.display_tree.register_inferred(object);
+        self.graph_object_draw_enabled.insert(object, enabled);
+        self.graph_object_properties
+            .entry(object)
+            .or_default()
+            .native
+            .draw_enabled = if enabled { 1 } else { 0 };
+        trace_graph!(
+            self,
+            "object #{object} draw_enabled={enabled} layers={}",
+            self.graph_object_layers
+                .get(&object)
+                .map(BTreeSet::len)
+                .unwrap_or_default()
+        );
+    }
+
+    fn graph_object_pointer_hit(&self, object: i32) -> Option<i32> {
+        let (mouse_x, mouse_y) = self.mouse_pos?;
+        let layers = self.graph_object_layers.get(&object)?;
+        for layer_id in layers.iter().rev() {
+            let layer = self.graph_layers.get(layer_id)?;
+            if !layer.enabled {
+                continue;
+            }
+            let (x, y, _) = self.layer_world_transform(*layer_id, layer);
+            let width = layer.width.max(0.0) * layer.scale_x.abs().max(f32::EPSILON);
+            let height = layer.height.max(0.0) * layer.scale_y.abs().max(f32::EPSILON);
+            if mouse_x >= x && mouse_y >= y && mouse_x < x + width && mouse_y < y + height {
+                // Target CDspObj::HitTest returns a nonzero bit value when a
+                // generated hit mask accepts the local coordinate. The
+                // portable renderer currently has rectangle-level evidence,
+                // so preserve the same truthy contract and use the layer hit id
+                // when one was assigned.
+                return Some(if layer.hit_id != 0 { layer.hit_id } else { 1 });
+            }
+        }
+        Some(0)
+    }
+
+    /// Commit/re-evaluate an existing portable graph object without destroying it.
+    /// This helper is host-side infrastructure and is not selector 0x90:0x61;
+    /// target evidence closes 0x90:0x61 as CDspObjFilter release.
+    fn update_graph_object(&mut self, object: i32) -> bool {
+        if object == -1 {
+            return false;
+        }
+        let exists = self.display_tree.contains(object)
+            || self.graph_object_enabled.contains_key(&object)
+            || self.graph_object_properties.contains_key(&object)
+            || self.graph_object_layers.contains_key(&object)
+            || self.graph_surfaces.contains_key(&object)
+            || self.graph_layers.contains_key(&object)
+            || self.text_nodes.contains_key(&object);
+        if !exists {
+            return false;
+        }
+
+        self.display_tree.register_inferred(object);
+        self.graph_object_properties.entry(object).or_default();
+        let enabled = self
+            .graph_object_enabled
+            .get(&object)
+            .copied()
+            .unwrap_or(true);
+        self.display_tree.set_enabled(object, enabled);
+
+        // Rebuild only structural relations already represented by runtime
+        // objects. This mirrors a target update/commit boundary; it does not
+        // invent new parentage or transfer layers between objects.
+        self.sync_display_tree_from_runtime();
+        true
+    }
+
     fn remove_graph_object(&mut self, object: i32) -> bool {
+        self.layer_animations.clear_object(object);
+        self.graph_links.unlink(object);
+        self.display_tree.remove(object);
         let mut removed = self.graph_object_enabled.remove(&object).is_some();
+        removed |= self.graph_object_draw_enabled.remove(&object).is_some();
+        removed |= self.graph91_object_transforms.remove(&object).is_some();
+        removed |= self.graph91_effectors.remove(&object).is_some();
+        removed |= self.graph91_landscapes.remove(&object).is_some();
+        self.graph91_sprite_relations
+            .retain(|sprite, linked| *sprite != object && *linked != object);
         removed |= self.graph_input_objects.remove(&object).is_some();
         removed |= self.graph_object_properties.remove(&object).is_some();
+        removed |= self.graph_object_input_tables.remove(&object).is_some();
         self.user_controls
             .retain(|_, control| control.title_only || control.owner_id != object);
         if self.current_graph_object == Some(object) {
@@ -1167,7 +2263,11 @@ impl RuntimeTraceApi {
         }
         if let Some(layer_ids) = self.graph_object_layers.remove(&object) {
             removed = true;
+            self.layer_animations.clear_layers(layer_ids.iter());
             for layer_id in layer_ids {
+                self.display_tree.remove(layer_id);
+                self.graph_node_sources.remove(&layer_id);
+                self.graph_node_masks.remove(&layer_id);
                 if self
                     .graph_layers
                     .get(&layer_id)
@@ -1233,7 +2333,7 @@ impl RuntimeTraceApi {
             );
             return;
         }
-        let layer_id = if target > 0 { target } else { resource_id };
+        let layer_id = if target != -1 { target } else { resource_id };
         let owner_object = self.current_graph_object;
         if let Some(object) = owner_object {
             self.graph_object_layers
@@ -1241,7 +2341,12 @@ impl RuntimeTraceApi {
                 .or_default()
                 .insert(layer_id);
         }
-        let enabled = self.object_enabled_for_layer(owner_object);
+        self.display_tree
+            .register(layer_id, NativeDisplayKind::Sprite);
+        if let Some(owner) = owner_object {
+            self.display_tree.register_inferred(owner);
+            let _ = self.display_tree.set_parent(layer_id, owner);
+        }
         self.graph_layers.insert(
             layer_id,
             RuntimeGraphLayer {
@@ -1257,7 +2362,7 @@ impl RuntimeTraceApi {
                 src_y: y.max(0.0),
                 opacity: 1.0,
                 z: layer_id,
-                enabled,
+                enabled: true,
                 transform_x: 0.0,
                 transform_y: 0.0,
                 transform_z: 0,
@@ -1292,22 +2397,319 @@ impl RuntimeTraceApi {
         );
     }
 
-    fn apply_graph_scroll_position(&mut self, handle: i32) {
-        let Some(state) = self.graph_scroll_states.get(&handle).copied() else {
-            return;
-        };
-        let dimensions = self
-            .graph_layers
-            .get(&state.target)
-            .map(|layer| (layer.width, layer.height))
+    fn alloc_graph_knob_handle(&self) -> Option<i32> {
+        (0..32)
+            .map(|slot| (0xF000_0000u32 | slot) as i32)
+            .find(|handle| !self.graph_knob_states.contains_key(handle))
+    }
+
+    fn alloc_graph_group_handle(&self) -> Option<i32> {
+        (0..8)
+            .map(|slot| (0xF100_0000u32 | slot) as i32)
+            .find(|handle| !self.graph_groups.contains_key(handle))
+    }
+
+    /// Renderer-facing raster top-left. This is intentionally distinct from
+    /// CDspObj::GetCompositePosition: projected sprites (mode 2/5/6) can have
+    /// a raster origin hundreds of pixels away from their ordinary object
+    /// coordinate. Native group/member attachment must never use this value.
+    fn graph_object_position(&self, object: i32) -> (f32, f32) {
+        self.graph_layers
+            .get(&object)
+            .map(|layer| (layer.x, layer.y))
             .or_else(|| {
                 self.graph_object_layers
-                    .get(&state.target)
+                    .get(&object)
                     .and_then(|layers| layers.iter().next())
                     .and_then(|layer| self.graph_layers.get(layer))
-                    .map(|layer| (layer.width, layer.height))
+                    .map(|layer| (layer.x, layer.y))
             })
-            .unwrap_or_default();
+            .or_else(|| {
+                self.graph_surfaces
+                    .get(&object)
+                    .map(|surface| (surface.x, surface.y))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Raw ordinary CDspObj position returned by vtable+0x30 / sub_41B240.
+    /// Native member attachment uses this pair, not the composite getter.
+    fn graph_native_base_position(&self, object: i32) -> Option<(i32, i32)> {
+        self.graph_object_properties
+            .get(&object)
+            .map(|properties| {
+                (
+                    properties.native.position_x,
+                    properties.native.position_y,
+                )
+            })
+            .or_else(|| {
+                self.graph_surfaces
+                    .get(&object)
+                    .map(|surface| (surface.x.round() as i32, surface.y.round() as i32))
+            })
+    }
+
+    /// Portable equivalent of target `CDspObj::GetCompositePosition`
+    /// (`sub_41B260`). The target adds ordinary position plus both propagated
+    /// integer offset banks, then conditionally adds Graph91:06's global
+    /// display offset only when CDspObj+0x48 (property selector 196) is nonzero.
+    /// It does not inspect renderer raster bounds or traverse parents;
+    /// parent/member state is eagerly materialized by the setters.
+    fn graph_native_composite_position(&self, object: i32) -> Option<(i32, i32)> {
+        if let Some(properties) = self.graph_object_properties.get(&object) {
+            let native = &properties.native;
+            let mut x = native
+                .position_x
+                .wrapping_add(native.primary_offset_x)
+                .wrapping_add(native.secondary_offset_x);
+            let mut y = native
+                .position_y
+                .wrapping_add(native.primary_offset_y)
+                .wrapping_add(native.secondary_offset_y);
+            if native.global_display_offset_enabled != 0 {
+                x = x.wrapping_add(self.graph_global_offset.0.round() as i32);
+                y = y.wrapping_add(self.graph_global_offset.1.round() as i32);
+            }
+            return Some((x, y));
+        }
+        self.graph_surfaces
+            .get(&object)
+            .map(|surface| (surface.x.round() as i32, surface.y.round() as i32))
+    }
+
+    /// Children represented by the native CDspObj member list (+0x12C). The
+    /// knob compatibility owner is deliberately excluded: a knob controls its
+    /// target but is not a CDspObj member parent whose transform/alpha setters
+    /// recurse into the target.
+    fn graph_native_member_children(&self, parent: i32) -> Vec<i32> {
+        self.graph_native_owners
+            .iter()
+            .filter_map(|(&child, &owner)| {
+                (owner == parent
+                    && self.graph_knob_target_owners.get(&child) != Some(&owner))
+                    .then_some(child)
+            })
+            .collect()
+    }
+
+    fn graph_native_descendants_inclusive(&self, root: i32) -> Vec<i32> {
+        let mut result = Vec::new();
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(object) = pending.pop() {
+            if !visited.insert(object) {
+                continue;
+            }
+            result.push(object);
+            let children = self.graph_native_member_children(object);
+            pending.extend(children.into_iter().rev());
+        }
+        result
+    }
+
+    fn set_graph_object_position(&mut self, object: i32, x: f32, y: f32) -> bool {
+        // Sprite modes 2 and 5 store raster-origin offsets at
+        // CDspObjSprite+0x2DC/+0x2E0. sub_4281E0 subtracts those offsets from
+        // the object's ordinary composite position. A later vtable+0x28
+        // position motion must therefore move the object anchor without
+        // discarding the affine/projected raster origin.
+        let raster_origin_offset = self
+            .graph_object_properties
+            .get(&object)
+            .and_then(|properties| {
+                let mode = properties.named_properties.get("target-object-mode").copied()?;
+                let prefix = match mode {
+                    2 => "mode2-origin-offset",
+                    5 => "mode5-origin-offset",
+                    _ => return None,
+                };
+                Some((
+                    *properties
+                        .named_properties
+                        .get(&format!("{prefix}-x"))
+                        .unwrap_or(&0) as f32,
+                    *properties
+                        .named_properties
+                        .get(&format!("{prefix}-y"))
+                        .unwrap_or(&0) as f32,
+                ))
+            });
+        let materialized_x = x - raster_origin_offset.map_or(0.0, |offset| offset.0);
+        let materialized_y = y - raster_origin_offset.map_or(0.0, |offset| offset.1);
+        let mut moved = false;
+        let knob_changed = if let Some(knob) = self.graph_knob_states.get_mut(&object) {
+            knob.base_x = x;
+            knob.base_y = y;
+            true
+        } else {
+            false
+        };
+        if knob_changed {
+            self.apply_graph_knob_position(object);
+            moved = true;
+        } else {
+            if let Some(layer) = self.graph_layers.get_mut(&object) {
+                layer.x = materialized_x;
+                layer.y = materialized_y;
+                moved = true;
+            }
+            if let Some(layers) = self.graph_object_layers.get(&object).cloned() {
+                for layer_id in layers {
+                    if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
+                        layer.x = materialized_x;
+                        layer.y = materialized_y;
+                        moved = true;
+                    }
+                }
+            }
+            if self.set_graph_surface_position(object, x, y) {
+                moved = true;
+            }
+        }
+        let resolved_x = x.round() as i32;
+        let resolved_y = y.round() as i32;
+        let properties = self.graph_object_properties.entry(object).or_default();
+        properties.native.position_x = resolved_x;
+        properties.native.position_y = resolved_y;
+        // RuntimeGraphGroup is only a portable mirror. The target has one
+        // CDspObj position field, so motion through Graph90:23/28 must update
+        // the position later observed by sub_41AB40 when another member is
+        // attached. Leaving this mirror stale at the last Graph90:E5 value
+        // places late-added UI members at their pre-animation coordinates.
+        if let Some(group) = self.graph_groups.get_mut(&object) {
+            group.x = resolved_x;
+            group.y = resolved_y;
+        }
+        self.display_tree.set_local_position(object, x, y);
+        moved
+    }
+
+    fn store_runtime_bitmap(&mut self, bitmap: i32, image: DecodedImage, format: i32) {
+        let width = image.width;
+        let height = image.height;
+        let key = format!("runtime:bitmap:{bitmap}");
+        self.store_graph_image(key.clone(), image);
+        self.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key));
+        self.graph_bindings.remove(&bitmap);
+        self.bitmap_dimensions.insert(bitmap, (width, height));
+        self.bitmap_formats.insert(bitmap, format);
+        let mut surface = RuntimeSurface::bitmap(bitmap, width as f32, height as f32);
+        surface.resource_id = Some(bitmap);
+        self.graph_surfaces.insert(bitmap, surface);
+        self.refresh_bitmap_nodes(bitmap);
+    }
+
+    fn flip_graph_bitmap(&mut self, destination: i32, source: i32, direction: i32) -> bool {
+        let Some(source_image) = self.graph_bitmap_image(source) else {
+            return false;
+        };
+        if !matches!(direction, 0 | 1) {
+            return false;
+        }
+        let mut output = source_image.clone();
+        let width = source_image.width as usize;
+        let height = source_image.height as usize;
+        for y in 0..height {
+            for x in 0..width {
+                let source_x = if direction == 0 { width - 1 - x } else { x };
+                let source_y = if direction == 1 { height - 1 - y } else { y };
+                let src = (source_y * width + source_x) * 4;
+                let dst = (y * width + x) * 4;
+                output.rgba[dst..dst + 4].copy_from_slice(&source_image.rgba[src..src + 4]);
+            }
+        }
+        let format = self.bitmap_formats.get(&source).copied().unwrap_or(2);
+        self.store_runtime_bitmap(destination, output, format);
+        true
+    }
+
+    fn downsample_graph_bitmap_half(&mut self, destination: i32, source: i32) -> bool {
+        let Some(source_image) = self.graph_bitmap_image(source) else {
+            return false;
+        };
+        if source_image.width < 2 || source_image.height < 2 {
+            return false;
+        }
+        let width = (source_image.width + 1) >> 1;
+        let height = (source_image.height + 1) >> 1;
+        let mut output = DecodedImage {
+            width,
+            height,
+            rgba: vec![0; width as usize * height as usize * 4],
+        };
+        for y in 0..height {
+            for x in 0..width {
+                let mut sums = [0u32; 4];
+                let mut count = 0u32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let sx = x * 2 + dx;
+                        let sy = y * 2 + dy;
+                        if sx >= source_image.width || sy >= source_image.height {
+                            continue;
+                        }
+                        let offset = (sy as usize * source_image.width as usize + sx as usize) * 4;
+                        for channel in 0..4 {
+                            sums[channel] += u32::from(source_image.rgba[offset + channel]);
+                        }
+                        count += 1;
+                    }
+                }
+                let destination_offset = (y as usize * width as usize + x as usize) * 4;
+                for channel in 0..4 {
+                    output.rgba[destination_offset + channel] =
+                        ((sums[channel] + count / 2) / count) as u8;
+                }
+            }
+        }
+        let format = self.bitmap_formats.get(&source).copied().unwrap_or(2);
+        self.store_runtime_bitmap(destination, output, format);
+        true
+    }
+
+    fn aspect_fit_graph_bitmap(&mut self, destination: i32, source: i32) -> bool {
+        let Some(source_image) = self.graph_bitmap_image(source) else {
+            return false;
+        };
+        let Some((destination_width, destination_height)) =
+            self.bitmap_dimensions.get(&destination).copied()
+        else {
+            return false;
+        };
+        if destination_width == 0
+            || destination_height == 0
+            || source_image.width == 0
+            || source_image.height == 0
+        {
+            return false;
+        }
+        let scale_x = ((u64::from(destination_width) << 16) / u64::from(source_image.width)) as i32;
+        let scale_y =
+            ((u64::from(destination_height) << 16) / u64::from(source_image.height)) as i32;
+        let scale = scale_x.min(scale_y).max(1);
+        let Some(scaled) = scale_decoded_image_fixed(&source_image, scale, scale) else {
+            return false;
+        };
+        let mut output = DecodedImage {
+            width: destination_width,
+            height: destination_height,
+            rgba: vec![0; destination_width as usize * destination_height as usize * 4],
+        };
+        let x = (destination_width as i32 - scaled.width as i32) / 2;
+        let y = (destination_height as i32 - scaled.height as i32) / 2;
+        blit_decoded_image(&mut output, &scaled, x, y, 128);
+        let format = self.bitmap_formats.get(&destination).copied().unwrap_or(2);
+        self.store_runtime_bitmap(destination, output, format);
+        true
+    }
+
+    fn apply_graph_knob_position(&mut self, handle: i32) {
+        let Some(state) = self.graph_knob_states.get(&handle).copied() else {
+            return;
+        };
+        let dimensions = self.graph_knob_target_dimensions(state.target);
         let (x, y) = state.display_position(dimensions.0, dimensions.1);
         let mut moved = 0usize;
         if let Some(layer) = self.graph_layers.get_mut(&state.target) {
@@ -1323,17 +2725,47 @@ impl RuntimeTraceApi {
                 }
             }
         }
+        let (max_x, max_y) = state.logical_limits(dimensions.0, dimensions.1);
         trace_graph!(
             self,
-            "scroll #{handle} target=#{} logical=({}, {}) display=({x:.0}, {y:.0}) bounds={}x{} extent={}x{} moved={moved}",
+            "scroll #{handle} target=#{} logical=({}, {}) limits=({max_x}, {max_y}) display=({x:.0}, {y:.0}) target={}x{} bounds={}x{} extent={}x{} moved={moved}",
             state.target,
             state.x,
             state.y,
+            dimensions.0,
+            dimensions.1,
             state.bounds_width,
             state.bounds_height,
             state.extent_x,
             state.extent_y
         );
+    }
+
+    fn graph_knob_target_dimensions(&self, target: i32) -> (f32, f32) {
+        self.graph_layers
+            .get(&target)
+            .map(|layer| (layer.width, layer.height))
+            .or_else(|| {
+                self.graph_object_layers
+                    .get(&target)
+                    .and_then(|layers| layers.iter().next())
+                    .and_then(|layer| self.graph_layers.get(layer))
+                    .map(|layer| (layer.width, layer.height))
+            })
+            .or_else(|| {
+                let resource = self
+                    .graph_object_properties
+                    .get(&target)
+                    .and_then(|properties| properties.format_resource)?;
+                self.resource_image_region(resource)
+                    .map(|(_, region)| (region.width, region.height))
+                    .or_else(|| {
+                        self.bitmap_dimensions
+                            .get(&resource)
+                            .map(|&(width, height)| (width as f32, height as f32))
+                    })
+            })
+            .unwrap_or((1.0, 1.0))
     }
 
     fn apply_graph_layer_property(&mut self, args: &[ethornell_vm::Value]) {
@@ -1373,6 +2805,65 @@ impl RuntimeTraceApi {
         );
     }
 
+    fn set_graph_node_mask(&mut self, node: i32, bitmap: i32) {
+        // funcs_505300[0x55] -> sub_47C230 -> sub_462520 ->
+        // sub_43ED20/sub_427F80 stores the bitmap in CDspObj fields
+        // 78..80. The draw path consumes it as a type-2/3 alpha mask.
+        if bitmap == -1 {
+            self.graph_node_masks.remove(&node);
+            self.refresh_graph_node_mask(node);
+            trace_graph!(self, "node #{node} detached bitmap mask");
+            return;
+        }
+        self.graph_node_masks.insert(node, bitmap);
+        self.refresh_graph_node_mask(node);
+        trace_graph!(self, "node #{node} bitmap mask=#{bitmap}");
+    }
+
+    fn record_graph_node_source(&mut self, node: i32, key: String, region: RuntimeClipRect) {
+        self.graph_node_sources.insert(node, (key, region));
+        self.refresh_graph_node_mask(node);
+    }
+
+    fn refresh_graph_node_mask(&mut self, node: i32) {
+        let Some((source_key, source_region)) = self.graph_node_sources.get(&node).cloned() else {
+            return;
+        };
+        let Some(mask_bitmap) = self.graph_node_masks.get(&node).copied() else {
+            if let Some(layer) = self.graph_layers.get_mut(&node) {
+                layer.key = source_key;
+                layer.src_x = source_region.x;
+                layer.src_y = source_region.y;
+                layer.width = source_region.width;
+                layer.height = source_region.height;
+            }
+            return;
+        };
+        let source = self
+            .graph_images
+            .get(&source_key)
+            .map(|image| crop_decoded_image(image, source_region));
+        let mask = self.graph_bitmap_image(mask_bitmap);
+        let Some(masked) = source
+            .as_ref()
+            .zip(mask.as_ref())
+            .and_then(|(source, mask)| apply_alpha_mask(source, mask))
+        else {
+            return;
+        };
+        let width = masked.width as f32;
+        let height = masked.height as f32;
+        let key = format!("runtime:masked-node:{node}");
+        self.store_graph_image(key.clone(), masked);
+        if let Some(layer) = self.graph_layers.get_mut(&node) {
+            layer.key = key;
+            layer.src_x = 0.0;
+            layer.src_y = 0.0;
+            layer.width = width;
+            layer.height = height;
+        }
+    }
+
     fn apply_graph_object_position(&mut self, args: &[ethornell_vm::Value]) {
         let popped = args.iter().map(value_to_i32).collect::<Vec<_>>();
         if popped.len() < 3 {
@@ -1381,6 +2872,7 @@ impl RuntimeTraceApi {
         let y = popped[0] as f32;
         let x = popped[1] as f32;
         let target = popped[2];
+        self.display_tree.set_local_position(target, x, y);
         let mut changed = 0usize;
         if let Some(layer_ids) = self.graph_object_layers.get(&target).cloned() {
             for layer_id in layer_ids {
@@ -1420,6 +2912,12 @@ impl RuntimeTraceApi {
         if let Some((parent_x, parent_y)) = parent_origin {
             surface.local_x = x - parent_x;
             surface.local_y = y - parent_y;
+            self.display_tree
+                .set_local_position(target, surface.local_x, surface.local_y);
+        } else {
+            surface.local_x = x;
+            surface.local_y = y;
+            self.display_tree.set_local_position(target, x, y);
         }
         self.propagate_graph_surface_children(target);
         true
@@ -1438,6 +2936,10 @@ impl RuntimeTraceApi {
             .get_mut(&child)
             .filter(|surface| surface.display_attached)
         {
+            self.display_tree.register_inferred(parent);
+            self.display_tree.register(child, NativeDisplayKind::Window);
+            let _ = self.display_tree.set_parent(child, parent);
+            self.display_tree.set_local_position(child, x, y);
             surface.parent_surface = Some(parent);
             surface.local_x = x;
             surface.local_y = y;
@@ -1447,6 +2949,9 @@ impl RuntimeTraceApi {
             return true;
         }
         if let Some(layer) = self.graph_layers.get_mut(&child) {
+            self.display_tree.register_inferred(parent);
+            self.display_tree.register_inferred(child);
+            let _ = self.display_tree.set_parent(child, parent);
             layer.target_surface = Some(parent);
             layer.x = x;
             layer.y = y;
@@ -1459,6 +2964,10 @@ impl RuntimeTraceApi {
             return true;
         }
         if let Some(surface) = self.graph_surfaces.get_mut(&child) {
+            self.display_tree.register_inferred(parent);
+            self.display_tree.register(child, NativeDisplayKind::Window);
+            let _ = self.display_tree.set_parent(child, parent);
+            self.display_tree.set_local_position(child, x, y);
             surface.parent_surface = Some(parent);
             surface.local_x = x;
             surface.local_y = y;
@@ -1484,6 +2993,7 @@ impl RuntimeTraceApi {
             surface.parent_surface = None;
             surface.local_x = surface.x;
             surface.local_y = surface.y;
+            let _ = self.display_tree.set_parent(child, 0);
             return true;
         }
         if let Some(layer) = self
@@ -1494,6 +3004,7 @@ impl RuntimeTraceApi {
             layer.target_surface = None;
             layer.x += parent_origin.0;
             layer.y += parent_origin.1;
+            let _ = self.display_tree.set_parent(child, 0);
             return true;
         }
         if let Some(node) = self
@@ -1504,6 +3015,7 @@ impl RuntimeTraceApi {
             node.target_surface = None;
             node.x += parent_origin.0;
             node.y += parent_origin.1;
+            let _ = self.display_tree.set_parent(child, 0);
             return true;
         }
         false
@@ -1538,6 +3050,25 @@ impl RuntimeTraceApi {
         }
     }
 
+    fn remove_graph_surface(&mut self, surface: i32) -> bool {
+        self.layer_animations.clear_object(surface);
+        self.graph_links.unlink(surface);
+        self.display_tree.remove(surface);
+        self.remove_surface_control_layers(surface);
+        self.detach_graph_surface_relations(surface);
+        self.graph_bindings.remove(&surface);
+        self.surface_text_states.remove(&surface);
+        self.surface_text_buffers.remove(&surface);
+        self.graph_object_layers.remove(&surface);
+        self.graph_object_enabled.remove(&surface);
+        self.graph_object_properties.remove(&surface);
+        self.graph_object_input_tables.remove(&surface);
+        self.graph_input_objects.remove(&surface);
+        self.layer_animations
+            .clear_layers(std::iter::once(&surface));
+        self.graph_surfaces.remove(&surface).is_some()
+    }
+
     fn propagate_graph_surface_children(&mut self, parent: i32) {
         let Some((parent_x, parent_y)) = self
             .graph_surfaces
@@ -1566,41 +3097,203 @@ impl RuntimeTraceApi {
         screen_point: (f32, f32),
     ) -> Option<(ethornell_vm::GraphInputRegion, i32, i32)> {
         let input = self.graph_input_objects.get(&object)?;
-        let origin = self
-            .graph_surfaces
-            .get(&input.layer)
-            .map(|surface| (surface.x, surface.y))
-            .unwrap_or_default();
+        // DCIPIcon owns a CDspObjWindow and sub_44A900 attaches every icon
+        // Sprite to that Window with sub_41AB40. CDspObjVirtual::IsEnabled
+        // (sub_42AD30) delegates to the parent, so a disabled/hidden Window
+        // cannot receive pointer hits through one of its configured children.
+        if self.graph_surfaces.get(&input.layer).is_some_and(|surface| {
+            !self.surface_display_chain_visible(input.layer, surface)
+        }) {
+            return None;
+        }
+        // Extended root+0x20 disables DCIPIcon pointer processing. Target
+        // sub_4495C0 returns -1 before hit-testing when DCIPIcon+0x88 is zero.
+        if !input.descriptor.pointer_processing_enabled {
+            return None;
+        }
+
+        // Target sub_447C10/sub_44A900 creates one child CDspObjSprite for
+        // every live icon item and attaches it to the input Window with
+        // sub_41AB40. sub_4495C0 then asks that *actual child Sprite* for its
+        // final screen rectangle (vtable+0x24) before testing the cursor. The
+        // compact descriptor coordinates are construction-time local offsets;
+        // using them directly after the Window/Group moves separates the
+        // clickable rectangle from the button that the GUI actually draws.
+        //
+        // surface_controls is the portable mirror of those child Sprites, so
+        // prefer its renderer-facing world rectangle. Fall back to the compact
+        // descriptor path only when no native visual child was materialized
+        // (e.g. a hand-built test descriptor without bitmap resources).
+        let mut has_materialized_visual = false;
+        let mut visual_hit: Option<(ethornell_vm::GraphInputRegion, i32, i32, i32)> = None;
+        for (&layer_id, layer) in &self.graph_layers {
+            if layer.target_surface != Some(input.layer)
+                || !self.surface_controls.contains_layer(layer_id)
+                || !layer.enabled
+            {
+                continue;
+            }
+            has_materialized_visual = true;
+            let Ok(ordinal) = usize::try_from(layer.hit_id) else {
+                continue;
+            };
+            let Some(region) = input.descriptor.regions.get(ordinal).copied() else {
+                continue;
+            };
+            if region.enabled_depth == 0 {
+                continue;
+            }
+            let (left, top, _) = self.layer_world_transform(layer_id, layer);
+            let width = (layer.width * layer.scale_x.abs()).max(0.0);
+            let height = (layer.height * layer.scale_y.abs()).max(0.0);
+            let right = left + width;
+            let bottom = top + height;
+            if screen_point.0 < left
+                || screen_point.0 >= right
+                || screen_point.1 < top
+                || screen_point.1 >= bottom
+            {
+                continue;
+            }
+            if self.layer_display_clip(layer).is_some_and(|clip| {
+                screen_point.0 < clip.x
+                    || screen_point.0 >= clip.x + clip.width
+                    || screen_point.1 < clip.y
+                    || screen_point.1 >= clip.y + clip.height
+            }) {
+                continue;
+            }
+            let native_depth = if region.flags & 0x10 != 0 {
+                region.enabled_depth
+            } else if region.flags & 0x02 != 0 {
+                region.y
+            } else {
+                region.ordinal
+            };
+            let local_x = (screen_point.0 - left).round() as i32;
+            let local_y = (screen_point.1 - top).round() as i32;
+            if visual_hit
+                .as_ref()
+                .is_none_or(|(_, _, _, depth)| native_depth >= *depth)
+            {
+                visual_hit = Some((region, local_x, local_y, native_depth));
+            }
+        }
+        if let Some((region, local_x, local_y, _)) = visual_hit {
+            return Some((region, local_x, local_y));
+        }
+        if has_materialized_visual {
+            return None;
+        }
+
+        let origin = if self.graph_surfaces.contains_key(&input.layer) {
+            self.surface_world_position(input.layer)
+        } else {
+            (0.0, 0.0)
+        };
         input.hit_test((screen_point.0 - origin.0, screen_point.1 - origin.1))
     }
 
-    fn apply_graph_object_property(&mut self, args: &[ethornell_vm::Value]) {
+    fn graph_input_object_local_point(&self, object: i32, screen_point: (f32, f32)) -> (i32, i32) {
+        let origin = self
+            .graph_input_objects
+            .get(&object)
+            .map(|input| input.layer)
+            .filter(|layer| self.graph_surfaces.contains_key(layer))
+            .map(|layer| self.surface_world_position(layer))
+            .unwrap_or_default();
+        (
+            (screen_point.0 - origin.0).round() as i32,
+            (screen_point.1 - origin.1).round() as i32,
+        )
+    }
+
+    fn apply_graph_object_property(
+        &mut self,
+        args: &[ethornell_vm::Value],
+    ) -> ethornell_vm::VmResult<()> {
         let popped = args.iter().map(value_to_i32).collect::<Vec<_>>();
         if popped.len() < 4 {
-            return;
+            return Ok(());
         }
         let extra = popped[0];
         let value = popped[1];
         let property = popped[2] as u32;
         let target = popped[3];
 
+        // sub_4438B0 samples vtable+0x1C before and after the virtual
+        // property setter and calls sub_443300 when the CObjectManager key
+        // changes (notably property 0x8100 -> CDspObj+0x24).
+        let sort_key_before = self.graph90_native_sort_key(target);
+
+        if property == 0x4000_0000 {
+            let backf = self
+                .graph_object_properties
+                .get_mut(&target)
+                .and_then(|properties| properties.background.as_mut())
+                .filter(|background| background.class == NativeBackgroundClass::BackF)
+                .and_then(|background| background.backf.as_mut())
+                .ok_or_else(|| {
+                    ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:38 property 0x40000000 is only supported by CDspObjBackF #{target}"
+                    ))
+                })?;
+            // CDspObjBackF::SetParam (sub_41D4D0) forwards value as
+            // +0x168 and extra in EDX as +0x16c. sub_41D510 rejects an
+            // unsigned mode >= 4 only while the previous enable value is
+            // non-zero; constructor state (enable=0) accepts the first write.
+            if backf.mask_control_enabled != 0 && extra as u32 >= 4 {
+                return Err(ethornell_vm::VmError::Runtime(format!(
+                    "Graph90:38 BackF mask-control mode {extra} rejected while enabled"
+                )));
+            }
+            backf.mask_control_enabled = value;
+            backf.mask_control_mode = extra;
+        }
+
         self.graph_object_properties
             .entry(target)
             .or_default()
             .set_property(property, value, extra);
 
+        // CDspObjSprite::SetProperty 0x41 -> sub_428060 and 0x42 ->
+        // sub_428130 rebuild mode-5 geometry immediately. Properties
+        // 0x80/0x81/0x82/0x8F only update coefficients and are consumed by
+        // the next SetFixedParameter/sub_4299A0 invocation.
+        let transformed_property_rebuild = matches!(property, 0x41 | 0x42)
+            && self
+                .graph_object_properties
+                .get(&target)
+                .and_then(|properties| {
+                    properties.named_properties.get("target-object-mode")
+                })
+                .is_some_and(|mode| matches!(*mode, 5 | 6));
+
         // Property 0 calls CDspObj's virtual position setter (+44).
         if property == 0 {
-            self.apply_graph_object_position(&[
-                ethornell_vm::Value::Int(extra),
-                ethornell_vm::Value::Int(value),
-                ethornell_vm::Value::Int(target),
-            ]);
+            self.graph90_set_position_recursive(target, value, extra);
+        } else {
+            // Blend/alpha and BackF's 0x40000000 mask-control property all
+            // feed GetMaskAlpha/sub_41D540. Rebuilding a non-BackF is a
+            // no-op, so keep this centralized instead of guessing which BP
+            // scripts will combine the setters.
+            self.graph90_refresh_backf_primary(target)
+                .map_err(ethornell_vm::VmError::Runtime)?;
+        }
+        if transformed_property_rebuild {
+            let _ = self.graph90_resync_fixed_sprite_geometry(target);
+        }
+        let sort_key_after = self.graph90_native_sort_key(target);
+        if sort_key_before != sort_key_after {
+            if let Some(sort_key) = sort_key_after {
+                self.display_tree.set_native_sort_key(target, sort_key);
+            }
         }
         trace_graph!(
             self,
             "object property target=#{target} property=0x{property:08X} value={value} extra={extra}"
         );
+        Ok(())
     }
 
     fn apply_graph_layer_color_blend(&mut self, args: &[ethornell_vm::Value]) {
@@ -1651,73 +3344,359 @@ impl RuntimeTraceApi {
         );
     }
 
-    fn apply_graph_node_transition(&mut self, args: &[ethornell_vm::Value]) {
-        let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-        if ints.len() != 7 {
+    fn register_native_control_input_latch(
+        &mut self,
+        control_id: u64,
+        input_enabled: bool,
+        scope: i32,
+    ) {
+        self.native_control_last_poll_ms
+            .insert(control_id, self.engine_time_ms);
+        if !input_enabled {
             return;
         }
-        // funcs_48065E[0x22] -> sub_47A790 pops seven values. BP source
-        // order is target, mask, duration, transition, and three parameters.
-        let target = ints[6];
-        let duration_ms = ints
-            .get(4)
-            .copied()
-            .filter(|value| (1..=10_000).contains(value))
-            .unwrap_or(0);
-        let mask = ints
-            .get(5)
-            .copied()
-            .filter(|value| (0..=256).contains(value))
-            .unwrap_or(0);
-        let target_opacity = ((256 - mask) as f32 / 256.0).clamp(0.0, 1.0);
-        let duration_frames = duration_ms.unsigned_abs().div_ceil(16).max(1);
-
-        let mut animated_layers = 0usize;
-        let mut animated_text = 0usize;
-        if let Some(layer_ids) = self.graph_object_layers.get(&target).cloned() {
-            for layer_id in layer_ids {
-                if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                    let from = layer.opacity;
-                    if duration_frames > 1 && (from - target_opacity).abs() > f32::EPSILON {
-                        self.layer_animations.fade_to(
-                            layer_id,
-                            from,
-                            target_opacity,
-                            duration_frames,
-                        );
-                    } else {
-                        layer.opacity = target_opacity;
-                    }
-                    animated_layers += 1;
-                }
-            }
-        } else if let Some(layer) = self.graph_layers.get_mut(&target) {
-            let from = layer.opacity;
-            if duration_frames > 1 && (from - target_opacity).abs() > f32::EPSILON {
-                self.layer_animations
-                    .fade_to(target, from, target_opacity, duration_frames);
-            } else {
-                layer.opacity = target_opacity;
-            }
-            animated_layers += 1;
-        }
-        if let Some(surface) = self.graph_surfaces.get_mut(&target) {
-            let from = surface.opacity;
-            if duration_frames > 1 && (from - target_opacity).abs() > f32::EPSILON {
-                self.layer_animations
-                    .fade_to(target, from, target_opacity, duration_frames);
-            } else {
-                surface.opacity = target_opacity;
-            }
-        }
-        if let Some(node) = self.text_nodes.get_mut(&target) {
-            node.color[3] = target_opacity;
-            animated_text += 1;
-        }
-        self.animation_queue_remaining = self.animation_queue_remaining.max(duration_frames);
-        trace_graph!(self,
-            "node transition target=#{target} mask={mask} opacity={target_opacity:.2} duration_ms={duration_ms} frames={duration_frames} layers={animated_layers} text={animated_text}"
+        let packed = scope.wrapping_shl(16) | 0xffff;
+        // CProcCtrlDspObj::Init (sub_431E80) installs one node in each scope
+        // chain and snapshots sub_46E070 before the first Tick.  The previous
+        // eligibility flags start clear, so a stale/held event cannot finish
+        // the control immediately after it is created.
+        self.registered_keyboard_input_scopes.register(packed);
+        self.registered_pointer_input_scopes.register(packed);
+        let pointer_serial = native_input_activation_serial(self, 1);
+        let auxiliary_serial =
+            native_input_activation_serial(self, self.message_auxiliary_input_mask | 0x180);
+        self.native_control_input_latches.insert(
+            control_id,
+            NativeControlInputLatch {
+                scope,
+                previous_pointer_eligible: false,
+                previous_keyboard_eligible: false,
+                pointer_serial,
+                auxiliary_serial,
+            },
         );
+    }
+
+    fn unregister_native_control_input_latch(&mut self, control_id: u64) {
+        self.native_control_last_poll_ms.remove(&control_id);
+        let Some(latch) = self.native_control_input_latches.remove(&control_id) else {
+            return;
+        };
+        let packed = latch.scope.wrapping_shl(16) | 0xffff;
+        self.registered_keyboard_input_scopes.unregister_one(packed);
+        self.registered_pointer_input_scopes.unregister_one(packed);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_native_cdspobj_control(
+        &mut self,
+        object: i32,
+        target_position: Option<(i32, i32)>,
+        position_curve: i32,
+        target_transparency: i32,
+        alpha_curve: i32,
+        fixed_parameter_target: Option<i32>,
+        duration_ms: i32,
+        update_denominator: i32,
+        update_numerator: i32,
+        input_enabled: bool,
+        input_descriptor: i32,
+        source: &'static str,
+    ) -> ethornell_vm::VmResult<u64> {
+        if !self.graph_handle_exists(object) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} object #{object} is not registered"
+            )));
+        }
+        if !(0..=256).contains(&target_transparency) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} transparency {target_transparency} is outside 0..=256"
+            )));
+        }
+        // sub_491B40 returns 0x80000001 when the update denominator pointer is
+        // null; sub_431D90 subsequently computes 1000*numerator/denominator.
+        if update_denominator == 0 {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} update denominator must not be zero"
+            )));
+        }
+
+        let native_position = self
+            .graph_object_properties
+            .get(&object)
+            .map(|properties| {
+                (
+                    properties.native.position_x,
+                    properties.native.position_y,
+                )
+            })
+            .unwrap_or_else(|| {
+                let (x, y) = self.graph_object_position(object);
+                (x.round() as i32, y.round() as i32)
+            });
+        let target_position = target_position.unwrap_or(native_position);
+        // CProcCtrlDspObj captures vtable +76 (GetAlpha).  CDspObjSprite
+        // overrides it: selector 1 returns the mode-1 transition value at
+        // +0x240, while the other recovered selectors return base CDspObj
+        // transparency (+0xAC).  Reading only portable base properties here
+        // caused mode-1 Sprite transitions to jump to the wrong start value.
+        let from_transparency = self
+            .graph_transition_nodes
+            .get(&object)
+            .filter(|transition| transition.blend_selector == 1)
+            .map(|transition| transition.alpha_multiplier.clamp(0, 256))
+            .unwrap_or_else(|| {
+                self.graph_object_properties
+                    .entry(object)
+                    .or_default()
+                    .alpha_parameter()
+            });
+        // sub_41B740 calls selector -1 of sub_41B750, which reads the
+        // WORD at CDspObj+0xBA: only the integer/high half of +0xB8 survives
+        // when a control starts. The native updater then reconstructs 16.16
+        // by shifting that integer left by 16. Preserve that truncation;
+        // carrying the old fractional half across controls changes chaining.
+        let raw_fixed_parameter_16_16 = self
+            .graph_object_properties
+            .entry(object)
+            .or_default()
+            .native
+            .fixed_parameter_16_16;
+        let from_fixed_parameter_integer =
+            ((raw_fixed_parameter_16_16 as u32 >> 16) & 0xffff) as i32;
+        let from_fixed_parameter_16_16 = from_fixed_parameter_integer << 16;
+        let to_fixed_parameter_16_16 = fixed_parameter_target
+            .filter(|value| *value >= 0)
+            .map(|value| value.saturating_mul(0x1_0000))
+            .unwrap_or(from_fixed_parameter_16_16);
+        // Target sub_431D90 replaces a zero duration with one millisecond.
+        let duration_ms = duration_ms.max(1);
+
+        let control_id = self.layer_animations.schedule_native_object_control(
+            object,
+            native_position,
+            target_position,
+            position_curve,
+            from_transparency,
+            target_transparency,
+            alpha_curve,
+            from_fixed_parameter_16_16,
+            to_fixed_parameter_16_16,
+            duration_ms,
+            update_denominator,
+            update_numerator,
+            input_enabled,
+            input_descriptor,
+        );
+        self.register_native_control_input_latch(control_id, input_enabled, input_descriptor);
+        trace_graph!(
+            self,
+            "{source} object=#{object} position=({},{}) -> ({},{}) position_curve={} transparency={}->{} alpha_curve={} fixed=0x{:08X}->0x{:08X} duration_ms={} update={}/{} input={}:{}",
+            native_position.0,
+            native_position.1,
+            target_position.0,
+            target_position.1,
+            position_curve,
+            from_transparency,
+            target_transparency,
+            alpha_curve,
+            from_fixed_parameter_16_16,
+            to_fixed_parameter_16_16,
+            duration_ms,
+            update_numerator,
+            update_denominator,
+            input_enabled,
+            input_descriptor
+        );
+        Ok(control_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_native_cdspobj_special_path(
+        &mut self,
+        object: i32,
+        middle_position: (i32, i32),
+        target_position: (i32, i32),
+        position_curve: i32,
+        target_transparency: i32,
+        duration_ms: i32,
+        sample_rate_hz: i32,
+        max_catchup_steps: i32,
+        input_enabled: bool,
+        input_descriptor: i32,
+        source: &'static str,
+    ) -> ethornell_vm::VmResult<u64> {
+        if !self.graph_handle_exists(object) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} object #{object} is not registered"
+            )));
+        }
+        if !(0..=256).contains(&target_transparency) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} transparency {target_transparency} is outside 0..=256"
+            )));
+        }
+        if sample_rate_hz == 0 {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} sample rate must not be zero"
+            )));
+        }
+
+        let native_position = self
+            .graph_object_properties
+            .get(&object)
+            .map(|properties| {
+                (
+                    properties.native.position_x,
+                    properties.native.position_y,
+                )
+            })
+            .unwrap_or_else(|| {
+                let (x, y) = self.graph_object_position(object);
+                (x.round() as i32, y.round() as i32)
+            });
+        let from_transparency = self
+            .graph_transition_nodes
+            .get(&object)
+            .filter(|transition| transition.blend_selector == 1)
+            .map(|transition| transition.alpha_multiplier.clamp(0, 256))
+            .unwrap_or_else(|| {
+                self.graph_object_properties
+                    .entry(object)
+                    .or_default()
+                    .alpha_parameter()
+            });
+
+        let Some(control_id) = self.layer_animations.schedule_native_special_path_control(
+            object,
+            native_position,
+            middle_position,
+            target_position,
+            position_curve,
+            from_transparency,
+            target_transparency,
+            duration_ms.max(0),
+            sample_rate_hz,
+            max_catchup_steps,
+            input_enabled,
+            input_descriptor,
+        ) else {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} rejected its native three-point path or sample rate"
+            )));
+        };
+        self.register_native_control_input_latch(control_id, input_enabled, input_descriptor);
+        trace_graph!(
+            self,
+            "{source} object=#{object} start=({},{}) middle=({},{}) target=({},{}) curve={} transparency={}->{} duration_ms={} sample_rate={} catchup_cap={} input={}:{}",
+            native_position.0,
+            native_position.1,
+            middle_position.0,
+            middle_position.1,
+            target_position.0,
+            target_position.1,
+            position_curve,
+            from_transparency,
+            target_transparency,
+            duration_ms.max(0),
+            sample_rate_hz,
+            max_catchup_steps,
+            input_enabled,
+            input_descriptor
+        );
+        Ok(control_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_native_cdspobj_shake(
+        &mut self,
+        object: i32,
+        mode: i32,
+        amplitude: i32,
+        frequency_hz: i32,
+        cycles: i32,
+        decay_percent: i32,
+        sample_rate_hz: i32,
+        input_enabled: bool,
+        input_descriptor: i32,
+        source: &'static str,
+    ) -> ethornell_vm::VmResult<u64> {
+        if !self.graph_handle_exists(object) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} object #{object} is not registered"
+            )));
+        }
+        let native_position = self
+            .graph_object_properties
+            .get(&object)
+            .map(|properties| {
+                (
+                    properties.native.position_x,
+                    properties.native.position_y,
+                )
+            })
+            .unwrap_or_else(|| {
+                let (x, y) = self.graph_object_position(object);
+                (x.round() as i32, y.round() as i32)
+            });
+        let Some(control_id) = self.layer_animations.schedule_native_shake_object_control(
+            object,
+            mode,
+            native_position,
+            amplitude,
+            frequency_hz,
+            cycles,
+            decay_percent,
+            sample_rate_hz,
+            input_enabled,
+            input_descriptor,
+        ) else {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "{source} rejected mode/frequency/cycle/sample-rate arguments"
+            )));
+        };
+        self.register_native_control_input_latch(control_id, input_enabled, input_descriptor);
+        trace_graph!(
+            self,
+            "{source} object=#{object} mode={} amplitude={} frequency_hz={} cycles={} decay_percent={} sample_rate_hz={} input={}:{}",
+            mode,
+            amplitude,
+            frequency_hz,
+            cycles,
+            decay_percent,
+            sample_rate_hz,
+            input_enabled,
+            input_descriptor
+        );
+        Ok(control_id)
+    }
+
+    fn apply_graph_node_transition(
+        &mut self,
+        args: &[ethornell_vm::Value],
+    ) -> ethornell_vm::VmResult<u64> {
+        let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
+        let [input_descriptor, input_enabled, update_numerator, update_denominator, duration_ms, target_transparency, object] =
+            ints.as_slice()
+        else {
+            return Err(ethornell_vm::VmError::Runtime(
+                "Graph90:22 expected seven arguments".to_string(),
+            ));
+        };
+        self.schedule_native_cdspobj_control(
+            *object,
+            None,
+            0,
+            *target_transparency,
+            0,
+            None,
+            *duration_ms,
+            *update_denominator,
+            *update_numerator,
+            *input_enabled != 0,
+            *input_descriptor,
+            "Graph90:22",
+        )
     }
 
     fn graph_target_layers(&self, target: i32) -> Vec<i32> {
@@ -1735,161 +3714,120 @@ impl RuntimeTraceApi {
         layer_ids
     }
 
-    fn infer_graph_effect_target(&self, source: &[i32]) -> i32 {
-        source
-            .iter()
-            .copied()
-            .find(|value| {
-                self.graph_object_layers.contains_key(value)
-                    || self.graph_layers.contains_key(value)
-                    || self.graph_surfaces.contains_key(value)
-            })
-            .or(self.current_graph_object)
-            .unwrap_or_default()
-    }
-
     fn apply_graph_effect_config(&mut self, effect_id: u16, args: &[ethornell_vm::Value]) {
-        let mut source = args.iter().map(value_to_i32).collect::<Vec<_>>();
-        source.reverse();
-        let target = self.infer_graph_effect_target(&source);
-        let layer_ids = self.graph_target_layers(target);
-        let duration_frames = self.animation_queue_remaining.max(1);
-        let mut changed = 0usize;
-
-        match effect_id {
-            0x10 | 0x16 if source.len() >= 5 => {
-                let x = graph_motion_coord(source[1]);
-                let y = graph_motion_coord(source[2]);
-                let width = graph_motion_coord(source[3]).abs().max(1.0);
-                let height = graph_motion_coord(source[4]).abs().max(1.0);
-                for layer_id in &layer_ids {
-                    if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                        if effect_id == 0x10 {
-                            if duration_frames > 1 {
-                                self.layer_animations.move_x_to(
-                                    *layer_id,
-                                    layer.transform_x,
-                                    x,
-                                    duration_frames,
-                                );
-                                self.layer_animations.move_y_to(
-                                    *layer_id,
-                                    layer.transform_y,
-                                    y,
-                                    duration_frames,
-                                );
-                            } else {
-                                layer.transform_x = x;
-                                layer.transform_y = y;
-                            }
-                        } else {
-                            layer.clip = Some(RuntimeClipRect {
-                                x,
-                                y,
-                                width,
-                                height,
-                            });
-                        }
-                        changed += 1;
-                    }
-                }
-            }
-            0x11 if source.len() >= 2 => {
-                let alpha = (source[1] as f32 / 256.0).clamp(0.0, 1.0);
-                for layer_id in &layer_ids {
-                    if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                        if duration_frames > 1 {
-                            self.layer_animations.fade_to(
-                                *layer_id,
-                                layer.opacity,
-                                alpha,
-                                duration_frames,
-                            );
-                        } else {
-                            layer.opacity = alpha;
-                        }
-                        changed += 1;
-                    }
-                }
-            }
-            0x13 if source.len() >= 4 => {
-                let rotation = fixed_16_to_f32(source[1]);
-                let x = graph_motion_coord(source[2]);
-                let y = graph_motion_coord(source[3]);
-                for layer_id in &layer_ids {
-                    if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                        layer.rotation_degrees = rotation;
-                        layer.transform_x = x;
-                        layer.transform_y = y;
-                        changed += 1;
-                    }
-                }
-            }
-            0x12 | 0x15 => {
-                let alpha = source
-                    .iter()
-                    .copied()
-                    .skip(1)
-                    .find(|value| (0..=256).contains(value))
-                    .map(|value| (value as f32 / 256.0).clamp(0.0, 1.0));
-                if let Some(alpha) = alpha {
-                    for layer_id in &layer_ids {
-                        if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                            layer.opacity = alpha;
-                            changed += 1;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        trace_graph!(self,
-            "effect 0x{effect_id:02X} target=#{target} layers={layer_ids:?} changed={changed} raw={source:?}"
+        let configured = self.effects.configure_displacement_map(effect_id, args);
+        trace_graph!(
+            self,
+            "format-4 displacement effect 0x{effect_id:02X} configured={configured} raw={:?}",
+            args.iter().map(value_to_i32).collect::<Vec<_>>()
         );
     }
 
-    fn apply_graph_object_effect(&mut self, args: &[ethornell_vm::Value]) {
+    fn install_temp_effect_layer(
+        &mut self,
+        target: i32,
+        displacement: Option<i32>,
+        opacity: f32,
+        z: i32,
+    ) -> bool {
+        if target == -1 {
+            return false;
+        }
+        self.graph_layers.remove(&target);
+        let source = snapshot::compose_runtime_frame(self, false);
+        let image = match displacement {
+            Some(bitmap) => self.effects.warp_displacement_map(bitmap, &source),
+            None => Some(source),
+        };
+        let Some(image) = image else {
+            return false;
+        };
+        let key = format!("runtime:temp-effect:{target}");
+        let width = image.width as f32;
+        let height = image.height as f32;
+        self.store_graph_image(key.clone(), image);
+        self.display_tree
+            .register(target, NativeDisplayKind::Sprite);
+        self.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: Some(target),
+                key,
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: opacity.clamp(0.0, 1.0),
+                z,
+                enabled: self
+                    .graph_object_enabled
+                    .get(&target)
+                    .copied()
+                    .unwrap_or(true),
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        self.graph_object_layers
+            .entry(target)
+            .or_default()
+            .insert(target);
+        true
+    }
+
+    fn apply_graph_object_effect(
+        &mut self,
+        args: &[ethornell_vm::Value],
+    ) -> ethornell_vm::VmResult<u64> {
         let mut source = args.iter().map(value_to_i32).collect::<Vec<_>>();
         source.reverse();
         let schedule = animation::ScheduledObjectControl::from_popped_args(args);
+        let mut control_id = 0;
         if let Some(schedule) = schedule {
-            self.pending_graph_procedure_schedule = Some(schedule.procedure_schedule());
-            let duration_frames = schedule.duration_ms.unsigned_abs().div_ceil(16).max(1);
-            let target_x = fixed_16_to_f32(schedule.target_x);
-            let target_y = fixed_16_to_f32(schedule.target_y);
-            let target_alpha = (schedule.target_alpha as f32 / 256.0).clamp(0.0, 1.0);
-            let layer_ids = self.graph_target_layers(schedule.target_object);
-            for layer_id in &layer_ids {
-                if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                    self.layer_animations.base_vector_to(
-                        *layer_id,
-                        (layer.x, layer.y, layer.z),
-                        (target_x, target_y, schedule.target_z),
-                        duration_frames,
-                        schedule.position_curve,
-                        schedule.z_curve,
-                    );
-                    self.layer_animations.fade_to_eased(
-                        *layer_id,
-                        layer.opacity,
-                        target_alpha,
-                        duration_frames,
-                        0,
-                    );
-                }
-            }
-            self.animation_queue_remaining = self.animation_queue_remaining.max(duration_frames);
+            // Target sub_47AC80 -> sub_491D60 -> sub_431D90 uses ordinary
+            // integer CDspObj coordinates here.  The old port incorrectly
+            // interpreted x/y as 16.16 and, worse, treated source s4/s5 as
+            // Z + Z-curve even though they are target alpha + alpha curve.
+            // Source s6 is the vtable+80 fixed parameter target (-1 keeps the
+            // current value); it must never change display-tree Z order.
+            control_id = self.schedule_native_cdspobj_control(
+                schedule.target_object,
+                Some((schedule.target_x, schedule.target_y)),
+                schedule.position_curve,
+                schedule.target_alpha,
+                schedule.alpha_curve,
+                Some(schedule.fixed_parameter_target),
+                schedule.duration_ms,
+                schedule.update_denominator,
+                schedule.update_numerator,
+                schedule.input_enabled,
+                schedule.input_descriptor,
+                "Graph90:28",
+            )?;
             trace_graph!(
                 self,
-                "object control target=#{} layers={layer_ids:?} position=({target_x:.2},{target_y:.2},{}) curves=({}, {}) alpha={target_alpha:.3} duration_ms={} update={}/{}",
+                "object control target=#{} position=({},{}) position_curve={} alpha={} alpha_curve={} fixed_target={} duration_ms={} update={}/{} input={}:{}",
                 schedule.target_object,
-                schedule.target_z,
+                schedule.target_x,
+                schedule.target_y,
                 schedule.position_curve,
-                schedule.z_curve,
+                schedule.target_alpha,
+                schedule.alpha_curve,
+                schedule.fixed_parameter_target,
                 schedule.duration_ms,
                 schedule.update_numerator,
-                schedule.update_denominator
+                schedule.update_denominator,
+                schedule.input_enabled,
+                schedule.input_descriptor
             );
         }
         let destination = self.pending_transition_destination;
@@ -1897,6 +3835,7 @@ impl RuntimeTraceApi {
             self,
             "transition start destination={destination:?} schedule={schedule:?} raw={source:?}"
         );
+        Ok(control_id)
     }
 
     fn apply_graph_affine_transform(&mut self, args: &[ethornell_vm::Value]) {
@@ -1917,7 +3856,7 @@ impl RuntimeTraceApi {
             })
             .or(resource_id)
             .unwrap_or_default();
-        if target <= 0 {
+        if target == -1 {
             trace_graph!(self, "affine transform skipped raw={source:?}");
             return;
         }
@@ -1959,33 +3898,15 @@ impl RuntimeTraceApi {
         layer_ids.sort_unstable();
         layer_ids.dedup();
 
-        let duration_frames = self.animation_queue_remaining.max(1);
         let mut changed = 0usize;
         for layer_id in &layer_ids {
             if let Some(layer) = self.graph_layers.get_mut(layer_id) {
+                self.layer_animations.clear_layer(*layer_id);
                 if let Some(x) = x {
-                    if duration_frames > 1 {
-                        self.layer_animations.move_x_to(
-                            *layer_id,
-                            layer.transform_x,
-                            x,
-                            duration_frames,
-                        );
-                    } else {
-                        layer.transform_x = x;
-                    }
+                    layer.transform_x = x;
                 }
                 if let Some(y) = y {
-                    if duration_frames > 1 {
-                        self.layer_animations.move_y_to(
-                            *layer_id,
-                            layer.transform_y,
-                            y,
-                            duration_frames,
-                        );
-                    } else {
-                        layer.transform_y = y;
-                    }
+                    layer.transform_y = y;
                 }
                 if let Some(scale_x) = scale_x {
                     layer.scale_x = scale_x;
@@ -2021,7 +3942,162 @@ impl RuntimeTraceApi {
         );
     }
 
-    fn tick_timelines(&mut self) {
+    fn sample_native_control_input(&mut self, control_id: u64) {
+        let Some((_, input_scope)) = self
+            .layer_animations
+            .native_input_controls()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == control_id)
+        else {
+            return;
+        };
+        let packed = input_scope.wrapping_shl(16) | 0xffff;
+        let pointer_serial = native_input_activation_serial(self, 1);
+        let auxiliary_serial = native_input_activation_serial(
+            self,
+            self.message_auxiliary_input_mask | 0x180,
+        );
+        let pointer_eligible = native_pointer_scope_eligible(self, packed);
+        let keyboard_eligible = native_keyboard_scope_eligible(self, packed);
+        let previous = self
+            .native_control_input_latches
+            .get(&control_id)
+            .copied()
+            .unwrap_or(NativeControlInputLatch {
+                scope: input_scope,
+                previous_pointer_eligible: false,
+                previous_keyboard_eligible: false,
+                pointer_serial,
+                auxiliary_serial,
+            });
+        let pointer_edge = pointer_eligible
+            && previous.previous_pointer_eligible
+            && pointer_serial > previous.pointer_serial;
+        let auxiliary_edge = keyboard_eligible
+            && previous.previous_keyboard_eligible
+            && auxiliary_serial > previous.auxiliary_serial;
+        let high_bit_edge = ethornell_vm::SysApi::query_configured_input_gate(self) != 0;
+        self.native_control_input_latches.insert(
+            control_id,
+            NativeControlInputLatch {
+                scope: input_scope,
+                previous_pointer_eligible: pointer_eligible,
+                previous_keyboard_eligible: keyboard_eligible,
+                pointer_serial,
+                auxiliary_serial,
+            },
+        );
+        if pointer_edge || auxiliary_edge || high_bit_edge {
+            let _ = query_runtime_input_event_bits(self, input_scope, true, false);
+            let _ = self
+                .layer_animations
+                .request_native_control_completion(control_id);
+        }
+    }
+
+    fn apply_native_control_events(
+        &mut self,
+        events: Vec<animation::LayerAnimationEvent>,
+    ) {
+        for event in events {
+            match event {
+                animation::LayerAnimationEvent::NativeObjectControlUpdated {
+                    object_id,
+                    x,
+                    y,
+                    alpha_parameter,
+                    fixed_parameter_16_16,
+                } => {
+                    self.graph90_set_position_recursive(object_id, x, y);
+                    self.set_graph_object_alpha_recursive(object_id, alpha_parameter);
+                    self.graph90_set_fixed_parameter_raw_recursive(
+                        object_id,
+                        fixed_parameter_16_16,
+                    );
+                }
+                animation::LayerAnimationEvent::NativeSpecialPathControlUpdated {
+                    object_id,
+                    x,
+                    y,
+                    alpha_parameter,
+                } => {
+                    self.graph90_set_position_recursive(object_id, x, y);
+                    self.set_graph_object_alpha_recursive(object_id, alpha_parameter);
+                }
+                animation::LayerAnimationEvent::NativeShakeObjectControlUpdated {
+                    object_id,
+                    x,
+                    y,
+                } => {
+                    self.graph90_set_position_recursive(object_id, x, y);
+                }
+                animation::LayerAnimationEvent::NativeSplineControlUpdated {
+                    object_id,
+                    fixed_x_16_16,
+                    fixed_y_16_16,
+                    fixed_z_16_16,
+                    alpha_parameter,
+                    fixed_parameter_16_16,
+                } => {
+                    let sort_key_before = self.graph90_native_sort_key(object_id);
+                    self.graph91_set_object_fixed_position(
+                        object_id,
+                        fixed_x_16_16,
+                        fixed_y_16_16,
+                        fixed_z_16_16,
+                    );
+                    self.set_graph_object_alpha_recursive(object_id, alpha_parameter);
+                    self.graph90_set_fixed_parameter_raw_recursive(
+                        object_id,
+                        fixed_parameter_16_16,
+                    );
+                    let sort_key_after = self.graph90_native_sort_key(object_id);
+                    if sort_key_before != sort_key_after {
+                        if let Some(sort_key) = sort_key_after {
+                            self.display_tree.set_native_sort_key(object_id, sort_key);
+                        }
+                    }
+                }
+                animation::LayerAnimationEvent::NativeObjectControlFinished { object_id } => {
+                    if self.debug_graph {
+                        let position = self.graph_object_properties.get(&object_id).map(|p| {
+                            (p.native.position_x, p.native.position_y)
+                        });
+                        let alpha = self
+                            .graph_object_properties
+                            .get(&object_id)
+                            .map(RuntimeGraphObjectProperties::alpha_parameter);
+                        trace_graph!(
+                            self,
+                            "native object control finished object={object_id} position={position:?} alpha={alpha:?}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn tick_timelines(&mut self, elapsed_ms: u64) {
+        self.graph_flash_controls.tick(elapsed_ms);
+        self.tick_native_user_state(elapsed_ms);
+        self.tick_native_effect_state(elapsed_ms);
+        let movie_elapsed_ms = elapsed_ms.min(i32::MAX as u64) as i32;
+        for update in self.graph_effects.tick_movies(movie_elapsed_ms) {
+            self.store_movie_frame(update);
+        }
+        // Target sub_496430 samples each registered Sprite once per main-loop
+        // pass and stores only bit zero of the primary-input query. The portable
+        // backend uses the same per-frame latching point with its current
+        // rectangle-level Sprite hit test.
+        let sprite_handles = self.graph_sprite_targets.sprite_handles();
+        for sprite in sprite_handles {
+            let state = i32::from(
+                self.mouse_pressed
+                    && self.graph_object_pointer_hit(sprite).unwrap_or_default() != 0,
+            );
+            self.graph_sprite_targets.set_sampled_state(sprite, state);
+        }
         let mut finished = self.timelines.tick();
         finished.extend(self.graph_animations.tick());
         for handle in finished {
@@ -2032,28 +4108,139 @@ impl RuntimeTraceApi {
                 trace_graph!(self, "special graph event queued handle=#{handle}");
             }
         }
-        for event in self
-            .layer_animations
-            .tick(&mut self.graph_layers, &mut self.graph_surfaces)
-        {
-            if self.debug_graph {
-                match event {
-                    animation::LayerAnimationEvent::Finished { layer_id, property } => {
+        // CProcCtrlDspObj-family controls are advanced by the exact VM
+        // CProcedure poll hook below, not by this renderer/native-pass tick.
+        // Keep only renderer-owned compatibility animations here.
+        let layer_events = self.layer_animations.tick(
+            &mut self.graph_layers,
+            &mut self.graph_surfaces,
+            &mut self.graph_object_properties,
+        );
+        for event in layer_events {
+            match event {
+                animation::LayerAnimationEvent::ObjectAlphaUpdated {
+                    object_id,
+                    alpha_parameter,
+                } => {
+                    self.set_graph_object_alpha_recursive(object_id, alpha_parameter);
+                }
+                animation::LayerAnimationEvent::NativeObjectControlUpdated {
+                    object_id,
+                    x,
+                    y,
+                    alpha_parameter,
+                    fixed_parameter_16_16,
+                } => {
+                    // sub_432160 dispatches the object's vtable position and
+                    // alpha/fixed-parameter setters together when the sampled
+                    // state changes.
+                    self.graph90_set_position_recursive(object_id, x, y);
+                    self.set_graph_object_alpha_recursive(object_id, alpha_parameter);
+                    self.graph90_set_fixed_parameter_raw_recursive(
+                        object_id,
+                        fixed_parameter_16_16,
+                    );
+                }
+                animation::LayerAnimationEvent::NativeSpecialPathControlUpdated {
+                    object_id,
+                    x,
+                    y,
+                    alpha_parameter,
+                } => {
+                    self.graph90_set_position_recursive(object_id, x, y);
+                    self.set_graph_object_alpha_recursive(object_id, alpha_parameter);
+                }
+                animation::LayerAnimationEvent::NativeShakeObjectControlUpdated {
+                    object_id,
+                    x,
+                    y,
+                } => {
+                    self.graph90_set_position_recursive(object_id, x, y);
+                }
+                animation::LayerAnimationEvent::NativeSplineControlUpdated {
+                    object_id,
+                    fixed_x_16_16,
+                    fixed_y_16_16,
+                    fixed_z_16_16,
+                    alpha_parameter,
+                    fixed_parameter_16_16,
+                } => {
+                    // sub_4325E0 samples vtable+0x1C before mutating the
+                    // object, writes fixed position (+60), alpha (+72), and
+                    // selector-1 fixed parameter (+80), then samples the key
+                    // again. A changed key triggers sub_443300 -> sub_4307D0,
+                    // which removes/reinserts the object in CObjectManager.
+                    let sort_key_before = self.graph90_native_sort_key(object_id);
+                    self.graph91_set_object_fixed_position(
+                        object_id,
+                        fixed_x_16_16,
+                        fixed_y_16_16,
+                        fixed_z_16_16,
+                    );
+                    self.set_graph_object_alpha_recursive(object_id, alpha_parameter);
+                    self.graph90_set_fixed_parameter_raw_recursive(
+                        object_id,
+                        fixed_parameter_16_16,
+                    );
+                    let sort_key_after = self.graph90_native_sort_key(object_id);
+                    if sort_key_before != sort_key_after {
+                        if let Some(sort_key) = sort_key_after {
+                            self.display_tree.set_native_sort_key(object_id, sort_key);
+                        }
+                    }
+                }
+                animation::LayerAnimationEvent::NativeObjectControlFinished { object_id } => {
+                    if self.debug_graph {
+                        let position = self.graph_object_properties.get(&object_id).map(|p| {
+                            (p.native.position_x, p.native.position_y)
+                        });
+                        let alpha = self
+                            .graph_object_properties
+                            .get(&object_id)
+                            .map(RuntimeGraphObjectProperties::alpha_parameter);
+                        trace_graph!(
+                            self,
+                            "native object control finished object={object_id} position={position:?} alpha={alpha:?}"
+                        );
+                    }
+                }
+                animation::LayerAnimationEvent::Finished { layer_id, property } => {
+                    if self.debug_graph {
                         trace_graph!(
                             self,
                             "layer animation finished layer={layer_id} property={property:?}"
                         );
                     }
                 }
+                animation::LayerAnimationEvent::ObjectAlphaFinished { object_id } => {
+                    if self.debug_graph {
+                        let alpha = self
+                            .graph_object_properties
+                            .get(&object_id)
+                            .map(RuntimeGraphObjectProperties::alpha_parameter)
+                            .unwrap_or_default();
+                        trace_graph!(
+                            self,
+                            "object alpha animation finished object={object_id} alpha={alpha}"
+                        );
+                    }
+                }
             }
         }
-        if self.animation_queue_remaining > 0 {
-            self.animation_queue_remaining -= 1;
-            trace_graph!(
-                self,
-                "animation queue frame tick remaining={}",
-                self.animation_queue_remaining
-            );
+        let active_native_input_controls = self
+            .layer_animations
+            .native_input_controls()
+            .into_iter()
+            .map(|(control_id, _)| control_id)
+            .collect::<BTreeSet<_>>();
+        let stale_native_input_controls = self
+            .native_control_input_latches
+            .keys()
+            .copied()
+            .filter(|control_id| !active_native_input_controls.contains(control_id))
+            .collect::<Vec<_>>();
+        for control_id in stale_native_input_controls {
+            self.unregister_native_control_input_latch(control_id);
         }
     }
 
@@ -2077,6 +4264,9 @@ impl RuntimeTraceApi {
         self.layer_animations.clear_layers(&layers);
         for layer_id in &layers {
             self.graph_layers.remove(layer_id);
+            self.display_tree.remove(*layer_id);
+            self.graph_node_sources.remove(layer_id);
+            self.graph_node_masks.remove(layer_id);
         }
         self.scenario_scene_layers.clear();
         trace_graph!(
@@ -2147,7 +4337,7 @@ impl RuntimeTraceApi {
                     } else {
                         let from = layer.transform_x;
                         let to = x as f32;
-                        if frames > 1 {
+                        if frames > 0 {
                             self.layer_animations.move_x_to(layer_id, from, to, frames);
                         } else {
                             layer.transform_x = to;
@@ -2165,7 +4355,7 @@ impl RuntimeTraceApi {
                     } else {
                         let from = layer.transform_y;
                         let to = y as f32;
-                        if frames > 1 {
+                        if frames > 0 {
                             self.layer_animations.move_y_to(layer_id, from, to, frames);
                         } else {
                             layer.transform_y = to;
@@ -2175,7 +4365,7 @@ impl RuntimeTraceApi {
                 if let Some(opacity) = opacity {
                     let from = layer.opacity;
                     let to = opacity.clamp(0.0, 1.0);
-                    if frames > 1 {
+                    if frames > 0 {
                         self.layer_animations.fade_to(layer_id, from, to, frames);
                     } else {
                         layer.opacity = to;
@@ -2189,8 +4379,14 @@ impl RuntimeTraceApi {
     }
 
     fn tick_scenario(&mut self) {
-        self.maybe_inject_scenario_mode_input();
+        let mode_input_injected = self.maybe_inject_scenario_mode_input();
         if self.handle_message_control_input() {
+            return;
+        }
+        // The regular BP message program owns native message completion.
+        // Keep synthesized AUTO/SKIP input alive until that program polls it;
+        // the shadow BCS player must not consume the same release first.
+        if mode_input_injected && self.native_message_active {
             return;
         }
         // Native BCS execution owns its input waits in the VM. The latch below
@@ -2291,43 +4487,53 @@ impl RuntimeTraceApi {
         }
     }
 
-    fn maybe_inject_scenario_mode_input(&mut self) {
+    fn maybe_inject_scenario_mode_input(&mut self) -> bool {
+        // The target AUTO/SKIP path belongs to message procedures and input
+        // state, not to periodic host mouse clicks. Keep the former shadow-BCS
+        // behavior behind an explicit compatibility switch so it cannot make
+        // the native BP runtime appear to fast-forward.
+        if !self.legacy_scenario_mode_input {
+            self.scenario_mode_release_pending = false;
+            return false;
+        }
+        if self.scenario_mode_release_pending {
+            self.scenario_mode_release_pending = false;
+            apply_runtime_input_event(self, RuntimeInputEvent::MouseRelease { x: 640.0, y: 650.0 });
+            self.trace_graph("scenario mode injected mouse release");
+            return true;
+        }
         if !self.scenario_bootstrapped
             || self.pending_click.is_some()
             || self.pending_object_state.is_some()
             || self.pending_input_state.is_some()
         {
-            return;
+            return false;
         }
         if self.scenario_skip_mode {
-            self.pending_click = Some((640.0, 650.0));
-            self.pending_click_age_frames = 0;
-            self.pending_input_state = Some(0x1000_0006);
-            self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
-            self.pending_input_consumed = false;
-            self.trace_graph("scenario skip mode injected input");
-            return;
+            apply_runtime_input_event(self, RuntimeInputEvent::MousePress { x: 640.0, y: 650.0 });
+            self.scenario_mode_release_pending = true;
+            self.trace_graph("scenario skip mode injected mouse press");
+            return true;
         }
         if self.scenario_auto_mode {
             if self.text_runtime.is_animating() {
                 self.scenario_auto_wait_frames = 0;
-                return;
+                return false;
             }
             if self.scenario_auto_wait_frames < 45 {
                 self.scenario_auto_wait_frames += 1;
-                return;
+                return false;
             }
             self.scenario_auto_wait_frames = 0;
-            self.pending_click = Some((640.0, 650.0));
-            self.pending_click_age_frames = 0;
-            self.pending_input_state = Some(0x1000_0006);
-            self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
-            self.pending_input_consumed = false;
-            self.trace_graph("scenario auto mode injected input");
+            apply_runtime_input_event(self, RuntimeInputEvent::MousePress { x: 640.0, y: 650.0 });
+            self.scenario_mode_release_pending = true;
+            self.trace_graph("scenario auto mode injected mouse press");
+            return true;
         }
+        false
     }
 
-    fn finish_frame_input(&mut self) {
+    fn finish_native_tick_input(&mut self) {
         let had_input_state = self.pending_input_state.is_some();
         if self.pending_input_state.is_some() && self.auto_title_release_after_state {
             self.mouse_pressed = false;
@@ -2387,6 +4593,9 @@ impl RuntimeTraceApi {
         if source == 0 || destination == 0 || source == destination {
             return;
         }
+        if let Some(dimensions) = self.bitmap_dimensions.get(&source).copied() {
+            self.bitmap_dimensions.insert(destination, dimensions);
+        }
         if let Some(resource) = self.resolve_graph_resource(source).cloned() {
             self.graph_resources.insert(destination, resource);
         }
@@ -2400,8 +4609,112 @@ impl RuntimeTraceApi {
             destination_surface.viewport_height = source_surface.viewport_height;
             destination_surface.resource_id = source_surface.resource_id;
         }
+        let copied_text_runs = self.copy_bitmap_text(source, destination);
         self.graph_bindings.insert(destination, source);
-        trace_graph!(self, "copy graph backing #{source} -> #{destination}");
+        trace_graph!(
+            self,
+            "copy graph backing #{source} -> #{destination} text_runs={copied_text_runs}"
+        );
+    }
+
+    fn clone_graph_bitmap(&mut self, source: i32, destination: i32) -> bool {
+        if source == 0 || destination == 0 {
+            return false;
+        }
+        if source == destination {
+            return self.graph_bitmap_image(source).is_some();
+        }
+        let Some(mut image) = self.graph_bitmap_image(source) else {
+            return false;
+        };
+        if let Some((width, height)) = self.bitmap_dimensions.get(&source).copied() {
+            image = fit_decoded_image_canvas(&image, width, height);
+        }
+        let dimensions = (image.width, image.height);
+        let key = format!("runtime:bitmap:{destination}");
+        self.store_graph_image(key.clone(), image);
+        self.graph_resources
+            .insert(destination, RuntimeGraphResource::whole(key));
+        self.graph_bindings.remove(&destination);
+        self.bitmap_dimensions.insert(destination, dimensions);
+        if let Some(format) = self.bitmap_formats.get(&source).copied() {
+            self.bitmap_formats.insert(destination, format);
+        }
+        let mut surface =
+            RuntimeSurface::bitmap(destination, dimensions.0 as f32, dimensions.1 as f32);
+        if let Some(source_surface) = self.graph_surfaces.get(&source) {
+            surface.x = source_surface.x;
+            surface.y = source_surface.y;
+            surface.viewport_x = source_surface.viewport_x;
+            surface.viewport_y = source_surface.viewport_y;
+            surface.opacity = source_surface.opacity;
+            surface.enabled = source_surface.enabled;
+        }
+        surface.resource_id = Some(destination);
+        self.graph_surfaces.insert(destination, surface);
+        self.copy_bitmap_text(source, destination);
+        self.refresh_bitmap_nodes(destination);
+        trace_graph!(
+            self,
+            "clone bitmap pixels #{source} -> #{destination} {}x{}",
+            dimensions.0,
+            dimensions.1
+        );
+        true
+    }
+
+    fn retain_surface_backing(&mut self, surface_id: i32, bitmap_id: i32) -> bool {
+        let Some(mut image) = self.graph_bitmap_image(bitmap_id) else {
+            return false;
+        };
+        if let Some((width, height)) = self.bitmap_dimensions.get(&bitmap_id).copied() {
+            image = fit_decoded_image_canvas(&image, width, height);
+        }
+        let key = format!("runtime:surface:{surface_id}:backing");
+        let dimensions = (image.width, image.height);
+        self.store_graph_image(key.clone(), image);
+        self.graph_resources
+            .insert(surface_id, RuntimeGraphResource::whole(key));
+        let Some(surface) = self.graph_surfaces.get_mut(&surface_id) else {
+            self.graph_resources.remove(&surface_id);
+            return false;
+        };
+        surface.resource_id = Some(surface_id);
+        trace_graph!(
+            self,
+            "surface #{surface_id} retained bitmap #{bitmap_id} as {}x{} backing",
+            dimensions.0,
+            dimensions.1
+        );
+        true
+    }
+
+    fn render_graph_object_to_bitmap(&mut self, object_id: i32, bitmap_id: i32) -> bool {
+        let target_size = self.bitmap_dimensions.get(&bitmap_id).copied();
+        let Some(image) = snapshot::compose_graph_object(self, object_id, target_size) else {
+            return false;
+        };
+        let dimensions = (image.width, image.height);
+        let key = format!("runtime:bitmap:{bitmap_id}:object-capture");
+        self.store_graph_image(key.clone(), image);
+        self.graph_resources
+            .insert(bitmap_id, RuntimeGraphResource::whole(key));
+        self.graph_bindings.remove(&bitmap_id);
+        self.bitmap_dimensions.insert(bitmap_id, dimensions);
+        self.clear_bitmap_text(bitmap_id);
+        self.effects.remove_bitmap(bitmap_id);
+        let mut surface =
+            RuntimeSurface::bitmap(bitmap_id, dimensions.0 as f32, dimensions.1 as f32);
+        surface.resource_id = Some(bitmap_id);
+        self.graph_surfaces.insert(bitmap_id, surface);
+        self.refresh_bitmap_nodes(bitmap_id);
+        trace_graph!(
+            self,
+            "graph object #{object_id} rendered into bitmap #{bitmap_id} {}x{}",
+            dimensions.0,
+            dimensions.1
+        );
+        true
     }
 
     fn resolve_resource_key(&self, id: i32) -> Option<&str> {
@@ -2443,9 +4756,13 @@ impl RuntimeTraceApi {
         }
         for layer in self.surface_controls.remove(surface) {
             self.graph_layers.remove(&layer);
+            self.release_screen_text_node(layer);
         }
 
-        let base_z = surface.saturating_add(1);
+        // Both target descriptor paths allocate their icon Sprites in the
+        // window's private CObjectManager. Their depth is local to that
+        // manager; the tagged window handle is not a render priority.
+        let base_z: i32 = 0;
         let controls = descriptor
             .regions
             .iter()
@@ -2493,6 +4810,7 @@ impl RuntimeTraceApi {
         let mut layer_ids = BTreeSet::new();
         for (ordinal, resource_id, key, source, width, height, region) in controls {
             let layer_id = self.alloc_node();
+            let z = base_z.saturating_add(native_surface_control_depth(region));
             self.graph_layers.insert(
                 layer_id,
                 RuntimeGraphLayer {
@@ -2507,7 +4825,7 @@ impl RuntimeTraceApi {
                     src_x: source.x,
                     src_y: source.y,
                     opacity: 1.0,
-                    z: base_z.saturating_add(native_surface_control_depth(region)),
+                    z,
                     enabled: true,
                     transform_x: 0.0,
                     transform_y: 0.0,
@@ -2518,6 +4836,16 @@ impl RuntimeTraceApi {
                     clip: None,
                 },
             );
+            if self.configure_image_bitmap_text_node(
+                layer_id,
+                resource_id,
+                region.x as f32,
+                region.y as f32,
+                z,
+                None,
+            ) {
+                self.set_screen_text_node_surface(layer_id, Some(surface));
+            }
             layer_ids.insert(layer_id);
             trace_graph!(
                 self,
@@ -2538,6 +4866,7 @@ impl RuntimeTraceApi {
             .replace(surface, descriptor.clone(), layer_ids)
         {
             self.graph_layers.remove(&stale);
+            self.release_screen_text_node(stale);
         }
         count
     }
@@ -2545,6 +4874,7 @@ impl RuntimeTraceApi {
     fn remove_surface_control_layers(&mut self, surface: i32) {
         for layer in self.surface_controls.remove(surface) {
             self.graph_layers.remove(&layer);
+            self.release_screen_text_node(layer);
         }
     }
 
@@ -2557,19 +4887,15 @@ impl RuntimeTraceApi {
         mode: i32,
         alpha_parameter: i32,
     ) -> Option<String> {
+        let source_format = self.bitmap_formats.get(&source).copied();
+        let destination_format = self.bitmap_formats.get(&destination).copied();
         let (source_key, source_region) = self
             .resource_image_region(source)
             .map(|(key, region)| (key.to_string(), region))?;
         let source_image = crop_decoded_image(self.graph_images.get(&source_key)?, source_region);
         let composite_key = format!("runtime:bitmap:{destination}");
 
-        let mut destination_image = if mode == 128 && alpha_parameter >= 256 && x == 0 && y == 0 {
-            DecodedImage {
-                width: source_image.width,
-                height: source_image.height,
-                rgba: vec![0; source_image.rgba.len()],
-            }
-        } else if let Some(image) = self.graph_images.get(&composite_key) {
+        let mut destination_image = if let Some(image) = self.graph_images.get(&composite_key) {
             image.clone()
         } else if let Some((key, region)) = self
             .resource_image_region(destination)
@@ -2594,16 +4920,41 @@ impl RuntimeTraceApi {
             }
         };
 
-        blit_decoded_image_parameter(
-            &mut destination_image,
-            &source_image,
-            x,
-            y,
-            mode,
-            alpha_parameter,
-        );
-        self.graph_images
-            .insert(composite_key.clone(), destination_image);
+        if alpha_parameter == 0
+            && mode == 128
+            && source_format.is_some()
+            && source_format == destination_format
+        {
+            // sub_40AF50 -> sub_40ADF0: same-format selector 128 is a raw
+            // clipped replacement. Treating it as source-over can preserve a
+            // stale transparent work buffer over the newly composed portrait.
+            blit_decoded_image_raw_copy(&mut destination_image, &source_image, x, y);
+        } else if alpha_parameter == 0
+            && mode == 1
+            && source_format == Some(2)
+            && destination_format == Some(2)
+        {
+            // sub_40B200: format-2 selector 1 stores straight-alpha RGB and
+            // normalizes channels by the resulting coverage.
+            blit_decoded_image_format2_source_over(
+                &mut destination_image,
+                &source_image,
+                x,
+                y,
+            );
+        } else if alpha_parameter == 0 {
+            blit_decoded_image(&mut destination_image, &source_image, x, y, mode);
+        } else {
+            blit_decoded_image_parameter(
+                &mut destination_image,
+                &source_image,
+                x,
+                y,
+                mode,
+                alpha_parameter,
+            );
+        }
+        self.store_graph_image(composite_key.clone(), destination_image);
         self.graph_resources.insert(
             destination,
             RuntimeGraphResource::whole(composite_key.clone()),
@@ -2614,101 +4965,36 @@ impl RuntimeTraceApi {
         Some(composite_key)
     }
 
-    fn render_graph_object_to_bitmap(&mut self, object: i32, destination: i32) -> bool {
-        let layers = self
-            .graph_target_layers(object)
-            .into_iter()
-            .filter_map(|layer_id| self.graph_layers.get(&layer_id).cloned())
-            .collect::<Vec<_>>();
-        if layers.is_empty() {
-            return false;
-        }
-
-        let destination_size = self
-            .graph_surfaces
-            .get(&destination)
-            .map(|surface| (surface.width as u32, surface.height as u32))
-            .or_else(|| {
-                self.resource_image_region(destination)
-                    .map(|(key, region)| {
-                        self.graph_images
-                            .get(key)
-                            .map(|image| {
-                                (
-                                    region.width.min(image.width as f32) as u32,
-                                    region.height.min(image.height as f32) as u32,
-                                )
-                            })
-                            .unwrap_or_default()
-                    })
-            })
-            .filter(|(width, height)| *width > 0 && *height > 0);
-        let Some((width, height)) = destination_size else {
-            return false;
-        };
-
-        let min_x = layers
-            .iter()
-            .map(|layer| layer.x)
-            .fold(f32::INFINITY, f32::min);
-        let min_y = layers
-            .iter()
-            .map(|layer| layer.y)
-            .fold(f32::INFINITY, f32::min);
-        let mut output = DecodedImage {
-            width,
-            height,
-            rgba: vec![0; width as usize * height as usize * 4],
-        };
-        let mut rendered = 0usize;
-        for layer in layers {
-            let Some(image) = self.graph_images.get(&layer.key) else {
-                continue;
-            };
-            let source = crop_decoded_image(
-                image,
-                RuntimeClipRect {
-                    x: layer.src_x,
-                    y: layer.src_y,
-                    width: layer.width,
-                    height: layer.height,
-                },
-            );
-            let x = (layer.x - min_x).round() as i32;
-            let y = (layer.y - min_y).round() as i32;
-            blit_decoded_image(&mut output, &source, x, y, 128);
-            rendered += 1;
-        }
-        if rendered == 0 {
-            return false;
-        }
-
-        let key = format!("runtime:render-target:{destination}");
-        self.store_graph_image(key.clone(), output);
-        self.graph_resources
-            .insert(destination, RuntimeGraphResource::whole(key));
-        if let Some(surface) = self.graph_surfaces.get_mut(&destination) {
-            surface.resource_id = Some(destination);
-        }
-        trace_graph!(
-            self,
-            "render object #{object} into bitmap #{destination} layers={rendered}"
-        );
-        true
-    }
-
     fn update_transition_node_image(&mut self, node: i32) -> Option<String> {
         let transition = *self.graph_transition_nodes.get(&node)?;
-        let (primary_key, primary_region) = self
-            .resource_image_region(transition.primary_resource)
-            .map(|(key, region)| (key.to_string(), region))?;
-        let (secondary_key, secondary_region) = self
-            .resource_image_region(transition.secondary_resource)
-            .map(|(key, region)| (key.to_string(), region))?;
-        let primary = crop_decoded_image(self.graph_images.get(&primary_key)?, primary_region);
-        let secondary =
-            crop_decoded_image(self.graph_images.get(&secondary_key)?, secondary_region);
-        let image = crossfade_decoded_images(&primary, &secondary, transition.alpha_parameter);
+        let primary = self.graph_bitmap_image(transition.primary_resource)?;
+        let secondary = self.graph_bitmap_image(transition.secondary_resource)?;
+        if (primary.width, primary.height) != (secondary.width, secondary.height) {
+            // CDspObjSprite::ConfigureMode1 (sub_4274A0) rejects mismatched
+            // bitmap dimensions with 0x80000003.  Clipping to the common
+            // rectangle can turn a character sprite into a tiny/empty layer
+            // and hides a real script/resource error.
+            tracing::warn!(
+                node,
+                primary = ?(primary.width, primary.height),
+                secondary = ?(secondary.width, secondary.height),
+                "sprite mode-1 source dimensions do not match"
+            );
+            return None;
+        }
+        if !matches!(transition.blend_selector, -1 | 0..=3)
+            && std::env::var_os("TRACE_REVERSE_GAPS").is_some()
+        {
+            tracing::warn!(
+                node,
+                transition_mode = transition.blend_selector,
+                "sprite mode-1 transition selector is outside the recovered SetAlpha cases"
+            );
+        }
+        // CDspObjSprite mode 1 stores the cross-fade control at +0x240
+        // (this[144]). The ordinary CDspObj alpha at +0xAC is a separate
+        // transparency gate applied after the two bitmaps are combined.
+        let image = crossfade_decoded_images(&primary, &secondary, transition.alpha_multiplier);
         let width = image.width as f32;
         let height = image.height as f32;
         let key = format!("runtime:transition:{node}");
@@ -2720,20 +5006,349 @@ impl RuntimeTraceApi {
             layer.src_x = 0.0;
             layer.src_y = 0.0;
         }
+        if self.graph_node_sources.contains_key(&node) {
+            self.graph_node_sources.insert(
+                node,
+                (
+                    key.clone(),
+                    RuntimeClipRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width,
+                        height,
+                    },
+                ),
+            );
+            self.refresh_graph_node_mask(node);
+        }
         Some(key)
     }
 
+    fn set_graph_object_alpha_one(&mut self, object: i32, alpha_parameter: i32) {
+        let alpha_parameter = alpha_parameter.clamp(0, 256);
+        if let Some(transition_mode) = self
+            .graph_transition_nodes
+            .get(&object)
+            .map(|transition| transition.blend_selector)
+        {
+            // CDspObjSprite::SetAlpha (sub_428380) treats mode-1 selector
+            // +0x244 separately from the base CDspObj transparency:
+            //   0,3,-1 -> base alpha only
+            //   1      -> transition value (+0x240) only
+            //   2      -> both
+            // other selectors return without modifying either field.
+            let update_base_alpha = matches!(transition_mode, -1 | 0 | 2 | 3);
+            let update_transition = matches!(transition_mode, 1 | 2);
+            if update_base_alpha {
+                self.graph_object_properties
+                    .entry(object)
+                    .or_default()
+                    .set_alpha_parameter(alpha_parameter);
+                if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
+                    transition.alpha_parameter = alpha_parameter;
+                }
+            }
+            let key = if update_transition {
+                if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
+                    transition.alpha_multiplier = alpha_parameter;
+                }
+                self.update_transition_node_image(object)
+            } else {
+                None
+            };
+            trace_graph!(
+                self,
+                "sprite mode1 #{object} SetAlpha={alpha_parameter} selector={transition_mode} rebuild={update_transition} key={key:?}"
+            );
+        } else {
+            self.graph_object_properties
+                .entry(object)
+                .or_default()
+                .set_alpha_parameter(alpha_parameter);
+            let _ = self.graph90_refresh_backf_primary(object);
+        }
+    }
+
+    /// `CDspObj::SetAlpha` (`sub_41B620`) stores the target transparency
+    /// parameter and invokes the same virtual setter on every current child.
+    pub(crate) fn set_graph_object_alpha_recursive(&mut self, object: i32, alpha_parameter: i32) {
+        if object == -1 {
+            return;
+        }
+        self.display_tree.register_inferred(object);
+        let objects = self.graph_native_descendants_inclusive(object);
+        for object in objects {
+            self.set_graph_object_alpha_one(object, alpha_parameter);
+        }
+    }
+
+    /// Raw `CDspObj::SetAlpha` propagation for native entry points that call
+    /// vtable +72 without a preceding range check. `sub_41B620` writes the
+    /// supplied DWORD verbatim before dispatching the same setter to children.
+    /// Renderer-facing paths may still clamp derived opacity, but the native
+    /// object state remains byte-for-byte faithful to the target setter.
+    pub(crate) fn set_graph_object_alpha_recursive_raw(
+        &mut self,
+        object: i32,
+        alpha_parameter: i32,
+    ) {
+        if object == -1 {
+            return;
+        }
+        self.display_tree.register_inferred(object);
+        let objects = self.graph_native_descendants_inclusive(object);
+        for object in objects {
+            if let Some(transition_mode) = self
+                .graph_transition_nodes
+                .get(&object)
+                .map(|transition| transition.blend_selector)
+            {
+                let update_base_alpha = matches!(transition_mode, -1 | 0 | 2 | 3);
+                let update_transition = matches!(transition_mode, 1 | 2);
+                if update_base_alpha {
+                    self.graph_object_properties
+                        .entry(object)
+                        .or_default()
+                        .set_alpha_parameter(alpha_parameter);
+                    if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
+                        transition.alpha_parameter = alpha_parameter;
+                    }
+                }
+                let key = if update_transition {
+                    if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
+                        transition.alpha_multiplier = alpha_parameter;
+                    }
+                    self.update_transition_node_image(object)
+                } else {
+                    None
+                };
+                trace_graph!(
+                    self,
+                    "sprite mode1 #{object} raw SetAlpha={alpha_parameter} selector={transition_mode} rebuild={update_transition} key={key:?}"
+                );
+            } else {
+                self.graph_object_properties
+                    .entry(object)
+                    .or_default()
+                    .set_alpha_parameter(alpha_parameter);
+                let _ = self.graph90_refresh_backf_primary(object);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn configure_transition_node(
+        &mut self,
+        node: i32,
+        x: i32,
+        y: i32,
+        primary_resource: i32,
+        secondary_resource: i32,
+        alpha_multiplier: i32,
+        alpha_parameter: i32,
+        render_priority: i32,
+        blend_selector: i32,
+    ) -> bool {
+        if node == -1 {
+            return false;
+        }
+        let transition = RuntimeGraphTransitionNode {
+            primary_resource,
+            secondary_resource,
+            alpha_multiplier,
+            alpha_parameter: alpha_parameter.clamp(0, 256),
+            render_priority,
+            blend_selector,
+        };
+        self.graph_transition_nodes.insert(node, transition);
+        let Some(key) = self.update_transition_node_image(node) else {
+            self.graph_transition_nodes.remove(&node);
+            return false;
+        };
+        let (width, height) = self
+            .graph_images
+            .get(&key)
+            .map(|image| (image.width as f32, image.height as f32))
+            .unwrap_or_default();
+        self.text_nodes.remove(&node);
+        // 90:58 configures the existing CDspObjSprite itself. It does not
+        // allocate a child/generic transition node under current_graph_object.
+        self.display_tree.register(node, NativeDisplayKind::Sprite);
+        self.display_tree.set_local_position(node, x as f32, y as f32);
+        self.display_tree.set_chain_depth(node, render_priority);
+        self.graph_object_layers.entry(node).or_default().insert(node);
+        self.graph_layers.insert(
+            node,
+            RuntimeGraphLayer {
+                hit_id: node,
+                owner_object: Some(node),
+                key,
+                target_surface: None,
+                x: x as f32,
+                y: y as f32,
+                width,
+                height,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: render_priority,
+                // 90:58 configures a real CDspObjSprite. Visibility belongs
+                // to CDspObj enabled/draw-enabled state, not the compatibility
+                // graph-node table used by generic transition nodes.
+                enabled: self.graph_object_enabled.get(&node).copied().unwrap_or(true),
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let layer_key = self
+            .graph_layers
+            .get(&node)
+            .map(|layer| layer.key.clone())
+            .unwrap_or_default();
+        self.record_graph_node_source(
+            node,
+            layer_key,
+            RuntimeClipRect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+            },
+        );
+        let has_text = self.configure_transition_bitmap_text_node(
+            node,
+            primary_resource,
+            secondary_resource,
+            transition.alpha_multiplier,
+            x as f32,
+            y as f32,
+            render_priority,
+            Some(node),
+        );
+        trace_graph!(
+            self,
+            "configure sprite mode1 #{node} primary=#{primary_resource} secondary=#{secondary_resource} alpha={} transition_value={} transition_mode={blend_selector} priority={render_priority} pos=({x},{y}) text={has_text}",
+            transition.alpha_parameter,
+            transition.alpha_multiplier,
+        );
+        true
+    }
+
+    fn sync_display_tree_from_runtime(&mut self) {
+        let object_handles = self
+            .graph_object_enabled
+            .keys()
+            .chain(self.graph_object_draw_enabled.keys())
+            .chain(self.graph_object_properties.keys())
+            .chain(self.graph_object_layers.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for handle in object_handles {
+            self.display_tree.register_inferred(handle);
+            let enabled = self
+                .graph_object_enabled
+                .get(&handle)
+                .copied()
+                .unwrap_or(true);
+            self.display_tree.set_enabled(handle, enabled);
+        }
+
+        let layers = self
+            .graph_layers
+            .iter()
+            .map(|(&handle, layer)| {
+                (
+                    handle,
+                    layer.owner_object,
+                    layer.enabled,
+                    layer.z.saturating_add(layer.transform_z),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (handle, owner, enabled, depth) in layers {
+            self.display_tree
+                .register(handle, NativeDisplayKind::Sprite);
+            self.display_tree.set_enabled(handle, enabled);
+            self.display_tree.set_chain_depth(handle, depth);
+            if let Some(owner) = owner.filter(|owner| *owner != handle) {
+                self.display_tree.register_inferred(owner);
+                let _ = self.display_tree.set_parent(handle, owner);
+            } else if owner.is_none() {
+                let _ = self.display_tree.set_parent(handle, 0);
+            }
+            // A real CDspObjSprite mode-1 layer uses the native Sprite handle
+            // for both the display object and its portable layer key.  Its
+            // `owner_object == handle` relation describes ownership only; it
+            // is not a native parent/child edge.  Do not attempt
+            // set_parent(handle, handle), and—more importantly—do not replace
+            // an existing target group parent when synchronizing that layer.
+        }
+
+        let surfaces = self
+            .graph_surfaces
+            .iter()
+            .map(|(&handle, surface)| {
+                (
+                    handle,
+                    surface.parent_surface,
+                    surface.local_x,
+                    surface.local_y,
+                    surface.x,
+                    surface.y,
+                    surface.enabled,
+                    surface.z,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (handle, parent, local_x, local_y, absolute_x, absolute_y, enabled, depth) in surfaces {
+            self.display_tree
+                .register(handle, NativeDisplayKind::Window);
+            let (tree_x, tree_y) = if parent.is_some() {
+                (local_x, local_y)
+            } else {
+                (absolute_x, absolute_y)
+            };
+            self.display_tree.set_local_position(handle, tree_x, tree_y);
+            self.display_tree.set_enabled(handle, enabled);
+            self.display_tree.set_chain_depth(handle, depth);
+            if let Some(parent) = parent {
+                self.display_tree.register_inferred(parent);
+                let _ = self.display_tree.set_parent(handle, parent);
+            } else {
+                let _ = self.display_tree.set_parent(handle, 0);
+            }
+        }
+
+        for (child, parent) in self.graph_links.relations() {
+            self.display_tree.register_inferred(child);
+            self.display_tree.register_inferred(parent);
+            let _ = self.display_tree.set_parent(child, parent);
+        }
+    }
+
     fn graph_handle_exists(&self, id: i32) -> bool {
-        id != 0
-            && (self.graph_resources.contains_key(&id)
-                || self.graph_bindings.contains_key(&id)
-                || self.graph_layers.contains_key(&id)
-                || self.graph_object_layers.contains_key(&id)
-                || self.graph_object_enabled.contains_key(&id)
-                || self.graph_surfaces.contains_key(&id)
-                || self.text_nodes.contains_key(&id)
-                || self.timelines.contains(id)
-                || self.user_controls.contains_key(&id))
+        // CDspObjBack is addressed by handle 0 in the native engine. Tagged
+        // object handles may have the sign bit set, so positivity is not a
+        // validity test.
+        self.display_tree.contains(id)
+            || self.graph_resources.contains_key(&id)
+            || self.graph_bindings.contains_key(&id)
+            || self.graph_layers.contains_key(&id)
+            || self.graph_object_layers.contains_key(&id)
+            || self.graph_object_enabled.contains_key(&id)
+            || self.graph_surfaces.contains_key(&id)
+            || self.text_nodes.contains_key(&id)
+            || self.graph_knob_states.contains_key(&id)
+            || self.graph_groups.contains_key(&id)
+            || self.graph91_effectors.contains_key(&id)
+            || self.graph91_landscapes.contains_key(&id)
+            || self.timelines.contains(id)
+            || self.user_controls.contains_key(&id)
     }
 
     fn ensure_transform_layer(&mut self, layer_id: i32, resource_id: i32) -> bool {
@@ -2753,6 +5368,8 @@ impl RuntimeTraceApi {
         } else {
             80
         };
+        self.display_tree
+            .register(layer_id, NativeDisplayKind::Sprite);
         self.graph_layers.insert(
             layer_id,
             RuntimeGraphLayer {
@@ -2796,6 +5413,9 @@ impl RuntimeTraceApi {
         }
         for layer_id in &title_layers {
             self.graph_layers.remove(layer_id);
+            self.display_tree.remove(*layer_id);
+            self.graph_node_sources.remove(layer_id);
+            self.graph_node_masks.remove(layer_id);
         }
         self.layer_animations.clear_layers(title_layers.iter());
         trace_graph!(self, "cleared {} title graph layers", title_layers.len());
@@ -2829,25 +5449,130 @@ impl RuntimeTraceApi {
 
     fn graph_draw_items(&self) -> Vec<RuntimeGraphDrawItem> {
         let mut items = Vec::new();
-        self.push_title_surface_composite(&mut items);
+        // Compatibility-only title items are added only when the target graph
+        // scripts have loaded resources but have not yet materialized matching
+        // display objects. Real graph layers remain authoritative.
+        self.push_title_compatibility_items(&mut items);
         self.push_surface_draw_items(&mut items);
         for (layer_id, layer) in &self.graph_layers {
             if !self.should_draw_graph_layer(*layer_id, layer) {
                 continue;
             }
-            let object_opacity = layer
+            let owner_background = layer
                 .owner_object
-                .filter(|object| *object != *layer_id)
                 .and_then(|object| self.graph_object_properties.get(&object))
-                .map(RuntimeGraphObjectProperties::opacity)
-                .unwrap_or(1.0);
-            let node_opacity = if self.graph_transition_nodes.contains_key(layer_id) {
+                .and_then(|properties| properties.background);
+            let backb_secondary = *layer_id == BACK_B_SECONDARY_LAYER_ID
+                && owner_background
+                    .is_some_and(|background| background.class == NativeBackgroundClass::BackB);
+            let backf_secondary = *layer_id == BACK_F_SECONDARY_LAYER_ID
+                && owner_background
+                    .is_some_and(|background| background.class == NativeBackgroundClass::BackF);
+            let object_opacity = if backb_secondary || backf_secondary {
                 1.0
             } else {
-                self.graph_object_properties
-                    .get(layer_id)
-                    .map(RuntimeGraphObjectProperties::opacity)
-                    .unwrap_or(1.0)
+                self.object_chain_opacity(layer.owner_object.filter(|object| *object != *layer_id))
+            };
+            let node_properties = self.graph_object_properties.get(layer_id);
+            let owner_properties = layer
+                .owner_object
+                .and_then(|object| self.graph_object_properties.get(&object));
+            let node_opacity = node_properties
+                .map(RuntimeGraphObjectProperties::opacity)
+                .unwrap_or(1.0);
+            let (blend_mode, node_opacity) = match owner_background {
+                Some(background) if background.class == NativeBackgroundClass::BackB => {
+                    if backb_secondary {
+                        (0x80, 1.0)
+                    } else {
+                        let mode = match background.secondary_resource_binding {
+                            Some(NativeBackgroundSecondaryResource::Sentinel(0x7000)) => 0xc0,
+                            Some(NativeBackgroundSecondaryResource::Sentinel(0x7001)) => 0xc1,
+                            _ => 0xf0,
+                        };
+                        (mode, node_opacity)
+                    }
+                }
+                Some(background) if background.class == NativeBackgroundClass::BackF => {
+                    if backf_secondary {
+                        // sub_41D590 copies a normal secondary bitmap first
+                        // with mode 128 and transparency 0. BackF's object
+                        // alpha applies only to the primary/masked pass.
+                        (0x80, 1.0)
+                    } else {
+                        let masked = background
+                            .backf
+                            .is_some_and(|backf| backf.mask_resource_binding.is_some());
+                        let sentinel = matches!(
+                            background.secondary_resource_binding,
+                            Some(NativeBackgroundSecondaryResource::Sentinel(_))
+                        );
+                        if masked {
+                            // Per-pixel target coverage already lives in the
+                            // generated primary alpha; do not multiply the
+                            // object's transparency a second time.
+                            (1, 1.0)
+                        } else if sentinel {
+                            let primary_format = background
+                                .resource_binding
+                                .and_then(|(handle, _)| self.bitmap_formats.get(&handle).copied())
+                                .unwrap_or(2);
+                            if primary_format == 1 {
+                                // Recovered format-1 C0/C1 RGB transformation
+                                // is baked into the generated opaque primary.
+                                (0x80, 1.0)
+                            } else {
+                                // Format 2 has separate alpha-aware C0/C1
+                                // routines. Retain their raw selector instead
+                                // of applying the format-1 pre-bake. The
+                                // renderer still treats these as unrecovered.
+                                let transparency = owner_properties
+                                    .map(RuntimeGraphObjectProperties::transparency_parameter)
+                                    .unwrap_or(0);
+                                let mode = match background.secondary_resource_binding {
+                                    Some(NativeBackgroundSecondaryResource::Sentinel(0x7001)) => 0xc1,
+                                    Some(NativeBackgroundSecondaryResource::Sentinel(0x7000)) => 0xc0,
+                                    Some(NativeBackgroundSecondaryResource::Sentinel(-1 | 0x7fff))
+                                        if transparency != 0 =>
+                                    {
+                                        0xc0
+                                    }
+                                    _ => 0x80,
+                                };
+                                (mode, node_opacity)
+                            }
+                        } else {
+                            // Target BackF uses selector 1 here. Only the
+                            // format-1 -> format-1 branch reaches sub_40B4B0,
+                            // whose constant interpolation is represented by
+                            // the renderer's 0xF0 path. Mixed/format-2 paths
+                            // dispatch to sub_40B5D0/40B6F0/40B9B0 instead, so
+                            // retain raw selector 1 there rather than applying
+                            // the format-1 formula to the wrong pixel layout.
+                            let primary_format = background
+                                .resource_binding
+                                .and_then(|(handle, _)| self.bitmap_formats.get(&handle).copied());
+                            let secondary_format = match background.secondary_resource_binding {
+                                Some(NativeBackgroundSecondaryResource::Bitmap { handle, .. }) => {
+                                    self.bitmap_formats.get(&handle).copied()
+                                }
+                                _ => None,
+                            };
+                            if primary_format == Some(1) && secondary_format == Some(1) {
+                                (0xf0, node_opacity)
+                            } else {
+                                (1, node_opacity)
+                            }
+                        }
+                    }
+                }
+                _ => (
+                    node_properties
+                        .or(owner_properties)
+                        .map(|properties| properties.blend_mode)
+                        .unwrap_or(128),
+                    node_opacity,
+                ),
             };
             let opacity = layer.opacity * node_opacity * object_opacity;
             let opacity = layer
@@ -2855,7 +5580,7 @@ impl RuntimeTraceApi {
                 .map(|surface| self.surface_display_opacity(surface))
                 .unwrap_or(1.0)
                 * opacity;
-            if !layer.enabled || opacity <= 0.001 {
+            if opacity <= 0.001 {
                 continue;
             }
             if layer.target_surface.is_some_and(|surface| {
@@ -2866,7 +5591,7 @@ impl RuntimeTraceApi {
                 continue;
             }
             let draw_key = self
-                .message_control_layer_draw_key(layer)
+                .message_control_layer_draw_key(*layer_id, layer)
                 .unwrap_or(layer.key.as_str());
             let Some(image) = self.graph_images.get(draw_key) else {
                 continue;
@@ -2874,29 +5599,47 @@ impl RuntimeTraceApi {
             if layer.width <= 0.0 || layer.height <= 0.0 {
                 continue;
             }
-            let width = (layer.width * layer.scale_x)
-                .abs()
-                .min(image.width as f32 * layer.scale_x.abs().max(1.0));
-            let height = (layer.height * layer.scale_y)
-                .abs()
-                .min(image.height as f32 * layer.scale_y.abs().max(1.0));
             let src_x = layer.src_x.clamp(0.0, image.width.saturating_sub(1) as f32);
             let src_y = layer
                 .src_y
                 .clamp(0.0, image.height.saturating_sub(1) as f32);
-            let src_width = width.min(image.width as f32 - src_x).max(0.0);
-            let src_height = height.min(image.height as f32 - src_y).max(0.0);
+            // Source crop and destination scale are independent in the
+            // target blitters.  `layer.width/height` are the unscaled source
+            // extent; applying scale before deriving src_width/src_height
+            // cropped sprites for scale < 1 instead of shrinking them.
+            let src_width = layer.width.min(image.width as f32 - src_x).max(0.0);
+            let src_height = layer.height.min(image.height as f32 - src_y).max(0.0);
             if src_width <= 0.0 || src_height <= 0.0 {
                 continue;
             }
+            let width = (src_width * layer.scale_x).abs();
+            let height = (src_height * layer.scale_y).abs();
+            if width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            let (x, y, mut z) = self.layer_world_transform(*layer_id, layer);
+            let mut order_serial = self.display_order_serial(*layer_id, layer.owner_object);
+            if self.surface_controls.contains_layer(*layer_id) {
+                if let Some(surface) = layer
+                    .target_surface
+                    .and_then(|surface| self.graph_surfaces.get(&surface))
+                {
+                    // Target window controls are rendered by the window's
+                    // private CObjectManager and then the window enters the
+                    // global display chain as one object. Flatten that nested
+                    // composition without leaking local depths into global z.
+                    z = self.display_tree.effective_depth(surface.id, surface.z);
+                    order_serial = self
+                        .display_order_serial(surface.id, None)
+                        .saturating_add(1)
+                        .saturating_add(layer.z.max(0) as u64);
+                }
+            }
             items.push(RuntimeGraphDrawItem {
+                owner_object: layer.owner_object.or(Some(*layer_id)),
                 key: draw_key.to_string(),
-                x: layer.screen_x(&self.graph_surfaces)
-                    + layer.transform_x
-                    + self.graph_global_offset.0,
-                y: layer.screen_y(&self.graph_surfaces)
-                    + layer.transform_y
-                    + self.graph_global_offset.1,
+                x,
+                y,
                 width,
                 height,
                 src_x,
@@ -2905,23 +5648,158 @@ impl RuntimeTraceApi {
                 src_height,
                 opacity,
                 rotation_degrees: layer.rotation_degrees,
-                clip: layer.clip,
-                z: layer.screen_z(),
+                clip: self.layer_display_clip(layer),
+                z,
+                blend_mode,
+                order_serial,
                 hit_id: layer.hit_id,
             });
         }
+        for rain in self.effects.rain_draw_instances() {
+            let Some((key, region)) = self.resource_image_region(rain.resource_id) else {
+                continue;
+            };
+            let Some(image) = self.graph_images.get(key) else {
+                continue;
+            };
+            let src_x = region.x.clamp(0.0, image.width.saturating_sub(1) as f32);
+            let src_y = region.y.clamp(0.0, image.height.saturating_sub(1) as f32);
+            let src_width = rain
+                .width
+                .min(region.width)
+                .min(image.width as f32 - src_x)
+                .max(0.0);
+            let src_height = rain
+                .height
+                .min(region.height)
+                .min(image.height as f32 - src_y)
+                .max(0.0);
+            if src_width <= 0.0 || src_height <= 0.0 || rain.opacity <= 0.001 {
+                continue;
+            }
+            items.push(RuntimeGraphDrawItem {
+                owner_object: None,
+                key: key.to_string(),
+                x: rain.x + self.screen_shake_offset.0,
+                y: rain.y + self.screen_shake_offset.1,
+                width: rain.width,
+                height: rain.height,
+                src_x,
+                src_y,
+                src_width,
+                src_height,
+                opacity: rain.opacity,
+                rotation_degrees: 0.0,
+                clip: None,
+                z: rain.z,
+                blend_mode: rain.blend_mode,
+                order_serial: rain.order_serial,
+                hit_id: 0,
+            });
+        }
         // Native CObjectManager inserts equal-depth objects after existing
-        // entries, then consumes the display chain back-to-front.
+        // entries. Preserve that chain order; the old reversed order is only
+        // available through ETHORNELL_LEGACY_REVERSE_EQUAL_DEPTH.
         items.sort_by_key(native_draw_order);
         items
     }
 
+    fn graph_output_draw_items(&self) -> Vec<RuntimeGraphDrawItem> {
+        let raw = self
+            .graph_draw_items()
+            .into_iter()
+            .filter(|item| {
+                let Some(owner) = item.owner_object else {
+                    return true;
+                };
+                let Some(background) = self
+                    .graph_object_properties
+                    .get(&owner)
+                    .and_then(|properties| properties.background)
+                else {
+                    return true;
+                };
+                if !matches!(
+                    background.class,
+                    NativeBackgroundClass::BackN
+                        | NativeBackgroundClass::BackB
+                        | NativeBackgroundClass::BackS
+                        | NativeBackgroundClass::BackF
+                ) {
+                    return true;
+                }
+                background.resources_are_current(|handle| {
+                    self.graph_resources
+                        .get(&handle)
+                        .map(|resource| resource.generation)
+                })
+            })
+            .collect::<Vec<_>>();
+        // `sub_442850 -> sub_430570` passes 1024 to CObjectManager, but
+        // reverse inspection of the manager shows that value is stored at
+        // +0x44 and used to size its internal priority/index workspace.  The
+        // priority sampled during drawing is the independent +0x48 field
+        // (`sub_430D20`, consumed by `sub_431550`).  Therefore the former
+        // portable rule "every z < 1024 is a backing object" was not a native
+        // display-domain split.
+        //
+        // That approximation was mostly hidden while the GUI renderer sorted
+        // every command by raw z.  Once the renderer began preserving this
+        // function's order to keep projected standing sprites visible, it
+        // moved *all* low-priority scene images in front of BackF.  BackF is
+        // itself the native compositor used for background/image transitions,
+        // so those images then appeared immediately instead of remaining
+        // underneath the fading BackF image.
+        //
+        // Preserve ordinary CObjectManager priority order.  The only recovered
+        // exception needed by the target scene here is the projected Sprite
+        // path (modes 5/6): these objects have their own rasterized geometry
+        // and must remain on the foreground side of BackF even when their raw
+        // CDspObj priority is numerically lower (the standing portrait path is
+        // mode 5 at priority 267).  Restrict the reorder to that class instead
+        // of treating every low-priority object as equivalent.
+        let Some(backf_index) = raw.iter().rposition(|item| {
+            item.owner_object.is_some_and(|owner| {
+                self.display_tree.kind(owner) == Some(NativeDisplayKind::BackF)
+            })
+        }) else {
+            return raw;
+        };
+        let backf_z = raw[backf_index].z;
+        let mut foreground_projected = Vec::new();
+        let mut output = Vec::with_capacity(raw.len());
+        let mut output_backf_index = None;
+        for (index, item) in raw.into_iter().enumerate() {
+            let projected_sprite_before_backf = index < backf_index
+                && item.z < backf_z
+                && item.owner_object.is_some_and(|owner| {
+                    self.graph_object_properties
+                        .get(&owner)
+                        .and_then(|properties| {
+                            properties.named_properties.get("target-object-mode")
+                        })
+                        .is_some_and(|mode| matches!(*mode, 5 | 6))
+                });
+            if projected_sprite_before_backf {
+                foreground_projected.push(item);
+                continue;
+            }
+            if index == backf_index {
+                output_backf_index = Some(output.len());
+            }
+            output.push(item);
+        }
+        if let Some(index) = output_backf_index {
+            output.splice(index + 1..index + 1, foreground_projected);
+        } else {
+            output.extend(foreground_projected);
+        }
+        output
+    }
+
     fn push_surface_draw_items(&self, items: &mut Vec<RuntimeGraphDrawItem>) {
         for surface in self.graph_surfaces.values() {
-            let flattened_input_surface = self.surface_has_active_input(surface.id);
-            if !surface.display_attached
-                || (!self.has_title_child_render_context() && !flattened_input_surface)
-                || !self.surface_display_chain_visible(surface.id, surface)
+            if !surface.display_attached || !self.surface_display_chain_visible(surface.id, surface)
             {
                 continue;
             }
@@ -2931,12 +5809,12 @@ impl RuntimeTraceApi {
             let Some((key, region)) = self.resource_image_region(resource_id) else {
                 continue;
             };
-            if is_title_layer(key) {
-                continue;
-            }
-            if key.starts_with("sysgrp.arc:SGMsgWnd") {
-                continue;
-            }
+            // Native message-window surfaces are ordinary display objects.
+            // Do not suppress SGMsgWnd resources here: the old compatibility
+            // renderer used the resource prefix to avoid drawing its own
+            // synthetic fallback twice, but that also discarded the real
+            // window/background created by sysprg. Synthetic fallback message
+            // chrome lives in dedicated graph-layer ids and is gated there.
             let viewport_x = surface.viewport_x.max(0.0);
             let viewport_y = surface.viewport_y.max(0.0);
             let width = surface
@@ -2950,102 +5828,155 @@ impl RuntimeTraceApi {
             if width <= 0.0 || height <= 0.0 {
                 continue;
             }
+            let (x, y) = self.surface_world_position(surface.id);
+            let properties = self.graph_object_properties.get(&surface.id);
+            let blend_mode = properties
+                .map(|properties| properties.blend_mode)
+                .unwrap_or(128);
             items.push(RuntimeGraphDrawItem {
+                owner_object: Some(surface.id),
                 key: key.to_string(),
-                x: surface.x,
-                y: surface.y,
+                x,
+                y,
                 width,
                 height,
                 src_x: region.x + viewport_x,
                 src_y: region.y + viewport_y,
                 src_width: width,
                 src_height: height,
-                opacity: surface.opacity,
+                opacity: self.surface_display_opacity(surface.id),
                 rotation_degrees: 0.0,
-                clip: None,
-                z: surface.z,
+                clip: self.surface_chain_clip(surface.id),
+                z: self.display_tree.effective_depth(surface.id, surface.z),
+                blend_mode,
+                order_serial: self.display_order_serial(surface.id, None),
                 hit_id: 0,
             });
         }
     }
 
-    fn surface_has_active_input(&self, surface: i32) -> bool {
-        self.surface_controls.layer_count(surface) != 0
-            && self.graph_input_objects.iter().any(|(&object, input)| {
-                input.layer == surface
-                    && !input.descriptor.regions.is_empty()
-                    && self
-                        .graph_object_enabled
-                        .get(&object)
-                        .copied()
-                        .unwrap_or(true)
-            })
-    }
-
-    fn surface_display_chain_visible(&self, surface: i32, record: &RuntimeSurface) -> bool {
-        (record.enabled || self.surface_has_active_input(surface))
-            && self.surface_display_opacity(surface) > 0.001
+    fn surface_display_chain_visible(&self, surface: i32, _record: &RuntimeSurface) -> bool {
+        let mut current = Some(surface);
+        let mut visited = BTreeSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                return false;
+            }
+            if self
+                .graph_object_properties
+                .get(&id)
+                .is_some_and(|properties| properties.native.suppress_draw != 0)
+            {
+                return false;
+            }
+            let Some(record) = self.graph_surfaces.get(&id) else {
+                break;
+            };
+            if !record.enabled || !self.display_tree.chain_drawable(id) {
+                return false;
+            }
+            current = record.parent_surface;
+        }
+        self.surface_display_opacity(surface) > 0.001
     }
 
     fn surface_display_opacity(&self, surface: i32) -> f32 {
-        let mut opacity = 1.0;
+        let mut opacity = self
+            .graph_object_properties
+            .get(&surface)
+            .map(RuntimeGraphObjectProperties::opacity)
+            .unwrap_or(1.0);
         let mut current = Some(surface);
-        let mut depth = 0;
+        let mut visited = BTreeSet::new();
         while let Some(id) = current {
+            if !visited.insert(id) {
+                return 0.0;
+            }
             let Some(record) = self.graph_surfaces.get(&id) else {
                 break;
             };
             opacity *= record.opacity;
             current = record.parent_surface;
-            depth += 1;
-            if depth >= 32 {
-                break;
-            }
         }
         opacity.clamp(0.0, 1.0)
     }
 
     fn should_draw_graph_layer(&self, layer_id: i32, layer: &RuntimeGraphLayer) -> bool {
+        if !layer.enabled || !self.object_enabled_for_layer(layer.owner_object) {
+            return false;
+        }
+        // A materialized DCIPIcon child is still governed by its owning
+        // CDspObjWindow. Target sub_42AD30 delegates IsEnabled to the parent;
+        // merely configuring Graph91:BA must never resurrect preloaded child
+        // textures while the Window is disabled or fully transparent.
+        if layer.target_surface.is_some_and(|surface| {
+            self.graph_surfaces
+                .get(&surface)
+                .is_none_or(|record| !self.surface_display_chain_visible(surface, record))
+        }) {
+            return false;
+        }
+        let display_handle = layer.owner_object.unwrap_or(layer_id);
+        if !self.graph_native_owners.contains_key(&display_handle)
+            && !self.display_tree.chain_drawable(display_handle)
+        {
+            return false;
+        }
         let key = layer.key.as_str();
         if self.title_ui_departed && is_title_layer(key) {
             return false;
         }
-        if self.has_title_child_render_context() && is_title_layer(key) {
-            return false;
-        }
-        if is_title_layer(key) && !is_title_base_layer(key) && layer.target_surface.is_none() {
-            return false;
-        }
-        if self.title_ui_active
-            && !self.title_child_program_active
-            && !self.has_title_child_render_context()
-            && !is_title_layer(key)
-        {
-            return false;
-        }
-        if is_message_control_layer(key) {
+        // Only the portable fallback controls are governed by the synthetic
+        // message-control state machine.  Native DCIPIcon child Sprites can use
+        // the same SGMsgWnd000xxx resources, and key-name matching must never
+        // hide them merely because they are not one of the compatibility
+        // layers.
+        let synthetic_message_control = is_message_control_layer(key)
+            && !self.surface_controls.contains_layer(layer_id)
+            && self.user_controls.get(&layer.hit_id).is_some_and(|control| {
+                control.owner_id == text::MESSAGE_CONTROL_OWNER_ID
+            });
+        if synthetic_message_control {
             return !self.has_native_fullscreen_modal()
                 && self.should_draw_message_control_layer(layer);
         }
-        if key == "sysgrp.arc:SGMsgWnd800000" {
-            return !self.has_native_fullscreen_modal()
-                && layer_id == text::MESSAGE_WINDOW_LAYER_ID
-                && self.has_active_message_window();
+        // SGMsgWnd800000/700000 are also legitimate native resources. Only
+        // apply compatibility message-window visibility policy to the two
+        // synthetic fallback layer ids; a native Sprite/Window using the same
+        // bitmap name must pass through the normal CDspObj visibility chain.
+        if layer_id == text::MESSAGE_WINDOW_LAYER_ID && key == "sysgrp.arc:SGMsgWnd800000" {
+            return !self.has_native_fullscreen_modal() && self.has_active_message_window();
         }
-        if key == "sysgrp.arc:SGMsgWnd700000" {
-            return !self.has_native_fullscreen_modal()
-                && layer_id == text::MESSAGE_NAME_WINDOW_LAYER_ID
-                && self.has_active_message_window();
+        if layer_id == text::MESSAGE_NAME_WINDOW_LAYER_ID && key == "sysgrp.arc:SGMsgWnd700000" {
+            return !self.has_native_fullscreen_modal() && self.has_active_message_window();
         }
-        if !self.title_ui_active && !self.scenario_bootstrapped && is_boot_suppressed_layer(key) {
+        if !self.surface_controls.contains_layer(layer_id)
+            && !self.title_ui_active
+            && !self.scenario_bootstrapped
+            && is_boot_suppressed_layer(key)
+        {
             return false;
         }
         true
     }
 
     fn should_draw_text_node(&self, node: &RuntimeTextNode) -> bool {
-        if !node.enabled || !node.screen_attached || node.text.is_empty() {
+        if !node.enabled
+            || !self.object_enabled_for_layer(node.owner_object)
+            || (!node.screen_attached && node.target_surface.is_none())
+            || node.text.is_empty()
+        {
             return false;
+        }
+        if node.target_surface.is_some_and(|surface| {
+            self.graph_surfaces
+                .get(&surface)
+                .is_none_or(|record| !self.surface_display_chain_visible(surface, record))
+        }) {
+            return false;
+        }
+        if node.target_surface.is_some() {
+            return true;
         }
         if node.z == MESSAGE_TEXT_Z || node.z == MESSAGE_NAME_TEXT_Z {
             return !self.has_native_fullscreen_modal() && self.has_active_message_window();
@@ -3056,7 +5987,7 @@ impl RuntimeTraceApi {
         true
     }
 
-    fn push_title_surface_composite(&self, items: &mut Vec<RuntimeGraphDrawItem>) {
+    fn push_title_compatibility_items(&self, items: &mut Vec<RuntimeGraphDrawItem>) {
         if !self.title_ui_active || self.title_ui_departed {
             return;
         }
@@ -3064,6 +5995,30 @@ impl RuntimeTraceApi {
             return;
         }
         let child_context = self.has_title_child_render_context();
+        // The 99xxxx title assets and RuntimeUserControl buttons are an old
+        // bring-up fallback. They must never be composited on top of a real
+        // title CDspObjWindow/DCIPIcon scene. In the target the captured window
+        // backing and its private CObjectManager are the single authoritative
+        // title composition. Keeping the fallback active creates a second,
+        // independent full-screen/button state machine whose hover/click state
+        // can disagree with DCIPIcon and can expose the renderer's black clear
+        // between two different title compositions.
+        let has_native_title_scene = self.graph_input_objects.values().any(|input| {
+            self.surface_controls.layer_count(input.layer) != 0
+                && self.graph_surfaces.get(&input.layer).is_some_and(|surface| {
+                    surface.resource_id.is_some()
+                        && self.surface_display_chain_visible(input.layer, surface)
+                })
+        });
+        if has_native_title_scene {
+            return;
+        }
+        let native_title_layers = self
+            .graph_layers
+            .values()
+            .filter(|layer| layer.enabled && layer.opacity > 0.001)
+            .map(|layer| layer.key.as_str())
+            .collect::<BTreeSet<_>>();
         let title_surface_z = self
             .graph_layers
             .values()
@@ -3081,10 +6036,14 @@ impl RuntimeTraceApi {
             ("sysgrp.arc:SGTitle990200", 1),
             ("sysgrp.arc:SGTitle990300", title_surface_z + 1),
         ] {
+            if native_title_layers.contains(key) {
+                continue;
+            }
             let Some(image) = self.graph_images.get(key) else {
                 continue;
             };
             items.push(RuntimeGraphDrawItem {
+                owner_object: None,
                 key: key.to_string(),
                 x: 0.0,
                 y: 0.0,
@@ -3098,20 +6057,12 @@ impl RuntimeTraceApi {
                 rotation_degrees: 0.0,
                 clip: None,
                 z,
+                blend_mode: 128,
+                order_serial: z.max(0) as u64,
                 hit_id: 0,
             });
         }
         if child_context {
-            return;
-        }
-        let has_native_control_layers = self.graph_layers.values().any(|layer| {
-            layer.target_surface.is_some()
-                && layer.enabled
-                && layer.opacity > 0.001
-                && is_title_layer(&layer.key)
-                && !is_title_base_layer(&layer.key)
-        });
-        if has_native_control_layers {
             return;
         }
         let hovered_title_control = self.mouse_pos.and_then(|point| {
@@ -3160,6 +6111,7 @@ impl RuntimeTraceApi {
                 continue;
             };
             items.push(RuntimeGraphDrawItem {
+                owner_object: Some(control.owner_id),
                 key,
                 x: draw_x,
                 y: draw_y,
@@ -3173,6 +6125,8 @@ impl RuntimeTraceApi {
                 rotation_degrees: 0.0,
                 clip: None,
                 z: 4,
+                blend_mode: 1,
+                order_serial: self.display_order_serial(control.id, Some(control.owner_id)),
                 hit_id: control.id,
             });
         }
@@ -3186,14 +6140,28 @@ impl RuntimeTraceApi {
         if !debug_trace::frame_selected(frame, frame_selector.as_deref()) {
             return;
         }
-        let draw_items = self.graph_draw_items();
+        let draw_items = self.graph_output_draw_items();
         let full_trace = std::env::var("TRACE_RENDER_TREE")
             .is_ok_and(|value| value.eq_ignore_ascii_case("full"));
         if full_trace {
             for (id, layer) in &self.graph_layers {
-                let draw = self.should_draw_graph_layer(*id, layer)
-                    && layer.enabled
-                    && layer.opacity > 0.001;
+                let draw = self.should_draw_graph_layer(*id, layer) && layer.opacity > 0.001;
+                let display_handle = layer.owner_object.unwrap_or(*id);
+                let display_kind = self.display_tree.kind(display_handle);
+                let display_parent = self.display_tree.parent(display_handle);
+                let (world_x, world_y, world_z) = self.layer_world_transform(*id, layer);
+                let blend_mode = self
+                    .graph_object_properties
+                    .get(id)
+                    .or_else(|| {
+                        layer
+                            .owner_object
+                            .and_then(|owner| self.graph_object_properties.get(&owner))
+                    })
+                    .map(|properties| properties.blend_mode)
+                    .unwrap_or(128);
+                let clip = self.layer_display_clip(layer);
+                let order_serial = self.display_order_serial(*id, layer.owner_object);
                 tracing::info!(
                     target: "graph_tree",
                     frame,
@@ -3201,6 +6169,9 @@ impl RuntimeTraceApi {
                     hit_id = layer.hit_id,
                     owner = ?layer.owner_object,
                     parent = ?layer.target_surface,
+                    display_handle,
+                    display_kind = ?display_kind,
+                    display_parent = ?display_parent,
                     key = layer.key,
                     x = layer.x,
                     y = layer.y,
@@ -3210,7 +6181,14 @@ impl RuntimeTraceApi {
                     src_y = layer.src_y,
                     opacity = layer.opacity,
                     z = layer.z,
-                    enabled = layer.enabled,
+                    world_x,
+                    world_y,
+                    world_z,
+                    blend_mode,
+                    order_serial,
+                    clip = ?clip,
+                    node_enabled = layer.enabled,
+                    object_enabled = self.object_enabled_for_layer(layer.owner_object),
                     draw,
                     "render layer"
                 );
@@ -3232,7 +6210,30 @@ impl RuntimeTraceApi {
                     src_height = item.src_height,
                     opacity = item.opacity,
                     z = item.z,
+                    blend_mode = item.blend_mode,
+                    order_serial = item.order_serial,
+                    clip = ?item.clip,
                     "render draw item"
+                );
+            }
+            for (id, node) in &self.text_nodes {
+                tracing::info!(
+                    target: "graph_tree",
+                    frame,
+                    text_node = *id,
+                    owner = ?node.owner_object,
+                    target_surface = ?node.target_surface,
+                    screen_attached = node.screen_attached,
+                    node_enabled = node.enabled,
+                    object_enabled = self.object_enabled_for_layer(node.owner_object),
+                    draw = self.should_draw_text_node(node),
+                    x = node.x,
+                    y = node.y,
+                    size = node.size,
+                    color = ?node.color,
+                    z = node.z,
+                    text = ?node.text.chars().take(96).collect::<String>(),
+                    "render text node"
                 );
             }
         }
@@ -3275,6 +6276,29 @@ impl RuntimeTraceApi {
                 )
             })
             .collect::<Vec<_>>();
+        let scene_layer_preview = self
+            .graph_layers
+            .iter()
+            .filter(|(id, layer)| layer.z < 900 && self.should_draw_graph_layer(**id, layer))
+            .take(12)
+            .map(|(id, layer)| {
+                let surface = layer
+                    .target_surface
+                    .and_then(|surface| self.graph_surfaces.get(&surface))
+                    .map(|surface| (surface.id, surface.x, surface.y));
+                format!(
+                    "#{id} base=({:.1},{:.1}) transform=({:.1},{:.1},{}) surface={surface:?} global=({:.1},{:.1}) key={}",
+                    layer.x,
+                    layer.y,
+                    layer.transform_x,
+                    layer.transform_y,
+                    layer.transform_z,
+                    self.graph_global_offset.0,
+                    self.graph_global_offset.1,
+                    layer.key
+                )
+            })
+            .collect::<Vec<_>>();
         let layer_relation_preview = self
             .graph_layers
             .iter()
@@ -3290,13 +6314,23 @@ impl RuntimeTraceApi {
         let text_preview = self
             .text_nodes
             .iter()
-            .filter(|(_, node)| self.should_draw_text_node(node))
-            .take(8)
+            .take(12)
             .map(|(id, node)| {
                 let text = node.text.chars().take(48).collect::<String>();
                 format!(
-                    "#{id} ({:.1},{:.1}) size={:.1} {:?}",
-                    node.x, node.y, node.size, text
+                    "#{id} draw={} enabled={} screen={} owner={:?} surface={:?} z={} \
+                     ({:.1},{:.1}) size={:.1} rgba={:?} {:?}",
+                    self.should_draw_text_node(node),
+                    node.enabled,
+                    node.screen_attached,
+                    node.owner_object,
+                    node.target_surface,
+                    node.z,
+                    node.x,
+                    node.y,
+                    node.size,
+                    node.color,
+                    text
                 )
             })
             .collect::<Vec<_>>();
@@ -3363,6 +6397,7 @@ impl RuntimeTraceApi {
             vm_trace_tail = ?report.map(|report| report.recent_trace.iter().rev().take(8).cloned().collect::<Vec<_>>()),
             ?draw_preview,
             ?scene_draw_preview,
+            ?scene_layer_preview,
             ?layer_relation_preview,
             ?text_preview,
             ?surface_preview,
@@ -3378,17 +6413,102 @@ impl RuntimeTraceApi {
             self.hit_test_user_controls(point)
         };
         user_hit.or_else(|| {
-            self.graph_draw_items().into_iter().rev().find_map(|item| {
-                if item.hit_id == 0 {
-                    return None;
-                }
-                let inside = point.0 >= item.x
-                    && point.0 < item.x + item.width
-                    && point.1 >= item.y
-                    && point.1 < item.y + item.height;
-                inside.then_some(item.hit_id)
-            })
+            self.graph_output_draw_items()
+                .into_iter()
+                .rev()
+                .find_map(|item| {
+                    if item.hit_id == 0 {
+                        return None;
+                    }
+                    let inside_bounds = point.0 >= item.x
+                        && point.0 < item.x + item.width
+                        && point.1 >= item.y
+                        && point.1 < item.y + item.height;
+                    let inside_clip = item.clip.is_none_or(|clip| {
+                        !clip.is_empty()
+                            && point.0 >= clip.x
+                            && point.0 < clip.x + clip.width
+                            && point.1 >= clip.y
+                            && point.1 < clip.y + clip.height
+                    });
+                    (inside_bounds && inside_clip).then_some(item.hit_id)
+                })
         })
+    }
+    fn configure_cursor_motion(
+        &mut self,
+        cancel_on_large_move: i32,
+        updates_per_second: i32,
+        duration_ms: i32,
+        interpolation_mode: i32,
+        target_y: i32,
+        target_x: i32,
+    ) {
+        if self.pending_window_minimize {
+            self.cursor_motion = None;
+            return;
+        }
+        let start = self
+            .mouse_pos
+            .map(|(x, y)| (x.round() as i32, y.round() as i32))
+            .unwrap_or_default();
+        self.cursor_motion = Some(RuntimeCursorMotion::new(
+            start,
+            (target_x, target_y),
+            duration_ms.max(0) as u32,
+            updates_per_second.max(0) as u32,
+            interpolation_mode,
+            cancel_on_large_move != 0,
+        ));
+        tracing::debug!(
+            ?start,
+            target_x,
+            target_y,
+            duration_ms,
+            updates_per_second,
+            interpolation_mode,
+            cancel_on_large_move,
+            "configured target cursor motion"
+        );
+    }
+
+    fn tick_cursor_motion(&mut self, elapsed_ms: u32) {
+        let Some(mut motion) = self.cursor_motion.take() else {
+            return;
+        };
+        motion.elapsed_ms = motion.elapsed_ms.saturating_add(elapsed_ms);
+        while motion.step < motion.steps && motion.elapsed_ms >= motion.next_step_ms {
+            if motion.cancel_on_large_move {
+                let current = self
+                    .mouse_pos
+                    .map(|(x, y)| (x.round() as i32, y.round() as i32))
+                    .unwrap_or(motion.last_generated);
+                let tolerance_x =
+                    cursor_motion_scale_tolerance(self.screen_width, self.window_surface_width);
+                let tolerance_y =
+                    cursor_motion_scale_tolerance(self.screen_height, self.window_surface_height);
+                let dx = (current.0 - motion.last_generated.0).unsigned_abs();
+                let dy = (current.1 - motion.last_generated.1).unsigned_abs();
+                if dx > tolerance_x || dy > tolerance_y {
+                    tracing::debug!(?current, last = ?motion.last_generated, "cancelled target cursor motion after external displacement");
+                    return;
+                }
+            }
+            motion.step = motion.step.saturating_add(1);
+            let point = motion.point_for_step(motion.step);
+            motion.last_generated = point;
+            self.mouse_pos = Some((point.0 as f32, point.1 as f32));
+            self.pending_cursor_position = self.mouse_pos;
+            if motion.step >= motion.steps {
+                tracing::debug!(?point, "completed target cursor motion");
+                return;
+            }
+            motion.next_step_ms = motion
+                .duration_ms
+                .saturating_mul(motion.step.saturating_add(1))
+                / motion.steps;
+        }
+        self.cursor_motion = Some(motion);
     }
 }
 
@@ -3397,43 +6517,34 @@ struct RuntimeEngine {
     api: RuntimeTraceApi,
     options: ethornell_vm::VmRunOptions,
     last_report: Option<ethornell_vm::VmRunReport>,
-    tick_remainder_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RuntimeFramePacing {
-    vm_slices_per_frame: usize,
-    bootstrap_vm_slices_per_frame: usize,
-    continue_after_yield: bool,
-}
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimeFramePacing;
 
 impl RuntimeFramePacing {
     fn from_env() -> Self {
-        Self {
-            vm_slices_per_frame: std::env::var("ETHORNELL_VM_SLICES_PER_FRAME")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(1),
-            bootstrap_vm_slices_per_frame: std::env::var("ETHORNELL_VM_BOOTSTRAP_SLICES_PER_FRAME")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(1),
-            continue_after_yield: std::env::var("ETHORNELL_VM_CONTINUE_AFTER_YIELD")
-                .ok()
-                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-                .unwrap_or(false),
+        for obsolete in [
+            "ETHORNELL_VM_SLICES_PER_FRAME",
+            "ETHORNELL_VM_BOOTSTRAP_SLICES_PER_FRAME",
+            "ETHORNELL_VM_MAX_STEP_CHUNKS_PER_FRAME",
+            "ETHORNELL_VM_CONTINUE_AFTER_YIELD",
+        ] {
+            if std::env::var_os(obsolete).is_some() {
+                tracing::warn!(
+                    variable = obsolete,
+                    "legacy VM pacing override ignored; the cooperative scheduler executes one pass per native tick"
+                );
+            }
         }
+        Self
     }
 }
 
 struct RuntimeFrameReport {
     last_report: Option<ethornell_vm::VmRunReport>,
     total_steps: usize,
-    slices_this_frame: usize,
-    continue_setup_yield: bool,
-    continue_input_yield: bool,
+    scheduler_passes: usize,
 }
 
 #[derive(Clone)]
@@ -3447,94 +6558,131 @@ impl RuntimeEngine {
         script: &str,
         bytes: &[u8],
         manager: ResourceManager,
+        native_root: PathBuf,
         trace: bool,
         fail_on_stub: bool,
+        native_dialog_presentation: bool,
     ) -> Self {
         let program = ethornell_script::parse_bp_program(Some(script.to_string()), bytes);
         let mut vm = ethornell_vm::Vm::new();
         vm.start(&program);
         Self {
             vm,
-            api: RuntimeTraceApi::new(manager),
+            api: {
+                let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
+                api.native_dialog_presentation = native_dialog_presentation;
+                api
+            },
             options: ethornell_vm::VmRunOptions {
-                max_steps: parse_usize_env("ETHORNELL_VM_MAX_STEPS").unwrap_or(250_000),
+                max_steps: parse_usize_env("ETHORNELL_VM_MAX_STEPS")
+                    .unwrap_or(ethornell_vm::DEFAULT_COOPERATIVE_WATCHDOG_STEPS),
                 trace,
                 fail_on_stub,
                 collect_diagnostics: trace || fail_on_stub,
             },
             last_report: None,
-            tick_remainder_ms: 0,
         }
     }
 
-    fn begin_frame(&mut self, elapsed_ms: u64) {
-        let elapsed_ms = elapsed_ms.min(250);
+    fn begin_native_pass(&mut self, elapsed_ms: u64) {
+        // The target main loop executes one cooperative scheduler pass per host
+        // iteration. Time-based native procedures sample the pause-adjusted
+        // millisecond clock; a delayed GUI frame must therefore advance time
+        // once, not replay several synthetic 16 ms VM frames.
         self.vm.advance_time_ms(elapsed_ms);
-        self.api.advance_audio_clocks(elapsed_ms);
-        self.tick_remainder_ms = self.tick_remainder_ms.saturating_add(elapsed_ms);
-        let native_ticks = self.tick_remainder_ms / 16;
-        self.tick_remainder_ms %= 16;
-        for _ in 0..native_ticks {
-            self.api.tick_timelines();
-            self.api.tick_text();
-            self.api.tick_scenario();
-            self.api.maybe_auto_click_title();
-            self.api.maybe_auto_click_user();
-        }
+        self.api.engine_time_ms = self.api.engine_time_ms.saturating_add(elapsed_ms);
+        self.api.advance_cursor_idle(elapsed_ms);
+        self.api
+            .tick_cursor_motion(elapsed_ms.min(u64::from(u32::MAX)) as u32);
+        self.api.tick_timelines(elapsed_ms);
+        self.api.tick_text(elapsed_ms);
+        self.api.tick_scenario();
+        self.api.maybe_auto_click_title();
+        self.api.maybe_auto_click_user();
     }
 
     fn tick_vm(&mut self) -> ethornell_vm::VmRunReport {
-        if self.api.animation_queue_remaining > 0 {
-            if let Some(mut report) = self.last_report.clone() {
-                report.steps = 0;
-                report.stop_reason = ethornell_vm::VmStopReason::WaitingForAnimation;
-                return report;
-            }
-        }
+        // Do not freeze the entire interpreter merely because a display object
+        // is animating. Native CProcedure state blocks only the calling BP
+        // thread; unrelated asynchronous threads and scheduler work continue.
+        // `Vm::run_loaded` already polls the pending native procedure.
         let report = self.vm.run_loaded(&mut self.api, &self.options);
+        self.api
+            .observe_running_program_for_title(report.program.as_str());
         self.last_report = Some(report.clone());
         report
     }
 
-    fn run_frame(&mut self, pacing: RuntimeFramePacing, elapsed_ms: u64) -> RuntimeFrameReport {
-        self.begin_frame(elapsed_ms);
-        let mut last_report = None;
-        let mut total_steps = 0usize;
-        let mut last_continue_setup_yield = false;
-        let mut last_continue_input_yield = false;
-        let slices_this_frame = if self.api.should_continue_vm_after_yield() {
-            pacing.bootstrap_vm_slices_per_frame
-        } else {
-            pacing.vm_slices_per_frame
-        };
-        for _ in 0..slices_this_frame {
-            let report = self.tick_vm();
-            total_steps += report.steps;
-            let yielded = report.stop_reason == ethornell_vm::VmStopReason::WaitingForAnimation;
-            let continue_setup_yield = self.api.should_continue_vm_after_yield();
-            let continue_input_yield = self.api.should_continue_input_yield();
-            last_continue_setup_yield = continue_setup_yield;
-            last_continue_input_yield = continue_input_yield;
-            last_report = Some(report);
-            if yielded
-                && !pacing.continue_after_yield
-                && !continue_setup_yield
-                && !continue_input_yield
-            {
-                break;
-            }
-            if !yielded {
-                break;
-            }
+    fn run_native_pass(
+        &mut self,
+        _pacing: RuntimeFramePacing,
+        elapsed_ms: u64,
+    ) -> RuntimeFrameReport {
+        self.begin_native_pass(elapsed_ms);
+
+        // `sub_48CD70` handles native status 3 by selecting the requested
+        // CThread immediately in the same scheduler pass. Re-enter `run_loaded`
+        // without advancing native time so a root-thread SwitchThread does not
+        // acquire an artificial 16 ms delay. Child-to-child switches are
+        // followed inside `pump_async_programs`.
+        let mut report = self.tick_vm();
+        let mut total_steps = report.steps;
+        let mut scheduler_passes = 1usize;
+        const MAX_ROOT_SWITCH_HOPS_PER_TICK: usize = 256;
+        while report.stop_reason == ethornell_vm::VmStopReason::SwitchedThread
+            && scheduler_passes < MAX_ROOT_SWITCH_HOPS_PER_TICK
+        {
+            report = self.tick_vm();
+            total_steps = total_steps.saturating_add(report.steps);
+            scheduler_passes = scheduler_passes.saturating_add(1);
         }
-        self.api.finish_frame_input();
+        if scheduler_passes == MAX_ROOT_SWITCH_HOPS_PER_TICK
+            && report.stop_reason == ethornell_vm::VmStopReason::SwitchedThread
+        {
+            tracing::warn!(
+                scheduler_passes,
+                "portable root-thread switch safety cap reached in one native tick"
+            );
+        }
+        if report.stop_reason == ethornell_vm::VmStopReason::WatchdogExceeded {
+            tracing::warn!(
+                program = %report.program,
+                pc = report.pc,
+                offset = ?report.offset,
+                steps = report.steps,
+                "VM host watchdog ended this scheduler pass"
+            );
+        }
         RuntimeFrameReport {
-            last_report,
+            last_report: Some(report),
             total_steps,
-            slices_this_frame,
-            continue_setup_yield: last_continue_setup_yield,
-            continue_input_yield: last_continue_input_yield,
+            scheduler_passes,
         }
+    }
+
+    fn run_frame(
+        &mut self,
+        pacing: RuntimeFramePacing,
+        elapsed_ms: u64,
+        audio_elapsed_ms: u64,
+    ) -> RuntimeFrameReport {
+        // Audio clocks follow host elapsed time. Engine time has already been
+        // normalized by the frontend to match the target's >500 ms pause-gap
+        // rule. Do not replay missed VM frames after a delayed redraw.
+        self.api.advance_audio_clocks(audio_elapsed_ms.min(500));
+        if self.api.native_user.has_blocking_message() {
+            return RuntimeFrameReport {
+                last_report: self.last_report.clone(),
+                total_steps: 0,
+                scheduler_passes: 0,
+            };
+        }
+
+        let report = self.run_native_pass(pacing, elapsed_ms);
+        // Input edges are visible for one cooperative main-loop pass.
+        self.api.finish_native_tick_input();
+        self.api.sync_display_tree_from_runtime();
+        report
     }
 }
 
@@ -3565,14 +6713,6 @@ fn parse_env_point(x_key: &str, y_key: &str) -> Option<(f32, f32)> {
     let x = std::env::var(x_key).ok()?.parse().ok()?;
     let y = std::env::var(y_key).ok()?.parse().ok()?;
     Some((x, y))
-}
-
-fn graph_motion_coord(raw: i32) -> f32 {
-    if raw.unsigned_abs() >= 32_768 {
-        fixed_16_to_f32(raw)
-    } else {
-        raw as f32
-    }
 }
 
 fn input_descriptor_for_keycode(code: KeyCode) -> Option<i32> {
@@ -3631,14 +6771,223 @@ fn input_class_state_for_descriptor(
     }
 }
 
+fn query_runtime_input_event_bits(
+    api: &mut RuntimeTraceApi,
+    scope: i32,
+    consume: bool,
+    scope_is_packed: bool,
+) -> i32 {
+    let packed = if scope_is_packed {
+        scope
+    } else {
+        scope.wrapping_shl(16) | 0xffff
+    };
+    // `scope_is_packed` describes only the ABI representation of `scope`.
+    // Target sub_46DF00 still checks the packed scope through
+    // sub_46D810/sub_46D830 before collecting keyboard/class or pointer
+    // events. Treating an already-packed CProcDspMsg scope as automatically
+    // registered lets messages observe input owned by another processor.
+    let keyboard_registered = api
+        .registered_keyboard_input_scopes
+        .top_scope()
+        .is_none_or(|top| packed as u32 >= top);
+    let pointer_registered = api
+        .registered_pointer_input_scopes
+        .top_scope()
+        .is_some_and(|top| packed as u32 == top);
+    let is_pointer = api.pending_input_descriptor == Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
+    let mut result = 0_i32;
+    if keyboard_registered && api.input_configuration_enabled != 0 {
+        for &class_mask in input_state::TARGET_EVENT_CLASS_MASKS {
+            let descriptors = api
+                .configured_input_classes
+                .get(&class_mask)
+                .cloned()
+                .unwrap_or_default();
+            if descriptors
+                .into_iter()
+                .any(|descriptor| drain_native_input_descriptor(api, descriptor) != 0)
+            {
+                result |= class_mask;
+            }
+        }
+    }
+    if pointer_registered && api.input_configuration_enabled != 0 {
+        for (descriptor, bit) in [(1, 1), (2, 2), (4, 4), (5, 0x10), (6, 0x20)] {
+            if drain_native_input_descriptor(api, descriptor) != 0 {
+                result |= bit;
+            }
+        }
+    }
+    if keyboard_registered && ethornell_vm::SysApi::query_configured_input_gate(api) != 0 {
+        result |= i32::MIN;
+    }
+    if consume && result != 0 {
+        let was_animating = api.text_runtime.is_animating();
+        api.pending_input_consumed = true;
+        if was_animating && is_pointer {
+            api.suppress_message_mouse_release = true;
+        }
+    }
+    if api.pending_input_state.is_some() || std::env::var_os("TRACE_INPUT_WAIT").is_some() {
+        tracing::debug!(
+            scope,
+            packed = format_args!("0x{packed:08X}"),
+            master_gate = api.input_master_gate,
+            configuration_enabled = api.input_configuration_enabled,
+            latched_state = api.input_latched_state,
+            keyboard_registered,
+            pointer_registered,
+            active_descriptor = ?api.pending_input_descriptor,
+            pending_state = ?api.pending_input_state.map(|value| format!("0x{value:08X}")),
+            result = format_args!("0x{result:08X}"),
+            "runtime input event bits queried"
+        );
+    }
+    result
+}
+
+fn native_bitmap_clear_color(color: i32) -> [u8; 4] {
+    let value = color as u32;
+    [
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+        ((value >> 24) & 0xff) as u8,
+    ]
+}
+
 #[cfg(test)]
 mod input_tests {
+    use super::graph::{RuntimeGraphLayer, RuntimeGraphResource, RuntimeSurface};
+    use super::text::{ruby_draw_runs, RuntimeTextNode};
+    use super::text_anim::RuntimeRubySpan;
     use super::{
-        input_class_state_for_descriptor, input_state_for_descriptor, INPUT_DESCRIPTOR_DOWN,
-        INPUT_DESCRIPTOR_ENTER, INPUT_DESCRIPTOR_LEFT, INPUT_DESCRIPTOR_MOUSE_LEFT,
-        INPUT_DESCRIPTOR_RIGHT, INPUT_DESCRIPTOR_UP,
+        input_class_state_for_descriptor, input_state_for_descriptor, DecodedImage,
+        BACK_F_SECONDARY_LAYER_ID,
+        INPUT_DESCRIPTOR_DOWN, INPUT_DESCRIPTOR_ENTER, INPUT_DESCRIPTOR_LEFT,
+        INPUT_DESCRIPTOR_MOUSE_LEFT, INPUT_DESCRIPTOR_RIGHT, INPUT_DESCRIPTOR_UP,
+        NATIVE_SCREEN_BITMAP,
     };
-    use ethornell_vm::{GraphApi, SoundApi, SysApi, Value};
+    use ethornell_vm::{
+        GraphApi, GraphIconRecord, GraphInputDescriptor, GraphInputGroup, GraphInputRegion, SysApi,
+        Value,
+    };
+
+    fn test_call_frame(
+        group: u8,
+        id: u16,
+        stack: &mut Vec<Value>,
+    ) -> ethornell_vm::NativeCallFrame {
+        ethornell_vm::NativeCallFrame::new(
+            ethornell_vm::NativeOpcode { group, id },
+            std::mem::take(stack),
+        )
+    }
+
+    fn call_sys(
+        api: &mut super::RuntimeTraceApi,
+        group: u8,
+        id: u16,
+        stack: &mut Vec<Value>,
+    ) -> ethornell_vm::VmResult<Value> {
+        let mut call = test_call_frame(group, id, stack);
+        let result = ethornell_vm::SysApi::call_sys(api, &mut call);
+        *stack = call.into_args();
+        result
+    }
+
+    fn call_graph(
+        api: &mut super::RuntimeTraceApi,
+        group: u8,
+        id: u16,
+        stack: &mut Vec<Value>,
+    ) -> ethornell_vm::VmResult<Value> {
+        let mut call = test_call_frame(group, id, stack);
+        let result = ethornell_vm::GraphApi::call_graph(api, &mut call);
+        *stack = call.into_args();
+        result
+    }
+
+    fn call_sound(
+        api: &mut super::RuntimeTraceApi,
+        group: u8,
+        id: u16,
+        stack: &mut Vec<Value>,
+    ) -> ethornell_vm::VmResult<Value> {
+        let mut call = test_call_frame(group, id, stack);
+        let result = ethornell_vm::SoundApi::call_sound(api, &mut call);
+        *stack = call.into_args();
+        result
+    }
+
+    fn call_user(
+        api: &mut super::RuntimeTraceApi,
+        group: u8,
+        id: u16,
+        stack: &mut Vec<Value>,
+    ) -> ethornell_vm::VmResult<Option<Value>> {
+        let mut call = test_call_frame(group, id, stack);
+        let result = ethornell_vm::SoundApi::call_user(api, &mut call);
+        *stack = call.into_args();
+        result
+    }
+
+    #[test]
+    fn recovered_native_registry_is_structurally_complete_without_host_side_effects() {
+        let mut recovered = 0usize;
+        for group in ethornell_script::calls::DISPATCH_GROUPS {
+            for id in 0..=u8::MAX {
+                let id = u16::from(id);
+                if ethornell_script::native_abi::lookup(group, id).is_none() {
+                    continue;
+                }
+                recovered += 1;
+                assert!(ethornell_script::candidate_call_name(group, id).is_some());
+                if ethornell_vm::native_ownership::owns_before_host_dispatch(group, id) {
+                    assert!(ethornell_script::native_abi::lookup(group, id).is_some());
+                }
+            }
+        }
+        assert_eq!(recovered, 695);
+    }
+
+    #[test]
+    fn title_composite_remains_present_across_frames() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.title_ui_active = true;
+        api.title_ui_resources_loaded = true;
+
+        for key in [
+            "sysgrp.arc:SGTitle990000",
+            "sysgrp.arc:SGTitle990200",
+            "sysgrp.arc:SGTitle990300",
+        ] {
+            api.graph_images.insert(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 255, 255, 255],
+                },
+            );
+        }
+
+        for draw_items in [api.graph_draw_items(), api.graph_draw_items()] {
+            for key in [
+                "sysgrp.arc:SGTitle990000",
+                "sysgrp.arc:SGTitle990200",
+                "sysgrp.arc:SGTitle990300",
+            ] {
+                assert!(
+                    draw_items.iter().any(|item| item.key.as_str() == key),
+                    "title resource {key} disappeared from a subsequent frame"
+                );
+            }
+        }
+    }
 
     #[test]
     fn mouse_input_does_not_activate_keyboard_or_system_classes() {
@@ -3693,6 +7042,4321 @@ mod input_tests {
     }
 
     #[test]
+    fn native_input_edge_is_consumed_only_once_per_tick() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+
+        assert_eq!(
+            SysApi::read_input_state(&mut api, INPUT_DESCRIPTOR_ENTER),
+            0x1000_0002
+        );
+        assert_eq!(
+            SysApi::read_input_state(&mut api, INPUT_DESCRIPTOR_ENTER),
+            0,
+            "the same edge must not satisfy a second wait in the same native tick"
+        );
+
+        api.finish_native_tick_input();
+        assert_eq!(api.pending_input_state, None);
+        assert_eq!(api.pending_input_descriptor, None);
+        assert!(!api.pending_input_consumed);
+    }
+
+    #[test]
+    fn input_message_serial_tracks_host_events_not_diagnostics() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.call_coverage_enabled = true;
+        api.call_coverage.insert((0x80, 0x13), 99);
+
+        assert_eq!(SysApi::input_message_serial(&mut api), 0);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseMove { x: 10.0, y: 20.0 },
+        );
+        assert_eq!(SysApi::input_message_serial(&mut api), 1);
+    }
+
+    #[test]
+    fn configured_input_gates_produce_only_the_target_high_bit() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        SysApi::set_input_master_gate(&mut api, 1);
+        SysApi::set_input_latched_state(&mut api, 1);
+
+        assert_eq!(
+            SysApi::query_input_event_bits(&mut api, 1808),
+            i32::MIN,
+            "sub_46DF00 adds bit 31 when sub_46DE30 accepts both configured gates"
+        );
+        assert!(
+            api.pending_input_consumed,
+            "sub_46DE30 drains the configured descriptor event through sub_46DB40"
+        );
+
+        SysApi::set_input_latched_state(&mut api, 0);
+        assert_eq!(SysApi::query_input_event_bits(&mut api, 1808), 0);
+    }
+
+    #[test]
+    fn registered_input_class_descriptors_drive_event_and_level_queries() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        SysApi::register_input_class_descriptors(&mut api, 0x100, &[INPUT_DESCRIPTOR_ENTER]);
+        SysApi::register_input_scope(&mut api, 1808);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+
+        assert_eq!(SysApi::query_input_event_bits(&mut api, 1808), 0x100);
+        assert!(api.pending_input_consumed);
+        api.finish_native_tick_input();
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+        assert_eq!(
+            SysApi::query_input_descriptor_state(&mut api, 0x100),
+            1,
+            "sub_46DA80 does not increment +0x0C for a repeated press while the key is down"
+        );
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyRelease {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+        assert_eq!(SysApi::query_input_descriptor_state(&mut api, 0x100), 2);
+        assert!(!api.pending_input_consumed);
+        SysApi::query_and_unregister_input_scope(&mut api, 1808);
+        let packed = 1808i32.wrapping_shl(16) | 0xffff;
+        assert!(!api.registered_keyboard_input_scopes.contains(&packed));
+        assert!(!api.registered_pointer_input_scopes.contains(&packed));
+    }
+
+    #[test]
+    fn input_accumulator_is_independent_from_the_consumed_event_counter() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+
+        assert_eq!(
+            SysApi::peek_input_state(&mut api, INPUT_DESCRIPTOR_ENTER),
+            1
+        );
+        assert_eq!(SysApi::query_input_descriptor_state(&mut api, 0x100), 1);
+        assert_eq!(SysApi::query_input_event_bits(&mut api, 1808), 0x100);
+        assert_eq!(SysApi::query_input_event_bits(&mut api, 1808), 0);
+        assert_eq!(
+            SysApi::peek_input_state(&mut api, INPUT_DESCRIPTOR_ENTER),
+            1
+        );
+        assert_eq!(SysApi::query_input_descriptor_state(&mut api, 0x100), 1);
+    }
+
+    #[test]
+    fn registering_input_scope_runs_the_target_discarded_stateful_query() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+
+        SysApi::register_input_scope(&mut api, 1808);
+
+        assert_eq!(
+            SysApi::query_input_event_bits(&mut api, 1808),
+            0,
+            "sub_488110 discards the result, but sub_46DF00 still drains +0x08 and sets +0x04"
+        );
+        assert_eq!(
+            SysApi::peek_input_state(&mut api, INPUT_DESCRIPTOR_ENTER),
+            1,
+            "the discarded query must preserve sub_46DC70's +0x0C accumulator"
+        );
+        assert_eq!(SysApi::query_input_descriptor_state(&mut api, 0x100), 1);
+    }
+
+    #[test]
+    fn reset_input_configuration_preserves_target_non_consuming_accumulator() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+
+        SysApi::reset_input_configuration(&mut api, 0);
+
+        assert_eq!(api.input_configuration_enabled, 0);
+        assert!(api.input_event_counts.is_empty());
+        assert!(api.input_down_descriptors.is_empty());
+        assert_eq!(
+            SysApi::peek_input_state(&mut api, INPUT_DESCRIPTOR_ENTER),
+            1
+        );
+        assert_eq!(SysApi::query_input_event_bits(&mut api, 1808), 0);
+    }
+
+    #[test]
+    fn resetting_message_surface_preserves_script_glyph_delay() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.graph_defaults.text_animation.glyph_delay_ms = 39;
+
+        assert_eq!(api.start_native_message("abc".to_string(), None), 117);
+        api.reset_native_message_text();
+        assert_eq!(api.start_native_message("ab".to_string(), None), 78);
+        api.tick_text(38);
+        assert_eq!(api.text_runtime.visible_chars, 0);
+        api.tick_text(1);
+        assert_eq!(api.text_runtime.visible_chars, 1);
+    }
+
+    #[test]
+    fn ordinary_input_queries_do_not_reveal_native_message_text() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.graph_defaults.text_animation.glyph_delay_ms = 39;
+        api.start_native_message("message procedure owns reveal".to_string(), None);
+        assert!(GraphApi::native_message_is_animating(&api));
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+        assert_ne!(SysApi::query_input_event_bits(&mut api, -1), 0);
+        assert!(
+            GraphApi::native_message_is_animating(&api),
+            "Sys input queries must not reveal text; CProcDspMsg owns progression"
+        );
+    }
+
+    #[test]
+    fn native_message_uses_window_local_text_without_compatibility_ui() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = api.alloc_window_surface(320, 96).unwrap();
+        api.surface_text_states.entry(window).or_default().cursor_x = 12;
+        api.surface_text_states.entry(window).or_default().cursor_y = 7;
+        api.native_message_surface_target = Some(window);
+
+        api.start_native_message("window-local text".to_string(), Some(window));
+
+        let node_id = api
+            .text_nodes
+            .iter()
+            .find_map(|(&id, node)| (node.target_surface == Some(window)).then_some(id))
+            .expect("native message text must target the CDspObjWindow");
+        api.text_nodes
+            .get_mut(&node_id)
+            .expect("native message node")
+            .text = "revealed text".into();
+        let node = &api.text_nodes[&node_id];
+        assert_eq!((node.x, node.y), (12.0, 7.0));
+        assert!(!node.screen_attached);
+        assert!(api.should_draw_text_node(node));
+        assert!(!api
+            .graph_layers
+            .contains_key(&super::text::MESSAGE_WINDOW_LAYER_ID));
+        assert!(!api
+            .user_controls
+            .values()
+            .any(|control| control.owner_id == super::text::MESSAGE_CONTROL_OWNER_ID));
+    }
+
+    #[test]
+    fn input_class_poll_and_direct_poll_share_one_consumption_token() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        SysApi::register_input_scope(&mut api, 0);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 100.0, y: 100.0 },
+        );
+
+        assert_eq!(SysApi::query_input_event_bits(&mut api, 0), 0x1);
+        assert_eq!(
+            SysApi::read_input_state(&mut api, INPUT_DESCRIPTOR_MOUSE_LEFT),
+            0,
+            "a second native input API must not replay an already consumed edge"
+        );
+    }
+
+    #[test]
+    fn unconsumed_input_edge_expires_at_the_native_tick_boundary() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER,
+            },
+        );
+
+        api.finish_native_tick_input();
+
+        assert_eq!(
+            SysApi::read_input_state(&mut api, INPUT_DESCRIPTOR_ENTER),
+            0,
+            "a delayed redraw must not carry one physical edge into later owed ticks"
+        );
+    }
+
+    #[test]
+    fn base_object_and_sprite_visibility_are_independent_native_states() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let object = 100;
+        let node = 200;
+        api.scenario_bootstrapped = true;
+        api.current_graph_object = Some(object);
+        api.graph_object_enabled.insert(object, true);
+        api.graph_object_layers
+            .entry(object)
+            .or_default()
+            .insert(node);
+        api.graph_layers.insert(
+            node,
+            RuntimeGraphLayer {
+                hit_id: node,
+                owner_object: Some(object),
+                key: "test".into(),
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        api.text_nodes.insert(
+            node,
+            RuntimeTextNode {
+                text: "visible".into(),
+                enabled: true,
+                owner_object: Some(object),
+                screen_attached: true,
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                size: 20.0,
+                line_height: 26.0,
+                formatted_layout: false,
+                color: [1.0; 4],
+                z: 0,
+                ruby_spans: Vec::new(),
+                style_spans: Vec::new(),
+            },
+        );
+
+        let mut object_off = vec![Value::Int(object), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x31, &mut object_off).unwrap();
+        assert!(api.graph_layers[&node].enabled);
+        assert!(!api.should_draw_graph_layer(node, &api.graph_layers[&node]));
+        assert!(!api.should_draw_text_node(&api.text_nodes[&node]));
+
+        let mut create_sprite = Vec::new();
+        let Value::Int(sprite) = call_graph(&mut api, 0x90, 0x50, &mut create_sprite).unwrap()
+        else {
+            panic!("sprite creation did not return a handle");
+        };
+        assert_eq!(sprite as u32, 0x8000_0000);
+        let mut sprite_off = vec![Value::Int(sprite), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x54, &mut sprite_off).unwrap();
+        let mut object_on = vec![Value::Int(object), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x31, &mut object_on).unwrap();
+        assert_eq!(api.graph_object_enabled.get(&object), Some(&true));
+        assert_eq!(api.graph_object_enabled.get(&sprite), Some(&false));
+        assert!(api.graph_layers[&node].enabled);
+        assert!(api.should_draw_graph_layer(node, &api.graph_layers[&node]));
+        assert!(api.should_draw_text_node(&api.text_nodes[&node]));
+    }
+
+    #[test]
+    fn sprite_constructor_sort_index_is_monotonic_across_slot_reuse() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let first = match call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        assert_eq!(first as u32, 0x8000_0000);
+        assert_eq!(api.graph_object_properties[&first].native.sort_class, 2);
+        assert_eq!(api.graph_object_properties[&first].native.sort_index, 0);
+
+        let mut release = vec![Value::Int(first)];
+        call_graph(&mut api, 0x90, 0x51, &mut release).unwrap();
+        let second = match call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        // The public slot is reused, while dword_56674C[536] in the target
+        // continues increasing and is passed to CDspObj+0x20.
+        assert_eq!(second, first);
+        assert_eq!(api.graph_object_properties[&second].native.sort_index, 1);
+    }
+
+    #[test]
+    fn graph90_38_sort_bias_reorders_the_gui_display_chain() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let first = match call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected first sprite handle {value:?}"),
+        };
+        let second = match call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected second sprite handle {value:?}"),
+        };
+        assert!(api.display_tree.chain_position(first) < api.display_tree.chain_position(second));
+
+        // sub_4438B0 samples vtable+0x1C around the property virtual. A
+        // positive +0x24 bias moves the first equal-priority Sprite after the
+        // second in CObjectManager, which is the order consumed by GUI draw
+        // items through display_order_serial().
+        let mut bias = vec![
+            Value::Int(first),
+            Value::Int(0x8100),
+            Value::Int(4),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x90, 0x38, &mut bias).unwrap();
+        assert_eq!(api.graph_object_properties[&first].native.sort_bias, 4);
+        assert!(api.display_tree.chain_position(second) < api.display_tree.chain_position(first));
+    }
+
+    #[test]
+    fn sys90_base_object_setters_update_target_layout_and_display_chain() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let object = 0x8000_0042_u32 as i32;
+        api.set_current_graph_object(object);
+
+        let mut draw = vec![Value::Int(object), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x30, &mut draw).unwrap();
+        let mut enabled = vec![Value::Int(object), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x31, &mut enabled).unwrap();
+        let mut position = vec![Value::Int(object), Value::Int(123), Value::Int(456)];
+        call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
+        let mut mask = vec![Value::Int(object), Value::Int(64)];
+        call_graph(&mut api, 0x90, 0x34, &mut mask).unwrap();
+        let mut fixed = vec![Value::Int(object), Value::Int(7)];
+        call_graph(&mut api, 0x90, 0x35, &mut fixed).unwrap();
+        let mut secondary = vec![Value::Int(object), Value::Int(11), Value::Int(12)];
+        call_graph(&mut api, 0x90, 0x36, &mut secondary).unwrap();
+        let mut primary = vec![Value::Int(object), Value::Int(21), Value::Int(22)];
+        call_graph(&mut api, 0x90, 0x37, &mut primary).unwrap();
+        let mut multiplier = vec![Value::Int(object), Value::Int(192)];
+        call_graph(&mut api, 0x90, 0x39, &mut multiplier).unwrap();
+        let mut priority = vec![Value::Int(object), Value::Int(0x1234)];
+        call_graph(&mut api, 0x90, 0x3a, &mut priority).unwrap();
+
+        let native = api.graph_object_properties[&object].native;
+        assert_eq!(native.draw_enabled, 0);
+        assert_eq!(native.enabled, 0);
+        assert_eq!((native.position_x, native.position_y), (123, 456));
+        assert_eq!(native.mask_alpha, 64);
+        assert_eq!(native.fixed_parameter_16_16, 7 << 16);
+        assert_eq!(
+            (native.secondary_offset_x, native.secondary_offset_y),
+            (11, 12)
+        );
+        assert_eq!((native.primary_offset_x, native.primary_offset_y), (21, 22));
+        assert_eq!(native.alpha_multiplier, 192);
+        assert_eq!(native.priority, 0x1234);
+        assert_eq!(api.display_tree.chain_position(object), Some(1));
+    }
+
+    #[test]
+    fn sys90_global_policy_raster_and_font_contracts_use_recovered_fields() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let mut redraw_policy = vec![Value::Int(1), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x0a, &mut redraw_policy).unwrap();
+        let mut bitmap = vec![Value::Int(77)];
+        call_graph(&mut api, 0x90, 0x0b, &mut bitmap).unwrap();
+        let mut raster = vec![Value::Int(3)];
+        call_graph(&mut api, 0x90, 0x0d, &mut raster).unwrap();
+        let mut font = vec![
+            Value::Int(9),
+            Value::Int(28),
+            Value::Int(125),
+            Value::Int(1),
+            Value::Int(4),
+        ];
+        call_graph(&mut api, 0x90, 0x0e, &mut font).unwrap();
+        let mut unblend = vec![Value::Int(0x0012_3456)];
+        call_graph(&mut api, 0x90, 0x0f, &mut unblend).unwrap();
+
+        assert!(api.graph_object_update_redraw_enabled);
+        assert!(api.graph_object_update_redraw_full);
+        assert_eq!(api.primary_bitmap, Some(77));
+        assert_eq!(api.graph_raster_format_mode, 3);
+        assert_eq!(api.graph_raster_layout, (8, 4, 16));
+        assert_eq!(api.graph_bitmap_unblend_color, 0x0012_3456);
+        assert_eq!(api.graph_config.fonts.len(), 1);
+        let font = &api.graph_config.fonts[0];
+        assert_eq!(
+            (
+                font.font_name_id,
+                font.height,
+                font.weight_percent,
+                font.font_id
+            ),
+            (9, 28, 125, 4)
+        );
+        assert!(font.italic);
+    }
+
+    #[test]
+    fn sys90_pointer_hit_test_is_not_object_existence_and_extension_is_error() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let object = 100;
+        let layer = 200;
+        api.set_current_graph_object(object);
+        api.graph_object_layers
+            .entry(object)
+            .or_default()
+            .insert(layer);
+        api.graph_layers.insert(
+            layer,
+            RuntimeGraphLayer {
+                hit_id: 0x55,
+                owner_object: Some(object),
+                key: "hit".into(),
+                target_surface: None,
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 40.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        api.mouse_pos = Some((15.0, 25.0));
+        let mut hit = vec![Value::Int(object)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0x3d, &mut hit).unwrap(),
+            Value::Int(0x55)
+        );
+
+        let mut unsupported = vec![Value::Int(object)];
+        assert!(call_graph(&mut api, 0x90, 0x3f, &mut unsupported).is_err());
+    }
+
+    #[test]
+    fn native_filter_release_removes_owned_state() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let Value::Int(filter) = call_graph(&mut api, 0x90, 0x60, &mut Vec::new()).unwrap() else {
+            panic!("filter creation did not return a handle");
+        };
+        assert_eq!(filter as u32, 0x9000_0000);
+        assert!(api.graph_object_enabled.contains_key(&filter));
+        assert!(api.graph_object_properties.contains_key(&filter));
+        assert!(api.display_tree.contains(filter));
+
+        let mut release = vec![Value::Int(filter)];
+        call_graph(&mut api, 0x90, 0x61, &mut release).unwrap();
+
+        assert!(release.is_empty());
+        assert!(!api.graph_object_enabled.contains_key(&filter));
+        assert!(!api.graph_object_properties.contains_key(&filter));
+        assert!(!api.display_tree.contains(filter));
+    }
+
+    #[test]
+    fn native_surface_text_and_group_options_preserve_validated_values() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 0xB000_0000_u32 as i32;
+        api.graph_surfaces
+            .insert(surface, RuntimeSurface::display(surface, 1280.0, 720.0));
+
+        let mut isolated = vec![Value::Int(surface), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x87, &mut isolated).unwrap();
+        let mut spacing = vec![Value::Int(surface), Value::Int(50)];
+        call_graph(&mut api, 0x91, 0x89, &mut spacing).unwrap();
+        let mut font = vec![
+            Value::Int(surface),
+            Value::Int(0),
+            Value::Int(28),
+            Value::Int(100),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x91, 0x88, &mut font).unwrap();
+        let mut text_property = vec![Value::Int(0x8000_0000_u32 as i32), Value::Int(1)];
+        call_graph(&mut api, 0x91, 0x9a, &mut text_property).unwrap();
+
+        assert!(api.graph_surfaces[&surface].isolated_group);
+        assert_eq!(api.graph_surfaces[&surface].line_spacing_percent, 50);
+        assert_eq!(api.surface_text_states[&surface].font_size, 28);
+        assert_eq!(api.surface_text_states[&surface].scale_percent, 100);
+        assert_eq!(api.surface_text_states[&surface].font_style, 1);
+        assert_eq!(api.graph_config.text_global_properties[&0x8000_0000], 1);
+
+        let mut invalid = vec![Value::Int(surface), Value::Int(801)];
+        call_graph(&mut api, 0x91, 0x89, &mut invalid).unwrap();
+        assert_eq!(api.graph_surfaces[&surface].line_spacing_percent, 50);
+    }
+
+    #[test]
+    fn native_surface_release_removes_surface_and_detaches_children() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let parent = 0xB000_0000_u32 as i32;
+        let child = 0xB000_0001_u32 as i32;
+        api.graph_surfaces
+            .insert(parent, RuntimeSurface::display(parent, 1280.0, 720.0));
+        let mut child_surface = RuntimeSurface::display(child, 320.0, 240.0);
+        child_surface.parent_surface = Some(parent);
+        api.graph_surfaces.insert(child, child_surface);
+        api.surface_text_states.insert(parent, Default::default());
+        api.surface_text_buffers.insert(parent, "stale".into());
+
+        let mut release = vec![Value::Int(parent)];
+        call_graph(&mut api, 0x90, 0x81, &mut release).unwrap();
+
+        assert!(release.is_empty());
+        assert!(!api.graph_surfaces.contains_key(&parent));
+        assert_eq!(api.graph_surfaces[&child].parent_surface, None);
+        assert!(!api.surface_text_states.contains_key(&parent));
+        assert!(!api.surface_text_buffers.contains_key(&parent));
+    }
+
+    #[test]
+    fn native_graph_scheduler_and_work_bitmap_follow_validated_configuration() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let mut scheduler = vec![Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x01, &mut scheduler).unwrap();
+        assert!(!api.graph_scheduler_enabled);
+
+        let mut frame_rate = vec![Value::Int(1000)];
+        call_graph(&mut api, 0x90, 0x02, &mut frame_rate).unwrap();
+        assert_eq!(api.graph_frame_rate, 1000);
+        let mut invalid_frame_rate = vec![Value::Int(1001)];
+        call_graph(&mut api, 0x90, 0x02, &mut invalid_frame_rate).unwrap();
+        assert_eq!(api.graph_frame_rate, 1000);
+
+        let mut memory_limit = vec![Value::Int(0x2000_0000)];
+        call_graph(&mut api, 0x90, 0x03, &mut memory_limit).unwrap();
+        assert_eq!(api.graph_memory_limit, 0x2000_0000);
+        let mut invalid_memory_limit = vec![Value::Int(0x2000_0001)];
+        call_graph(&mut api, 0x90, 0x03, &mut invalid_memory_limit).unwrap();
+        assert_eq!(api.graph_memory_limit, 0x2000_0000);
+
+        let bitmap = 3790;
+        let mut create = vec![Value::Int(bitmap)];
+        call_graph(&mut api, 0x90, 0x04, &mut create).unwrap();
+        assert_eq!(api.bitmap_dimensions[&bitmap], (1280, 720));
+        assert_eq!(api.bitmap_formats[&bitmap], 2);
+        assert_eq!(api.graph_surfaces[&bitmap].width, 1280.0);
+        assert_eq!(api.graph_surfaces[&bitmap].height, 720.0);
+        assert!(!api.graph_config.bitmap_priorities.contains_key(&bitmap));
+
+        let prioritized = 3791;
+        let mut create_prioritized = vec![Value::Int(prioritized), Value::Int(1791)];
+        call_graph(&mut api, 0x90, 0x05, &mut create_prioritized).unwrap();
+        assert_eq!(api.bitmap_dimensions[&prioritized], (1280, 720));
+        assert_eq!(api.graph_config.bitmap_priorities[&prioritized], 1791);
+        let captured = &api.graph_resources[&prioritized];
+        assert_eq!(
+            captured.key,
+            format!("runtime:priority-bitmap:{prioritized}")
+        );
+        assert_eq!(
+            api.graph_surfaces[&prioritized].resource_id,
+            Some(prioritized)
+        );
+
+        let mut dirty = vec![Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x00, &mut dirty).unwrap();
+        assert_eq!(api.graph_redraw_requested, Some(false));
+        let mut full = vec![Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x00, &mut full).unwrap();
+        assert_eq!(api.graph_redraw_requested, Some(true));
+        let mut dirty_after_full = vec![Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x00, &mut dirty_after_full).unwrap();
+        assert_eq!(api.graph_redraw_requested, Some(true));
+    }
+
+    #[test]
+    fn native_bitmap_validation_returns_status_and_converts_format_two_to_one() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.bitmap_formats.insert(12, 2);
+
+        let mut compatible = vec![Value::Int(12), Value::Int(1)];
+        let status = call_graph(&mut api, 0x90, 0x17, &mut compatible).unwrap();
+        assert_eq!(status, Value::Int(0));
+        assert_eq!(api.bitmap_formats[&12], 1);
+
+        let mut incompatible = vec![Value::Int(12), Value::Int(2)];
+        let status = call_graph(&mut api, 0x90, 0x17, &mut incompatible).unwrap();
+        assert_eq!(status, Value::Int(2));
+
+        let mut missing = vec![Value::Int(99), Value::Int(1)];
+        let status = call_graph(&mut api, 0x90, 0x17, &mut missing).unwrap();
+        assert_eq!(status, Value::Int(1));
+    }
+
+    #[test]
+    fn graph90_1f_allocates_a_detached_source_format_region_canvas() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let source = 120;
+        let destination = 121;
+        api.recreate_native_bitmap(source, 3, 2, 2);
+        let source_key = format!("runtime:bitmap:{source}");
+        api.store_graph_image(
+            source_key,
+            DecodedImage {
+                width: 3,
+                height: 2,
+                rgba: vec![
+                    1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255, 13, 14, 15, 255, 16,
+                    17, 18, 255,
+                ],
+            },
+        );
+        api.store_bitmap_text_run(
+            source,
+            RuntimeTextNode {
+                text: "region text".into(),
+                enabled: true,
+                owner_object: None,
+                screen_attached: false,
+                target_surface: None,
+                x: 2.0,
+                y: 1.0,
+                size: 1.0,
+                line_height: 1.0,
+                formatted_layout: false,
+                color: [1.0; 4],
+                z: source,
+                ruby_spans: Vec::new(),
+                style_spans: Vec::new(),
+            },
+        );
+
+        let mut args = vec![
+            Value::Int(destination),
+            Value::Int(source),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(3),
+            Value::Int(2),
+        ];
+        call_graph(&mut api, 0x90, 0x1f, &mut args).unwrap();
+
+        assert_eq!(api.bitmap_dimensions[&destination], (3, 2));
+        assert_eq!(api.bitmap_formats[&destination], 2);
+        let destination_image = api.graph_bitmap_image(destination).unwrap();
+        assert_eq!((destination_image.width, destination_image.height), (3, 2));
+        assert_eq!(&destination_image.rgba[..4], &[16, 17, 18, 255]);
+        assert!(destination_image.rgba[4..].iter().all(|byte| *byte == 0));
+        let destination_text = &api.bitmap_text_runs[&destination][0];
+        assert_eq!(destination_text.text, "region text");
+        assert_eq!((destination_text.x, destination_text.y), (0.0, 0.0));
+
+        api.graph_images
+            .get_mut(&format!("runtime:bitmap:{source}"))
+            .unwrap()
+            .rgba[20] = 99;
+        assert_eq!(
+            api.graph_bitmap_image(destination).unwrap().rgba[0],
+            16,
+            "the native region owns copied storage rather than an atlas alias"
+        );
+    }
+
+    #[test]
+    fn graph90_18_rejects_missing_destination_and_incompatible_formats() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.recreate_native_bitmap(130, 1, 1, 2);
+
+        let mut missing_destination = vec![
+            Value::Int(131),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(130),
+            Value::Int(128),
+            Value::Int(0),
+        ];
+        let error = call_graph(&mut api, 0x90, 0x18, &mut missing_destination).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("destination bitmap 131 is missing"));
+
+        api.recreate_native_bitmap(131, 1, 1, 3);
+        let mut incompatible = vec![
+            Value::Int(131),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(130),
+            Value::Int(128),
+            Value::Int(0),
+        ];
+        let error = call_graph(&mut api, 0x90, 0x18, &mut incompatible).unwrap_err();
+        assert!(error.to_string().contains("formats are incompatible"));
+    }
+
+    #[test]
+    fn native_sprite_relation_uses_source_order_arguments() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let Value::Int(first) = call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() else {
+            panic!("first sprite creation did not return a handle");
+        };
+        let Value::Int(second) = call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() else {
+            panic!("second sprite creation did not return a handle");
+        };
+
+        let mut link = vec![Value::Int(first), Value::Int(second)];
+        let status = call_graph(&mut api, 0x91, 0x55, &mut link).unwrap();
+        assert_eq!(status, Value::Int(0));
+        assert_eq!(api.graph91_sprite_relations.get(&first), Some(&second));
+
+        let mut self_link = vec![Value::Int(first), Value::Int(first)];
+        let status = call_graph(&mut api, 0x91, 0x55, &mut self_link).unwrap();
+        assert_eq!(status, Value::Int(11));
+    }
+
+    #[test]
+    fn native_graph_initialization_calls_preserve_recovered_state() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let mut center = vec![Value::Int(640), Value::Int(360)];
+        call_graph(&mut api, 0x90, 0x06, &mut center).unwrap();
+        let mut duration = vec![Value::Int(250)];
+        call_graph(&mut api, 0x90, 0x07, &mut duration).unwrap();
+        let mut enabled = vec![Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x08, &mut enabled).unwrap();
+        let mut display_mode = vec![Value::Int(1), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x0c, &mut display_mode).unwrap();
+        let mut renderer_options = vec![Value::Int(1), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x4c, &mut renderer_options).unwrap();
+        let mut font = vec![
+            Value::Int(0),
+            Value::Int(28),
+            Value::Int(100),
+            Value::Int(0),
+            Value::Int(1024),
+        ];
+        call_graph(&mut api, 0x90, 0x0e, &mut font).unwrap();
+
+        assert_eq!(api.graph_config.center, (640, 360));
+        assert_eq!(api.graph_config.default_duration, 250);
+        assert_eq!(api.graph_config.enabled, 1);
+        assert_eq!(api.graph_config.display_mode, (1, 0));
+        assert_eq!(api.graph_config.renderer_options, (1, 0));
+        assert_eq!(api.graph_config.fonts.len(), 1);
+        assert_eq!(api.text_state.font_size, 28.0);
+    }
+
+    #[test]
+    fn native_color_lut_blit_transforms_the_destination_bitmap() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let source = 501;
+        let destination = 502;
+        let key = "test:color-source".to_string();
+        let image = DecodedImage {
+            width: 2,
+            height: 1,
+            rgba: vec![24, 90, 201, 77, 255, 128, 0, 64],
+        };
+        api.store_graph_image(key.clone(), image.clone());
+        api.graph_resources
+            .insert(source, RuntimeGraphResource::whole(key));
+        assert!(GraphApi::register_graph_color_lut(
+            &mut api,
+            31,
+            [[128, 128]; 3]
+        ));
+
+        let mut args = vec![
+            Value::Int(source),
+            Value::Int(destination),
+            Value::Int(0x00ff_ffff),
+            Value::Int(0),
+            Value::Int(31),
+            Value::Int(0x00ff_ffff),
+            Value::Int(8),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x90, 0xcd, &mut args).unwrap();
+
+        assert!(args.is_empty());
+        assert_eq!(
+            api.graph_bitmap_image(destination).unwrap().rgba,
+            image.rgba
+        );
+        assert_eq!(api.bitmap_dimensions[&destination], (2, 1));
+        assert_eq!(api.bitmap_formats[&destination], 2);
+    }
+
+    #[test]
+    fn graph90_43_materializes_backf_layer_and_motion_fades_it_in() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 128;
+        let key = "test:backf-primary".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 4,
+                height: 3,
+                rgba: vec![255; 4 * 3 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key.clone()));
+        api.bitmap_formats.insert(bitmap, 1);
+        api.graph_default_priority = 1152;
+
+        let mut configure = vec![
+            Value::Int(50),
+            Value::Int(50),
+            Value::Int(bitmap),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(256),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+
+        let layer = &api.graph_layers[&0];
+        assert_eq!(layer.key, "runtime:backf:0:primary");
+        assert_eq!((layer.width, layer.height, layer.z), (4.0, 3.0, 1152));
+        assert_eq!((layer.x, layer.y), (-50.0, -50.0));
+        assert_eq!(
+            api.graph_images["runtime:backf:0:primary"].rgba,
+            vec![0, 0, 0, 255].repeat(4 * 3)
+        );
+        assert_eq!(
+            api.display_tree.kind(0),
+            Some(super::display_tree::NativeDisplayKind::BackF)
+        );
+        assert_eq!(
+            (
+                api.graph_object_properties[&0].native.position_x,
+                api.graph_object_properties[&0].native.position_y,
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            api.graph_object_properties[&0].background.unwrap().position,
+            super::native_background::NativeBackgroundPosition::BackFSource { x: 50, y: 50 }
+        );
+        assert_eq!(
+            api.graph_object_properties[&0]
+                .named_properties
+                .get("target-current-class"),
+            Some(&4)
+        );
+        let initial = api.graph_draw_items();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].blend_mode, 0x80);
+        assert_eq!(initial[0].opacity, 1.0);
+
+        let mut position = vec![Value::Int(0), Value::Int(-20), Value::Int(30)];
+        call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
+        assert_eq!(
+            (api.graph_layers[&0].x, api.graph_layers[&0].y),
+            (20.0, -30.0)
+        );
+        assert_eq!(
+            api.graph_object_properties[&0].background.unwrap().position,
+            super::native_background::NativeBackgroundPosition::BackFSource { x: -20, y: 30 }
+        );
+        assert_eq!(
+            (
+                api.graph_object_properties[&0].native.position_x,
+                api.graph_object_properties[&0].native.position_y,
+            ),
+            (0, 0)
+        );
+
+        let mut motion = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(800),
+            Value::Int(250),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(1808),
+        ];
+        call_graph(&mut api, 0x90, 0x28, &mut motion).unwrap();
+        for _ in 0..50 {
+            api.layer_animations.tick(
+                &mut api.graph_layers,
+                &mut api.graph_surfaces,
+                &mut api.graph_object_properties,
+            );
+        }
+        api.graph90_refresh_backf_primary(0).unwrap();
+
+        assert_eq!(api.graph_object_properties[&0].alpha_parameter(), 0);
+        assert_eq!(api.graph_draw_items().len(), 1);
+        assert_eq!(api.graph_layers[&0].key, key);
+    }
+
+    #[test]
+    fn graph90_43_backf_validates_secondary_mask_and_preserves_independent_alpha() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (handle, key, rgba) in [
+            (401, "test:backf-primary-abi", [240, 10, 20, 255]),
+            (402, "test:backf-secondary-abi", [10, 220, 30, 255]),
+            (403, "test:backf-mask-abi", [0, 0, 0, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 2,
+                    height: 2,
+                    rgba: rgba.repeat(4),
+                },
+            );
+            api.graph_resources
+                .insert(handle, RuntimeGraphResource::whole(key.to_string()));
+        }
+        api.bitmap_formats.insert(401, 1);
+        api.bitmap_formats.insert(402, 1);
+        api.bitmap_formats.insert(403, 3);
+
+        let mut configure = vec![
+            Value::Int(11),
+            Value::Int(12),
+            Value::Int(401),
+            Value::Int(21),
+            Value::Int(22),
+            Value::Int(402),
+            Value::Int(403),
+            Value::Int(5),
+            Value::Int(64),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+
+        let background = api.graph_object_properties[&0].background.unwrap();
+        assert_eq!(
+            background.position,
+            super::native_background::NativeBackgroundPosition::BackFSource { x: 11, y: 12 }
+        );
+        assert!(matches!(
+            background.secondary_resource_binding,
+            Some(super::native_background::NativeBackgroundSecondaryResource::Bitmap {
+                handle: 402,
+                ..
+            })
+        ));
+        let backf = background.backf.unwrap();
+        assert_eq!((backf.secondary_x, backf.secondary_y), (21, 22));
+        assert_eq!(backf.mask_resource_binding.map(|binding| binding.0), Some(403));
+        assert_eq!(backf.mask_parameter, 5);
+        assert!(background.resources_are_current(|handle| {
+            api.graph_resources
+                .get(&handle)
+                .map(|resource| resource.generation)
+        }));
+
+        let raw = api.graph_draw_items();
+        let primary = raw
+            .iter()
+            .find(|item| item.key == "runtime:backf:0:primary")
+            .unwrap();
+        let secondary = raw
+            .iter()
+            .find(|item| item.key == "test:backf-secondary-abi")
+            .unwrap();
+        assert_eq!((primary.x, primary.y, primary.blend_mode), (-11.0, -12.0, 1));
+        assert_eq!(
+            (secondary.x, secondary.y, secondary.blend_mode),
+            (-21.0, -22.0, 0x80)
+        );
+        assert_eq!(primary.opacity, 1.0);
+        assert_eq!(secondary.opacity, 1.0);
+        let secondary_index = raw
+            .iter()
+            .position(|item| item.key == "test:backf-secondary-abi")
+            .unwrap();
+        let primary_index = raw
+            .iter()
+            .position(|item| item.key == "runtime:backf:0:primary")
+            .unwrap();
+        assert!(secondary_index < primary_index, "BackF secondary must draw before primary");
+
+        let mut bad_secondary = vec![
+            Value::Int(0), Value::Int(0), Value::Int(401), Value::Int(0), Value::Int(0),
+            Value::Int(999_999), Value::Int(-1), Value::Int(0), Value::Int(0),
+        ];
+        let error = call_graph(&mut api, 0x90, 0x43, &mut bad_secondary).unwrap_err();
+        assert!(error.to_string().contains("secondary bitmap #999999 is not registered"));
+
+        api.bitmap_formats.insert(403, 2);
+        let mut bad_mask = vec![
+            Value::Int(0), Value::Int(0), Value::Int(401), Value::Int(0), Value::Int(0),
+            Value::Int(-1), Value::Int(403), Value::Int(0), Value::Int(0),
+        ];
+        let error = call_graph(&mut api, 0x90, 0x43, &mut bad_mask).unwrap_err();
+        assert!(error.to_string().contains("expected format 3"));
+        // sub_43D750 commits sub_41D350 before sub_41D440. A mask-stage
+        // failure therefore keeps the new primary/secondary state, preserves
+        // the previous mask fields, and does not apply the new alpha.
+        let properties = &api.graph_object_properties[&0];
+        let background = properties.background.unwrap();
+        assert!(matches!(
+            background.secondary_resource_binding,
+            Some(super::native_background::NativeBackgroundSecondaryResource::Sentinel(-1))
+        ));
+        let backf = background.backf.unwrap();
+        assert_eq!(backf.mask_resource_binding.map(|binding| binding.0), Some(403));
+        assert_eq!(backf.mask_parameter, 5);
+        assert_eq!(properties.alpha_parameter(), 64);
+    }
+
+    #[test]
+    fn graph90_43_backf_normal_secondary_uses_target_selector1_weight_and_raw_alpha_state() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (handle, key, pixel) in [
+            (411, "test:backf-selector1-primary", [200, 100, 50, 255]),
+            (412, "test:backf-selector1-secondary", [10, 20, 30, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: pixel.to_vec(),
+                },
+            );
+            api.graph_resources
+                .insert(handle, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_formats.insert(handle, 1);
+        }
+
+        let mut configure = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(411),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(412),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(64),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        assert_eq!(api.graph_object_properties[&0].blend_mode, 1);
+        let items = api.graph_draw_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "test:backf-selector1-secondary");
+        assert_eq!(items[0].blend_mode, 0x80);
+        assert_eq!(items[0].opacity, 1.0);
+        assert_eq!(items[1].key, "test:backf-selector1-primary");
+        assert_eq!(items[1].blend_mode, 0xf0);
+        assert!((items[1].opacity - 0.75).abs() < f32::EPSILON);
+
+        // 90:43 itself does not reject/clamp this DWORD: sub_43D750 calls
+        // sub_41B620 directly after resource and mask validation succeeds.
+        let mut raw_alpha = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(411),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(257),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut raw_alpha).unwrap();
+        assert_eq!(api.graph_object_properties[&0].alpha_parameter(), 257);
+    }
+
+    #[test]
+    fn graph90_43_backf_format2_pair_keeps_selector1_instead_of_format1_surrogate() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (handle, key, pixel) in [
+            (413, "test:backf-format2-primary", [200, 100, 50, 128]),
+            (414, "test:backf-format2-secondary", [10, 20, 30, 192]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: pixel.to_vec(),
+                },
+            );
+            api.graph_resources
+                .insert(handle, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_formats.insert(handle, 2);
+        }
+
+        let mut configure = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(413),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(414),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(64),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        let items = api.graph_draw_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].blend_mode, 0x80);
+        assert_eq!(items[1].blend_mode, 1);
+        assert!((items[1].opacity - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn graph90_43_backf_format1_secondary_does_not_use_legacy_high_byte_as_gpu_alpha() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (handle, key, pixel) in [
+            (419, "test:backf-xrgb-primary", [200, 100, 50, 255]),
+            (420, "test:backf-xrgb-secondary", [10, 20, 30, 7]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: pixel.to_vec(),
+                },
+            );
+            api.graph_resources
+                .insert(handle, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_formats.insert(handle, 1);
+        }
+
+        let mut configure = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(419),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(420),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(64),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        assert_eq!(
+            api.graph_images["runtime:backf:0:secondary"].rgba,
+            vec![10, 20, 30, 255]
+        );
+        let items = api.graph_draw_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "runtime:backf:0:secondary");
+        assert_eq!(items[0].blend_mode, 0x80);
+        assert_eq!(items[0].opacity, 1.0);
+        assert_eq!(items[1].blend_mode, 0xf0);
+    }
+
+    #[test]
+    fn graph90_43_backf_format2_sentinel_keeps_raw_c0_selector() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.store_graph_image(
+            "test:backf-format2-sentinel-primary".to_string(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![200, 100, 50, 128],
+            },
+        );
+        api.graph_resources.insert(
+            423,
+            RuntimeGraphResource::whole("test:backf-format2-sentinel-primary".to_string()),
+        );
+        api.bitmap_formats.insert(423, 2);
+
+        let mut configure = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(423),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0x7000),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(128),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        assert!(!api.graph_images.contains_key("runtime:backf:0:primary"));
+        let items = api.graph_draw_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].key, "test:backf-format2-sentinel-primary");
+        assert_eq!(items[1].blend_mode, 0xc0);
+        assert!((items[1].opacity - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn graph90_43_backf_format2_mask_path_is_native_noop() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.store_graph_image(
+            "test:backf-format2-mask-primary".to_string(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![200, 100, 50, 192],
+            },
+        );
+        api.graph_resources.insert(
+            415,
+            RuntimeGraphResource::whole("test:backf-format2-mask-primary".to_string()),
+        );
+        api.bitmap_formats.insert(415, 2);
+        api.store_graph_image(
+            "test:backf-format2-mask".to_string(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            },
+        );
+        api.graph_resources.insert(
+            416,
+            RuntimeGraphResource::whole("test:backf-format2-mask".to_string()),
+        );
+        api.bitmap_formats.insert(416, 3);
+
+        let mut configure = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(415),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(416),
+            Value::Int(0),
+            Value::Int(128),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        assert_eq!(
+            api.graph_images["runtime:backf:0:primary"].rgba,
+            vec![200, 100, 50, 0]
+        );
+        let items = api.graph_draw_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].blend_mode, 1);
+        assert_eq!(items[0].opacity, 1.0);
+    }
+
+    #[test]
+    fn graph90_43_backf_constructor_selector1_controls_get_mask_alpha() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (handle, key) in [
+            (417, "test:backf-selector1-maskalpha-primary"),
+            (418, "test:backf-selector1-maskalpha-secondary"),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 255, 255, 255],
+                },
+            );
+            api.graph_resources
+                .insert(handle, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_formats.insert(handle, 1);
+        }
+        let mut configure = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(417),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(418),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(64),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        let mut mask_alpha = vec![Value::Int(0), Value::Int(128)];
+        call_graph(&mut api, 0x90, 0x34, &mut mask_alpha).unwrap();
+
+        let properties = &api.graph_object_properties[&0];
+        assert_eq!(properties.blend_mode, 1);
+        // 256 - (256 * (256-64) * (256-128) >> 16) = 160.
+        assert_eq!(properties.transparency_parameter(), 160);
+        let items = api.graph_draw_items();
+        assert_eq!(items[1].blend_mode, 0xf0);
+        assert!((items[1].opacity - 0.375).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn graph90_43_backf_mask_samples_destination_coordinates_without_scaling() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.store_graph_image(
+            "test:backf-mask-align-primary".to_string(),
+            DecodedImage {
+                width: 2,
+                height: 1,
+                rgba: vec![200, 100, 50, 255, 20, 40, 60, 255],
+            },
+        );
+        api.graph_resources.insert(
+            421,
+            RuntimeGraphResource::whole("test:backf-mask-align-primary".to_string()),
+        );
+        api.bitmap_formats.insert(421, 1);
+        api.store_graph_image(
+            "test:backf-mask-align-mask".to_string(),
+            DecodedImage {
+                width: 3,
+                height: 1,
+                rgba: vec![0, 0, 0, 0, 128, 128, 128, 128, 255, 255, 255, 255],
+            },
+        );
+        api.graph_resources.insert(
+            422,
+            RuntimeGraphResource::whole("test:backf-mask-align-mask".to_string()),
+        );
+        api.bitmap_formats.insert(422, 3);
+
+        // primary_x=-1 means source x=0 lands at destination x=1, so the
+        // two source pixels must sample mask bytes 128 and 255 respectively.
+        let mut configure = vec![
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(421),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(422),
+            Value::Int(0),
+            Value::Int(128),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        let generated = &api.graph_images["runtime:backf:0:primary"].rgba;
+        assert_eq!(generated[3], 128);
+        assert_eq!(generated[7], 253);
+        assert_eq!(api.graph_layers[&0].x, 1.0);
+    }
+
+    #[test]
+    fn graph90_43_backf_sentinel_paths_materialize_target_black_and_white_fades() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let primary = 501;
+        let key = "test:backf-sentinel-primary";
+        api.store_graph_image(
+            key.to_string(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![200, 100, 50, 255],
+            },
+        );
+        api.graph_resources
+            .insert(primary, RuntimeGraphResource::whole(key.to_string()));
+        api.bitmap_formats.insert(primary, 1);
+
+        let mut white = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(primary),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0x7001),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(128),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut white).unwrap();
+        assert_eq!(
+            &api.graph_images["runtime:backf:0:primary"].rgba[..4],
+            &[227, 177, 152, 255]
+        );
+        assert_eq!(
+            &api.graph_images["runtime:backf:0:sentinel:28673"].rgba[..4],
+            &[255, 255, 255, 255]
+        );
+        let white_items = api.graph_draw_items();
+        assert_eq!(white_items.len(), 2);
+        assert!(white_items.iter().all(|item| item.opacity == 1.0));
+
+        let mut black = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(primary),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0x7000),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(128),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut black).unwrap();
+        assert_eq!(
+            &api.graph_images["runtime:backf:0:primary"].rgba[..4],
+            &[100, 50, 25, 255]
+        );
+        assert_eq!(
+            &api.graph_images["runtime:backf:0:sentinel:28672"].rgba[..4],
+            &[0, 0, 0, 255]
+        );
+
+        let mut no_base = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(primary),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(128),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut no_base).unwrap();
+        assert!(!api.graph_layers.contains_key(&BACK_F_SECONDARY_LAYER_ID));
+        assert_eq!(
+            &api.graph_images["runtime:backf:0:primary"].rgba[..4],
+            &[100, 50, 25, 255]
+        );
+    }
+
+    #[test]
+    fn graph90_38_backf_mask_control_and_position_use_subclass_vtable_semantics() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (handle, key, rgba) in [
+            (511, "test:backf-control-primary", [240, 10, 20, 255]),
+            (512, "test:backf-control-secondary", [10, 220, 30, 255]),
+            (513, "test:backf-control-mask", [64, 64, 64, 64]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 2,
+                    height: 2,
+                    rgba: rgba.repeat(4),
+                },
+            );
+            api.graph_resources
+                .insert(handle, RuntimeGraphResource::whole(key.to_string()));
+        }
+        api.bitmap_formats.insert(511, 1);
+        api.bitmap_formats.insert(512, 1);
+        api.bitmap_formats.insert(513, 3);
+
+        let mut configure = vec![
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(511),
+            Value::Int(7),
+            Value::Int(8),
+            Value::Int(512),
+            Value::Int(513),
+            Value::Int(0),
+            Value::Int(128),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+
+        let mut control = vec![
+            Value::Int(0),
+            Value::Int(0x4000_0000),
+            Value::Int(1),
+            Value::Int(1),
+        ];
+        call_graph(&mut api, 0x90, 0x38, &mut control).unwrap();
+        let backf = api.graph_object_properties[&0]
+            .background
+            .unwrap()
+            .backf
+            .unwrap();
+        assert_eq!((backf.mask_control_enabled, backf.mask_control_mode), (1, 1));
+
+        let mut rejected = vec![
+            Value::Int(0),
+            Value::Int(0x4000_0000),
+            Value::Int(1),
+            Value::Int(4),
+        ];
+        assert!(call_graph(&mut api, 0x90, 0x38, &mut rejected).is_err());
+
+        let mut position = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(17),
+            Value::Int(29),
+        ];
+        call_graph(&mut api, 0x90, 0x38, &mut position).unwrap();
+        assert_eq!((api.graph_layers[&0].x, api.graph_layers[&0].y), (-17.0, -29.0));
+        assert_eq!(
+            (
+                api.graph_layers[&BACK_F_SECONDARY_LAYER_ID].x,
+                api.graph_layers[&BACK_F_SECONDARY_LAYER_ID].y,
+            ),
+            (-7.0, -8.0)
+        );
+    }
+
+    #[test]
+    fn graph90_background_selector_switch_reconstructs_class_and_preserves_noop_position_vtable() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.graph_default_priority = 901;
+
+        let bitmap = 99;
+        let key = "test:backn".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 3,
+                height: 2,
+                rgba: vec![255; 3 * 2 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key.clone()));
+
+        let mut backf = vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(bitmap),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut backf).unwrap();
+        api.graph_object_properties
+            .get_mut(&0)
+            .unwrap()
+            .native
+            .position_x = 77;
+        api.graph_object_properties
+            .get_mut(&0)
+            .unwrap()
+            .native
+            .position_y = 88;
+
+        let mut backn = vec![Value::Int(bitmap)];
+        call_graph(&mut api, 0x90, 0x40, &mut backn).unwrap();
+        let properties = &api.graph_object_properties[&0];
+        assert_eq!(
+            properties.background.unwrap().class,
+            super::native_background::NativeBackgroundClass::BackN
+        );
+        assert_eq!(
+            (properties.native.position_x, properties.native.position_y),
+            (0, 0)
+        );
+        assert_eq!(properties.native.priority, 901);
+        assert_eq!(api.graph_layers[&0].key, key);
+        assert_eq!((api.graph_layers[&0].x, api.graph_layers[&0].y), (0.0, 0.0));
+        assert_eq!(
+            api.display_tree.kind(0),
+            Some(super::display_tree::NativeDisplayKind::BackN)
+        );
+
+        api.graph_object_properties
+            .get_mut(&0)
+            .unwrap()
+            .native
+            .position_x = 7;
+        api.graph_object_properties
+            .get_mut(&0)
+            .unwrap()
+            .native
+            .position_y = 9;
+        let mut position = vec![Value::Int(0), Value::Int(100), Value::Int(200)];
+        call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
+        let properties = &api.graph_object_properties[&0];
+        assert_eq!(
+            (properties.native.position_x, properties.native.position_y),
+            (7, 9)
+        );
+        assert_eq!(
+            properties.background.unwrap().position,
+            super::native_background::NativeBackgroundPosition::None
+        );
+        assert_eq!((api.graph_layers[&0].x, api.graph_layers[&0].y), (0.0, 0.0));
+        assert_eq!(api.graph_output_draw_items().len(), 1);
+
+        let replacement_key = "test:backn-reused-handle".to_string();
+        api.store_graph_image(
+            replacement_key.clone(),
+            DecodedImage {
+                width: 4,
+                height: 4,
+                rgba: vec![128; 4 * 4 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(replacement_key.clone()));
+        assert!(api.graph_output_draw_items().is_empty());
+
+        let mut rebind = vec![Value::Int(bitmap)];
+        call_graph(&mut api, 0x90, 0x40, &mut rebind).unwrap();
+        assert_eq!(api.graph_output_draw_items()[0].key, replacement_key);
+
+        let mut invalid = vec![Value::Int(123_456)];
+        let error = call_graph(&mut api, 0x90, 0x40, &mut invalid).unwrap_err();
+        assert!(error.to_string().contains("not a valid registered bitmap"));
+        assert_eq!(
+            api.graph_object_properties[&0].background.unwrap().class,
+            super::native_background::NativeBackgroundClass::BackN
+        );
+        assert_eq!(api.graph_layers[&0].key, replacement_key);
+    }
+
+    #[test]
+    fn graph90_41_backb_preserves_dual_resource_generations_and_draw_order() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let primary = 301;
+        let secondary = 302;
+        for (handle, key, rgba) in [
+            (primary, "test:backb-primary", [200, 10, 80, 255]),
+            (secondary, "test:backb-secondary", [20, 110, 40, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: rgba.to_vec(),
+                },
+            );
+            api.graph_resources
+                .insert(handle, RuntimeGraphResource::whole(key.to_string()));
+        }
+
+        let mut configure = vec![Value::Int(primary), Value::Int(secondary), Value::Int(64)];
+        call_graph(&mut api, 0x90, 0x41, &mut configure).unwrap();
+        let background = api.graph_object_properties[&0].background.unwrap();
+        assert_eq!(background.class, super::NativeBackgroundClass::BackB);
+        assert!(background.resources_are_current(|handle| {
+            api.graph_resources
+                .get(&handle)
+                .map(|resource| resource.generation)
+        }));
+        assert_eq!(api.graph_object_properties[&0].alpha_parameter(), 64);
+        let items = api.graph_output_draw_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            (items[0].key.as_str(), items[0].blend_mode),
+            ("test:backb-secondary", 0x80)
+        );
+        assert_eq!(
+            (items[1].key.as_str(), items[1].blend_mode),
+            ("test:backb-primary", 0xf0)
+        );
+        assert_eq!(items[0].opacity, 1.0);
+        assert_eq!(items[1].opacity, 0.75);
+
+        api.graph_resources.insert(
+            secondary,
+            RuntimeGraphResource::whole("test:backb-secondary".to_string()),
+        );
+        assert!(api.graph_output_draw_items().is_empty());
+
+        let mut rebind = vec![Value::Int(primary), Value::Int(secondary), Value::Int(128)];
+        call_graph(&mut api, 0x90, 0x41, &mut rebind).unwrap();
+        assert_eq!(api.graph_output_draw_items().len(), 2);
+
+        let mut sentinel = vec![Value::Int(primary), Value::Int(0x7001), Value::Int(128)];
+        call_graph(&mut api, 0x90, 0x41, &mut sentinel).unwrap();
+        let items = api.graph_output_draw_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].blend_mode, 0xc1);
+        assert_eq!(items[0].opacity, 0.5);
+
+        let mut invalid = vec![Value::Int(primary), Value::Int(999_999), Value::Int(32)];
+        let error = call_graph(&mut api, 0x90, 0x41, &mut invalid).unwrap_err();
+        assert!(error.to_string().contains("not a valid BackB pair"));
+        assert_eq!(api.graph_object_properties[&0].alpha_parameter(), 32);
+        assert_eq!(api.graph_output_draw_items()[0].blend_mode, 0xc1);
+    }
+
+    #[test]
+    fn graph90_42_backs_uses_target_quad_seam_and_generation_checks() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.screen_width = 8;
+        api.screen_height = 6;
+        api.bitmap_formats.insert(NATIVE_SCREEN_BITMAP, 2);
+        let resources = [401, 402, 403, 404];
+        for (index, resource) in resources.into_iter().enumerate() {
+            let key = format!("test:backs-{index}");
+            api.store_graph_image(
+                key.clone(),
+                DecodedImage {
+                    width: 8,
+                    height: 6,
+                    rgba: vec![index as u8; 8 * 6 * 4],
+                },
+            );
+            api.graph_resources
+                .insert(resource, RuntimeGraphResource::whole(key));
+            api.bitmap_dimensions.insert(resource, (8, 6));
+            api.bitmap_formats.insert(resource, 2);
+        }
+
+        let mut configure = vec![
+            Value::Int(resources[0]),
+            Value::Int(resources[1]),
+            Value::Int(resources[2]),
+            Value::Int(resources[3]),
+            Value::Int(3),
+            Value::Int(2),
+        ];
+        call_graph(&mut api, 0x90, 0x42, &mut configure).unwrap();
+        let background = api.graph_object_properties[&0].background.unwrap();
+        assert_eq!(background.class, super::NativeBackgroundClass::BackS);
+        assert_eq!(
+            background
+                .quad_resource_bindings
+                .unwrap()
+                .map(|item| item.0),
+            resources
+        );
+        assert_eq!(background.integer_position(), Some((3, 2)));
+
+        let mut items = api.graph_output_draw_items();
+        items.sort_by(|left, right| left.key.cmp(&right.key));
+        let geometry = items
+            .iter()
+            .map(|item| {
+                (
+                    item.key.as_str(),
+                    item.x,
+                    item.y,
+                    item.src_x,
+                    item.src_y,
+                    item.src_width,
+                    item.src_height,
+                    item.blend_mode,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            geometry,
+            vec![
+                ("test:backs-0", 0.0, 0.0, 3.0, 2.0, 5.0, 4.0, 0x80),
+                ("test:backs-1", 5.0, 0.0, 0.0, 2.0, 3.0, 4.0, 0x80),
+                ("test:backs-2", 0.0, 4.0, 3.0, 0.0, 5.0, 2.0, 0x80),
+                ("test:backs-3", 5.0, 4.0, 0.0, 0.0, 3.0, 2.0, 0x80),
+            ]
+        );
+
+        api.graph_resources.insert(
+            resources[2],
+            RuntimeGraphResource::whole("test:backs-2".to_string()),
+        );
+        assert!(api.graph_output_draw_items().is_empty());
+        let mut rebind = vec![
+            Value::Int(resources[0]),
+            Value::Int(resources[1]),
+            Value::Int(resources[2]),
+            Value::Int(resources[3]),
+            Value::Int(1),
+            Value::Int(5),
+        ];
+        call_graph(&mut api, 0x90, 0x42, &mut rebind).unwrap();
+        assert_eq!(api.graph_output_draw_items().len(), 4);
+
+        let mut invalid_resource = vec![
+            Value::Int(resources[0]),
+            Value::Int(resources[1]),
+            Value::Int(resources[2]),
+            Value::Int(999_999),
+            Value::Int(4),
+            Value::Int(3),
+        ];
+        call_graph(&mut api, 0x90, 0x42, &mut invalid_resource).unwrap_err();
+        let background = api.graph_object_properties[&0].background.unwrap();
+        assert_eq!(background.integer_position(), Some((4, 3)));
+        assert_eq!(
+            background
+                .quad_resource_bindings
+                .unwrap()
+                .map(|item| item.0),
+            resources
+        );
+        assert_eq!(api.graph_output_draw_items().len(), 4);
+
+        let mut invalid_position = vec![
+            Value::Int(resources[0]),
+            Value::Int(resources[1]),
+            Value::Int(resources[2]),
+            Value::Int(resources[3]),
+            Value::Int(4),
+            Value::Int(7),
+        ];
+        call_graph(&mut api, 0x90, 0x42, &mut invalid_position).unwrap_err();
+        assert_eq!(
+            api.graph_object_properties[&0]
+                .background
+                .unwrap()
+                .integer_position(),
+            Some((4, 3))
+        );
+    }
+
+    #[test]
+    fn graph90_56_materializes_mode0_sprite_at_object_position() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 1262;
+        let key = "test:message-backing".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 1280,
+                height: 149,
+                rgba: vec![255; 1280 * 149 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key.clone()));
+
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(0),
+            Value::Int(523),
+            Value::Int(bitmap),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(1840),
+        ];
+        call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+
+        let layer = &api.graph_layers[&sprite];
+        assert_eq!(layer.owner_object, Some(sprite));
+        assert_eq!(layer.key, key);
+        assert_eq!((layer.x, layer.y), (0.0, 523.0));
+        assert_eq!((layer.width, layer.height, layer.z), (1280.0, 149.0, 1840));
+        assert_eq!(api.layer_world_transform(sprite, layer), (0.0, 523.0, 1840));
+        assert_eq!(
+            api.graph_object_properties[&sprite].format_resource,
+            Some(bitmap)
+        );
+        assert_eq!(api.graph_draw_items().len(), 1);
+    }
+
+    #[test]
+    fn graph90_58_mode1_keeps_transition_value_separate_from_object_alpha() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.scenario_bootstrapped = true;
+
+        for (bitmap, key, rgba) in [
+            (501, "test:sprite-mode1-primary", vec![240, 32, 16, 255]),
+            (502, "test:sprite-mode1-secondary", vec![16, 32, 240, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba,
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_dimensions.insert(bitmap, (1, 1));
+            api.bitmap_formats.insert(bitmap, 2);
+        }
+
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        // A stale compatibility transition-node visibility entry must not
+        // suppress a real CDspObjSprite mode-1 object.  Target visibility is
+        // owned by CDspObj, not by the portable generic-node table.
+        api.graph_node_enabled.insert(sprite, false);
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(501),
+            Value::Int(502),
+            Value::Int(64),
+            Value::Int(64),
+            Value::Int(123),
+            Value::Int(1),
+        ];
+        call_graph(&mut api, 0x90, 0x58, &mut configure).unwrap();
+
+        let transition = api.graph_transition_nodes[&sprite];
+        assert_eq!(transition.alpha_multiplier, 64);
+        assert_eq!(transition.alpha_parameter, 64);
+        assert_eq!(transition.blend_selector, 1);
+        assert!(
+            api.display_tree.contains(sprite),
+            "bitmap-text compatibility cleanup must not delete the native sprite"
+        );
+        assert_eq!(api.graph_layers[&sprite].owner_object, Some(sprite));
+        assert!(api.graph_object_layers[&sprite].contains(&sprite));
+        assert_eq!(api.graph_object_properties[&sprite].alpha_parameter(), 64);
+        assert!(api.graph_layers[&sprite].enabled);
+        api.sync_display_tree_from_runtime();
+        assert!(api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
+        let item = api
+            .graph_draw_items()
+            .into_iter()
+            .find(|item| item.owner_object == Some(sprite))
+            .expect("mode-1 sprite must materialize as a draw item");
+        assert!((item.opacity - 0.75).abs() < 0.0001);
+
+        // sub_428380 selector 1 changes +0x240 only; the base CDspObj
+        // transparency at +0xAC must remain untouched.
+        let mut set_alpha = vec![Value::Int(sprite), Value::Int(200)];
+        call_graph(&mut api, 0x90, 0x32, &mut set_alpha).unwrap();
+        assert_eq!(api.graph_transition_nodes[&sprite].alpha_multiplier, 200);
+        assert_eq!(api.graph_transition_nodes[&sprite].alpha_parameter, 64);
+        assert_eq!(api.graph_object_properties[&sprite].alpha_parameter(), 64);
+    }
+
+    #[test]
+    fn graph90_20_uses_explicit_sprite_handle_and_sprite_getalpha_semantics() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.scenario_bootstrapped = true;
+        for (bitmap, key, rgba) in [
+            (511, "test:sprite-control-primary", vec![255, 0, 0, 255]),
+            (512, "test:sprite-control-secondary", vec![0, 0, 255, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba,
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_dimensions.insert(bitmap, (1, 1));
+            api.bitmap_formats.insert(bitmap, 2);
+        }
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(511),
+            Value::Int(512),
+            Value::Int(64),
+            Value::Int(64),
+            Value::Int(123),
+            Value::Int(1),
+        ];
+        call_graph(&mut api, 0x90, 0x58, &mut configure).unwrap();
+
+        // Deliberately point the legacy implicit-current slot elsewhere.  The
+        // target sub_47A6A0 uses the explicit object popped from the BP stack.
+        api.current_graph_object = Some(0);
+        let mut transition = vec![
+            Value::Int(sprite),
+            Value::Int(200),
+            Value::Int(100),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(1808),
+        ];
+        call_graph(&mut api, 0x90, 0x20, &mut transition).unwrap();
+        api.tick_timelines(50);
+
+        // Selector 1's vtable +76 returns +0x240 (64), not base alpha +0xAC.
+        // Halfway through a linear 64 -> 200 transition the value is 132.
+        assert_eq!(api.graph_transition_nodes[&sprite].alpha_multiplier, 132);
+        assert_eq!(api.graph_object_properties[&sprite].alpha_parameter(), 64);
+        assert_eq!(
+            (
+                api.graph_object_properties[&sprite].native.position_x,
+                api.graph_object_properties[&sprite].native.position_y,
+            ),
+            (10, 20)
+        );
+    }
+
+    #[test]
+    fn graph90_5c_materializes_target_mode5_sprite_for_motion() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.configure_screen_size(1280, 720);
+        let bitmap = 9997;
+        let key = "test:mode5-background".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 1480,
+                height: 820,
+                rgba: vec![255; 1480 * 820 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key.clone()));
+
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(0),
+            Value::Int(200 << 16),
+            Value::Int(-128 << 16),
+            Value::Int(bitmap),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(740),
+            Value::Int(205),
+            Value::Int(0),
+            Value::Int(640),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(32),
+            Value::Int(256),
+            Value::Int(261),
+        ];
+        call_graph(&mut api, 0x90, 0x5c, &mut configure).unwrap();
+
+        let layer = &api.graph_layers[&sprite];
+        assert_eq!(layer.owner_object, Some(sprite));
+        assert_eq!(layer.key, key);
+        assert_eq!((layer.x, layer.y, layer.z), (-248.0, -579.0, 261));
+        assert!((layer.scale_x - 1.2).abs() < 0.0001);
+        assert_eq!(layer.scale_y, 985.0 / 820.0);
+        let properties = &api.graph_object_properties[&sprite];
+        assert_eq!(properties.format_resource, Some(bitmap));
+        assert_eq!(properties.named_properties["target-object-mode"], 5);
+        assert_eq!(properties.native.position_x, 0);
+        assert_eq!(properties.native.position_y, 200 << 16);
+        assert_eq!(properties.native.fixed_position_updates_integer_position, 0);
+        assert_eq!(
+            api.graph90_native_sort_key(sprite),
+            api.display_tree.native_sort_key(sprite)
+        );
+        assert_eq!(
+            properties.named_properties["target-position-z-16-16"],
+            -128 << 16
+        );
+        assert_eq!(properties.alpha_parameter(), 256);
+        assert!(api.graph_draw_items().is_empty());
+
+        api.set_graph_object_alpha_recursive(sprite, 0);
+        assert_eq!(api.graph_draw_items().len(), 1);
+
+        let backf_bitmap = 128;
+        let backf_key = "test:backf".to_string();
+        api.store_graph_image(
+            backf_key.clone(),
+            DecodedImage {
+                width: 1280,
+                height: 720,
+                rgba: vec![255; 1280 * 720 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(backf_bitmap, RuntimeGraphResource::whole(backf_key.clone()));
+        api.graph_default_priority = 1152;
+        let mut configure_backf = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(backf_bitmap),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0x7fff),
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x90, 0x43, &mut configure_backf).unwrap();
+
+        let raw = api
+            .graph_draw_items()
+            .into_iter()
+            .map(|item| item.key)
+            .collect::<Vec<_>>();
+        assert_eq!(raw, vec![key.clone(), backf_key.clone()]);
+        let output = api
+            .graph_output_draw_items()
+            .into_iter()
+            .map(|item| item.key)
+            .collect::<Vec<_>>();
+        assert_eq!(output, vec![backf_key, key]);
+    }
+
+    #[test]
+    fn graph90_57_replaces_mode0_sprite_bitmap_without_losing_display_state() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (bitmap, key, width, height) in [
+            (1151, "test:sprite-before", 1280, 240),
+            (1262, "test:sprite-after", 1280, 149),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width,
+                    height,
+                    rgba: vec![255; width as usize * height as usize * 4],
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+        }
+
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(1151),
+            Value::Int(1),
+            Value::Int(32),
+            Value::Int(1839),
+        ];
+        call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+        assert!(api.set_graph_object_position(sprite, 0.0, 480.0));
+        let mut replace = vec![Value::Int(sprite), Value::Int(1262)];
+        call_graph(&mut api, 0x90, 0x57, &mut replace).unwrap();
+
+        let layer = &api.graph_layers[&sprite];
+        assert_eq!(layer.key, "test:sprite-after");
+        assert_eq!((layer.x, layer.y, layer.z), (0.0, 480.0, 1839));
+        assert_eq!((layer.width, layer.height), (1280.0, 149.0));
+        assert_eq!(
+            (
+                api.graph_object_properties[&sprite].native.position_x,
+                api.graph_object_properties[&sprite].native.position_y,
+            ),
+            (0, 480)
+        );
+        assert_eq!(api.graph_object_properties[&sprite].alpha_parameter(), 32);
+        assert_eq!(api.graph_object_properties[&sprite].blend_mode, 1);
+    }
+
+    #[test]
+    fn graph90_05_captures_only_display_objects_through_its_priority() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (id, z, key, rgba) in [
+            (10, 100, "test:priority-low", [255, 0, 0, 255]),
+            (20, 200, "test:priority-high", [0, 0, 255, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: rgba.to_vec(),
+                },
+            );
+            api.graph_layers.insert(
+                id,
+                RuntimeGraphLayer {
+                    hit_id: id,
+                    owner_object: None,
+                    key: key.to_string(),
+                    target_surface: None,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                    src_x: 0.0,
+                    src_y: 0.0,
+                    opacity: 1.0,
+                    z,
+                    enabled: true,
+                    transform_x: 0.0,
+                    transform_y: 0.0,
+                    transform_z: 0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    rotation_degrees: 0.0,
+                    clip: None,
+                },
+            );
+        }
+
+        let bitmap = 3793;
+        let mut create = vec![Value::Int(bitmap), Value::Int(150)];
+        call_graph(&mut api, 0x90, 0x05, &mut create).unwrap();
+
+        assert_eq!(
+            &api.graph_bitmap_image(bitmap).unwrap().rgba[..4],
+            &[255, 0, 0, 255]
+        );
+        assert_eq!(api.graph_config.bitmap_priorities[&bitmap], 150);
+    }
+
+    #[test]
+    fn native_knob_base_position_moves_the_target_layer() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 601;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-target".into(),
+                target_surface: None,
+                x: 12.0,
+                y: 34.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let mut create = vec![Value::Int(target)];
+        let handle = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+
+        assert_eq!((handle as u32) & 0xFF00_0000, 0xF000_0000);
+
+        let mut position = vec![Value::Int(handle), Value::Int(100), Value::Int(200)];
+        call_graph(&mut api, 0x90, 0xd5, &mut position).unwrap();
+
+        let state = api.graph_knob_states[&handle];
+        assert_eq!((state.base_x, state.base_y), (100.0, 200.0));
+        assert_eq!(
+            (api.graph_layers[&target].x, api.graph_layers[&target].y),
+            (100.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn knob_event_selectors_reach_the_target_confirmed_state_machine() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let first = 0xF000_0001_u32 as i32;
+        let second = 0xF000_0002_u32 as i32;
+        let mut first_state = super::GraphKnobState::new(601, 0.0, 0.0);
+        first_state.event_pending = true;
+        first_state.event_x = 9;
+        first_state.event_y = -17;
+        first_state.event_kind = 2;
+        first_state.changed = true;
+        let mut second_state = super::GraphKnobState::new(602, 0.0, 0.0);
+        second_state.changed = true;
+        api.graph_knob_states.insert(first, first_state);
+        api.graph_knob_states.insert(second, second_state);
+
+        let mut vertical = vec![Value::Int(first)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xda, &mut vertical).unwrap(),
+            Value::Int(-17)
+        );
+        let first_state = api.graph_knob_states[&first];
+        assert!(!first_state.event_pending);
+        assert_eq!(
+            (
+                first_state.event_x,
+                first_state.event_y,
+                first_state.event_kind
+            ),
+            (0, 0, 0)
+        );
+
+        let mut changed = Vec::new();
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdb, &mut changed).unwrap(),
+            Value::Int(second)
+        );
+        assert!(!api.graph_knob_states[&first].changed);
+        assert!(!api.graph_knob_states[&second].changed);
+
+        let mut watch = vec![Value::Int(first)];
+        call_graph(&mut api, 0x90, 0xde, &mut watch).unwrap();
+        assert!(api.graph_knob_watches.contains(&first));
+        let mut unwatch = vec![Value::Int(first)];
+        call_graph(&mut api, 0x90, 0xdf, &mut unwatch).unwrap();
+        assert!(!api.graph_knob_watches.contains(&first));
+    }
+
+    #[test]
+    fn native_group_uses_tagged_handle_and_preserves_member_ownership() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let object = 602;
+        api.graph_layers.insert(
+            object,
+            RuntimeGraphLayer {
+                hit_id: object,
+                owner_object: None,
+                key: "group-target".into(),
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 10.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+
+        let mut create = Vec::new();
+        let group = match call_graph(&mut api, 0x90, 0xe0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected group handle {value:?}"),
+        };
+        assert_eq!((group as u32) & 0xFF00_0000, 0xF100_0000);
+
+        let mut configure = vec![
+            Value::Int(group),
+            Value::Int(50),
+            Value::Int(60),
+            Value::Int(3),
+        ];
+        call_graph(&mut api, 0x90, 0xe5, &mut configure).unwrap();
+        let mut add = vec![
+            Value::Int(group),
+            Value::Int(object),
+            Value::Int(7),
+            Value::Int(8),
+        ];
+        call_graph(&mut api, 0x90, 0xe8, &mut add).unwrap();
+
+        assert_eq!(api.graph_native_owners.get(&object), Some(&group));
+        assert_eq!(api.graph_groups[&group].members.get(&object), Some(&(7, 8)));
+        assert_eq!(
+            (api.graph_layers[&object].x, api.graph_layers[&object].y),
+            (57.0, 68.0)
+        );
+
+        let mut set_alpha = vec![Value::Int(group), Value::Int(173)];
+        call_graph(&mut api, 0x90, 0x32, &mut set_alpha).unwrap();
+        assert_eq!(api.graph_object_properties[&group].alpha_parameter(), 173);
+        assert_eq!(api.graph_object_properties[&object].alpha_parameter(), 173);
+
+        let mut remove = vec![Value::Int(group), Value::Int(object)];
+        call_graph(&mut api, 0x90, 0xe9, &mut remove).unwrap();
+        assert!(!api.graph_native_owners.contains_key(&object));
+        assert!(!api.graph_groups[&group].members.contains_key(&object));
+        assert_eq!(
+            api.graph_object_properties[&object].alpha_parameter(),
+            173,
+            "native child retains the propagated alpha after detachment"
+        );
+    }
+
+
+    #[test]
+    fn group_late_member_attachment_uses_live_animated_position() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let object = api.alloc_window_surface(1280, 240).unwrap();
+        api.graph_layers.insert(
+            object,
+            super::RuntimeGraphLayer {
+                hit_id: object,
+                owner_object: Some(object),
+                key: "group-late-member".to_string(),
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                width: 1280.0,
+                height: 240.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+
+        let group = match call_graph(&mut api, 0x90, 0xe0, &mut Vec::new()).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected group handle {value:?}"),
+        };
+        let mut configure = vec![Value::Int(group), Value::Int(0), Value::Int(0), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xe5, &mut configure).unwrap();
+
+        // Model a group position change through the same setter used by
+        // Graph90:23/28 animation events, then attach the message frame.
+        api.graph90_set_position_recursive(group, 0, -240);
+        assert_eq!((api.graph_groups[&group].x, api.graph_groups[&group].y), (0, -240));
+
+        let mut add = vec![
+            Value::Int(group),
+            Value::Int(object),
+            Value::Int(0),
+            Value::Int(720),
+        ];
+        call_graph(&mut api, 0x90, 0xe8, &mut add).unwrap();
+        assert_eq!((api.graph_layers[&object].x, api.graph_layers[&object].y), (0.0, 480.0));
+        assert_eq!(api.display_tree.local_position(object), Some((0.0, 720.0)));
+    }
+
+    #[test]
+    fn graph90_32_rejects_out_of_range_alpha_and_missing_objects() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let object = api.alloc_window_surface(320, 180).unwrap();
+
+        for alpha in [-1, 257] {
+            let mut args = vec![Value::Int(object), Value::Int(alpha)];
+            let error = call_graph(&mut api, 0x90, 0x32, &mut args).unwrap_err();
+            assert!(error.to_string().contains("outside 0..=256"));
+            assert_eq!(
+                api.graph_object_properties
+                    .get(&object)
+                    .map(|properties| properties.alpha_parameter())
+                    .unwrap_or_default(),
+                0
+            );
+        }
+
+        let missing = 0x7000_1234;
+        let mut args = vec![Value::Int(missing), Value::Int(128)];
+        let error = call_graph(&mut api, 0x90, 0x32, &mut args).unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+        assert!(!api.display_tree.contains(missing));
+        assert!(!api.graph_object_properties.contains_key(&missing));
+    }
+
+    #[test]
+    fn graph90_32_accepts_sprite_slot_zero_and_repairs_display_tree_mirror() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        assert_eq!(sprite, i32::MIN, "target Sprite slot zero is 0x80000000");
+        assert!(api.graph_object_properties.contains_key(&sprite));
+        assert!(api.display_tree.contains(sprite));
+
+        // Portable presentation bookkeeping must not define native object
+        // lifetime. Simulate a lost mirror entry while retaining the native
+        // Sprite state, then verify the target setter still resolves it.
+        assert!(api.display_tree.remove(sprite));
+        assert!(!api.display_tree.contains(sprite));
+
+        let mut set_alpha = vec![Value::Int(sprite), Value::Int(91)];
+        call_graph(&mut api, 0x90, 0x32, &mut set_alpha).unwrap();
+        assert!(api.display_tree.contains(sprite));
+        assert_eq!(api.graph_object_properties[&sprite].alpha_parameter(), 91);
+    }
+
+    #[test]
+    fn graph90_33_propagates_absolute_position_through_target_child_offsets() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let parent = api.alloc_window_surface(320, 180).unwrap();
+        let child = api.alloc_window_surface(160, 90).unwrap();
+        let grandchild = api.alloc_window_surface(80, 45).unwrap();
+
+        assert!(api.attach_graph_surface(parent, child, 7.0, 8.0));
+        assert!(api.attach_graph_surface(child, grandchild, -2.0, 3.0));
+
+        let mut position = vec![Value::Int(parent), Value::Int(50), Value::Int(60)];
+        call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
+        for (object, expected) in [
+            (parent, (50, 60)),
+            (child, (57, 68)),
+            (grandchild, (55, 71)),
+        ] {
+            let native = api.graph_object_properties[&object].native;
+            assert_eq!((native.position_x, native.position_y), expected);
+            assert_eq!(
+                api.graph_surfaces
+                    .get(&object)
+                    .map(|surface| (surface.x as i32, surface.y as i32)),
+                Some(expected)
+            );
+        }
+        assert_eq!(api.display_tree.local_position(child), Some((7.0, 8.0)));
+        assert_eq!(
+            api.display_tree.local_position(grandchild),
+            Some((-2.0, 3.0))
+        );
+
+        let mut second = vec![Value::Int(parent), Value::Int(-20), Value::Int(11)];
+        call_graph(&mut api, 0x90, 0x33, &mut second).unwrap();
+        for (object, expected) in [
+            (parent, (-20, 11)),
+            (child, (-13, 19)),
+            (grandchild, (-15, 22)),
+        ] {
+            let native = api.graph_object_properties[&object].native;
+            assert_eq!((native.position_x, native.position_y), expected);
+        }
+
+        assert!(api.detach_graph_surface(parent, child));
+        assert_eq!(api.display_tree.parent(child), None);
+        let child_native = api.graph_object_properties[&child].native;
+        assert_eq!(
+            (child_native.position_x, child_native.position_y),
+            (-13, 19)
+        );
+
+        let missing = 0x7000_0033;
+        let mut args = vec![Value::Int(missing), Value::Int(1), Value::Int(2)];
+        let error = call_graph(&mut api, 0x90, 0x33, &mut args).unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+        assert!(!api.display_tree.contains(missing));
+        assert!(!api.graph_object_properties.contains_key(&missing));
+    }
+
+    #[test]
+    fn graph90_33_uses_group_member_offsets_instead_of_materialized_coordinates() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let object = api.alloc_window_surface(100, 50).unwrap();
+
+        let mut create = Vec::new();
+        let group = match call_graph(&mut api, 0x90, 0xe0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected group handle {value:?}"),
+        };
+        let mut configure = vec![
+            Value::Int(group),
+            Value::Int(100),
+            Value::Int(200),
+            Value::Int(5),
+        ];
+        call_graph(&mut api, 0x90, 0xe5, &mut configure).unwrap();
+        let mut add = vec![
+            Value::Int(group),
+            Value::Int(object),
+            Value::Int(9),
+            Value::Int(-4),
+        ];
+        call_graph(&mut api, 0x90, 0xe8, &mut add).unwrap();
+        assert_eq!(
+            api.display_tree.local_position(object),
+            Some((109.0, 196.0))
+        );
+
+        let mut position = vec![Value::Int(group), Value::Int(-30), Value::Int(40)];
+        call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
+        let native = api.graph_object_properties[&object].native;
+        assert_eq!((native.position_x, native.position_y), (-21, 36));
+        assert_eq!(api.display_tree.local_position(object), Some((9.0, -4.0)));
+    }
+
+    #[test]
+    fn graph90_34_35_39_validate_and_copy_state_through_the_child_chain() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let parent = api.alloc_window_surface(320, 180).unwrap();
+        let child = 0x8000_0042_u32 as i32;
+        api.display_tree
+            .register(child, super::NativeDisplayKind::Sprite);
+        api.display_tree.set_parent(child, parent).unwrap();
+
+        for (selector, value) in [(0x34, 37), (0x35, 91), (0x39, 173)] {
+            let mut args = vec![Value::Int(parent), Value::Int(value)];
+            call_graph(&mut api, 0x90, selector, &mut args).unwrap();
+        }
+
+        for object in [parent, child] {
+            let properties = &api.graph_object_properties[&object];
+            assert_eq!(properties.mask_alpha, 37);
+            assert_eq!(properties.native.mask_alpha, 37);
+            assert_eq!(properties.native.fixed_parameter_16_16, 91 << 16);
+            assert_eq!(properties.alpha_multiplier, 173);
+            assert_eq!(properties.native.alpha_multiplier, 173);
+        }
+
+        api.display_tree.set_parent(child, 0).unwrap();
+        assert_eq!(api.graph_object_properties[&child].native.mask_alpha, 37);
+        assert_eq!(
+            api.graph_object_properties[&child]
+                .native
+                .fixed_parameter_16_16,
+            91 << 16
+        );
+        assert_eq!(
+            api.graph_object_properties[&child].native.alpha_multiplier,
+            173
+        );
+
+        for selector in [0x34, 0x35, 0x39] {
+            for invalid in [-1, 257] {
+                let mut args = vec![Value::Int(parent), Value::Int(invalid)];
+                let error = call_graph(&mut api, 0x90, selector, &mut args).unwrap_err();
+                assert!(error.to_string().contains("outside 0..=256"));
+            }
+
+            let missing = 0x7000_0000 + i32::from(selector);
+            let mut args = vec![Value::Int(missing), Value::Int(128)];
+            let error = call_graph(&mut api, 0x90, selector, &mut args).unwrap_err();
+            assert!(error.to_string().contains("is not registered"));
+            assert!(!api.display_tree.contains(missing));
+            assert!(!api.graph_object_properties.contains_key(&missing));
+        }
+
+        assert_eq!(api.graph_object_properties[&parent].native.mask_alpha, 37);
+        assert_eq!(
+            api.graph_object_properties[&parent]
+                .native
+                .fixed_parameter_16_16,
+            91 << 16
+        );
+        assert_eq!(
+            api.graph_object_properties[&parent].native.alpha_multiplier,
+            173
+        );
+    }
+
+    #[test]
+    fn graph90_3a_validates_registered_objects_and_reinserts_by_priority() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let first = api.alloc_window_surface(320, 180).unwrap();
+        let second = api.alloc_window_surface(320, 180).unwrap();
+        assert!(api.display_tree.chain_position(first) < api.display_tree.chain_position(second));
+
+        let mut args = vec![Value::Int(first), Value::Int(5)];
+        call_graph(&mut api, 0x90, 0x3a, &mut args).unwrap();
+        assert_eq!(api.graph_object_properties[&first].native.priority, 5);
+        assert!(api.display_tree.chain_position(second) < api.display_tree.chain_position(first));
+
+        for invalid in [-1, 0x1_0000] {
+            let mut args = vec![Value::Int(first), Value::Int(invalid)];
+            let error = call_graph(&mut api, 0x90, 0x3a, &mut args).unwrap_err();
+            assert!(error.to_string().contains("outside 0..=65535"));
+        }
+        assert_eq!(api.graph_object_properties[&first].native.priority, 5);
+
+        let missing = 0x7000_003a;
+        let mut args = vec![Value::Int(missing), Value::Int(7)];
+        let error = call_graph(&mut api, 0x90, 0x3a, &mut args).unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+        assert!(!api.display_tree.contains(missing));
+        assert!(!api.graph_object_properties.contains_key(&missing));
+    }
+
+    #[test]
+    fn graph90_36_37_copy_offsets_through_children_and_reject_missing_objects() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let parent = api.alloc_window_surface(320, 180).unwrap();
+        let child = 0x8000_0043_u32 as i32;
+        api.display_tree
+            .register(child, super::NativeDisplayKind::Sprite);
+        api.display_tree.set_parent(child, parent).unwrap();
+
+        let mut secondary = vec![Value::Int(parent), Value::Int(-17), Value::Int(23)];
+        call_graph(&mut api, 0x90, 0x36, &mut secondary).unwrap();
+        let mut primary = vec![Value::Int(parent), Value::Int(101), Value::Int(-55)];
+        call_graph(&mut api, 0x90, 0x37, &mut primary).unwrap();
+
+        for object in [parent, child] {
+            let native = api.graph_object_properties[&object].native;
+            assert_eq!(
+                (native.secondary_offset_x, native.secondary_offset_y),
+                (-17, 23)
+            );
+            assert_eq!(
+                (native.primary_offset_x, native.primary_offset_y),
+                (101, -55)
+            );
+        }
+
+        api.display_tree.set_parent(child, 0).unwrap();
+        let child_native = api.graph_object_properties[&child].native;
+        assert_eq!(
+            (
+                child_native.secondary_offset_x,
+                child_native.secondary_offset_y
+            ),
+            (-17, 23)
+        );
+        assert_eq!(
+            (child_native.primary_offset_x, child_native.primary_offset_y),
+            (101, -55)
+        );
+
+        for selector in [0x36, 0x37] {
+            let missing = 0x7000_0000 + i32::from(selector);
+            let mut args = vec![Value::Int(missing), Value::Int(1), Value::Int(2)];
+            let error = call_graph(&mut api, 0x90, selector, &mut args).unwrap_err();
+            assert!(error.to_string().contains("is not registered"));
+            assert!(!api.display_tree.contains(missing));
+            assert!(!api.graph_object_properties.contains_key(&missing));
+        }
+    }
+
+    #[test]
+    fn graph91_attached_sprite_keeps_materialized_absolute_position() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = api.alloc_window_surface(897, 110).unwrap();
+        api.set_graph_object_position(window, 205.0, 612.0);
+        let sprite = 0x8000_0000_u32 as i32;
+        api.display_tree
+            .register(sprite, super::NativeDisplayKind::Sprite);
+        api.graph_layers.insert(
+            sprite,
+            RuntimeGraphLayer {
+                hit_id: sprite,
+                owner_object: None,
+                key: "attached-sprite".into(),
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                width: 360.0,
+                height: 50.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 1872,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+
+        let mut attach = vec![
+            Value::Int(window),
+            Value::Int(sprite),
+            Value::Int(-159),
+            Value::Int(-51),
+        ];
+        call_graph(&mut api, 0x91, 0x3e, &mut attach).unwrap();
+        api.graph_layers.get_mut(&sprite).unwrap().target_surface = Some(window);
+
+        assert_eq!(api.graph_native_owners.get(&sprite), Some(&window));
+        assert_eq!(api.display_tree.parent(sprite), Some(window));
+        assert_eq!(
+            api.layer_world_transform(sprite, &api.graph_layers[&sprite]),
+            (46.0, 561.0, 1872)
+        );
+    }
+
+    #[test]
+    fn graph91_40_and_graph90_33_share_backml_fixed_position_state() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 412;
+        let key = "test:backml-primary".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 8,
+                height: 6,
+                rgba: vec![255; 8 * 6 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key));
+
+        let mut initialize = vec![
+            Value::Int(0x1_8000),
+            Value::Int(-0x0_8000),
+            Value::Int(bitmap),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0x1_0000),
+            Value::Int(0x1_0000),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x91, 0x40, &mut initialize).unwrap();
+
+        let properties = &api.graph_object_properties[&0];
+        assert_eq!(
+            properties.background.unwrap().class,
+            super::native_background::NativeBackgroundClass::BackMl
+        );
+        assert_eq!(properties.native.fixed_position_x_16_16, 0x1_8000);
+        assert_eq!(properties.native.fixed_position_y_16_16, -0x0_8000);
+        assert_eq!(
+            api.display_tree.kind(0),
+            Some(super::display_tree::NativeDisplayKind::BackMl)
+        );
+        let render_id = -0x2100_0000i32;
+        assert_eq!(
+            (
+                api.graph_layers[&render_id].x,
+                api.graph_layers[&render_id].y
+            ),
+            (1.5, -0.5)
+        );
+
+        let mut position = vec![Value::Int(0), Value::Int(0x2_4000), Value::Int(0x3_8000)];
+        call_graph(&mut api, 0x90, 0x33, &mut position).unwrap();
+        let properties = &api.graph_object_properties[&0];
+        assert_eq!(properties.native.fixed_position_x_16_16, 0x2_4000);
+        assert_eq!(properties.native.fixed_position_y_16_16, 0x3_8000);
+        assert_eq!(
+            (
+                api.graph_layers[&render_id].x,
+                api.graph_layers[&render_id].y
+            ),
+            (2.25, 3.5)
+        );
+    }
+
+    #[test]
+    fn graph91_33_preserves_target_fixed_position_fields() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(320), Value::Int(180)];
+        let object = match call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected window handle {value:?}"),
+        };
+
+        let mut position = vec![
+            Value::Int(object),
+            Value::Int(0x2_8000),
+            Value::Int(-0x1_4000),
+            Value::Int(7),
+        ];
+        call_graph(&mut api, 0x91, 0x33, &mut position).unwrap();
+
+        let properties = &api.graph_object_properties[&object];
+        assert_eq!(properties.native.fixed_position_x_16_16, 0x2_8000);
+        assert_eq!(properties.native.fixed_position_y_16_16, -0x1_4000);
+        assert_eq!(properties.native.fixed_position_z_16_16, 7);
+        assert_eq!(properties.native.position_x, 2);
+        assert_eq!(properties.native.position_y, -2);
+        // Base CDspObj has +0x7C=1, so sub_41B370 mirrors arithmetic
+        // fixed X>>16/Y>>16 through vtable+0x28 into the GUI-visible object
+        // position. The fixed fields themselves retain the full fractions.
+        assert_eq!(api.graph_object_position(object), (2.0, -2.0));
+    }
+
+    #[test]
+    fn graph91_33_applies_target_fixed_position_rounding_policy() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(320), Value::Int(180)];
+        let object = match call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected window handle {value:?}"),
+        };
+
+        api.graph_object_properties
+            .entry(object)
+            .or_default()
+            .set_property(0x8000, 1, 0);
+        api.graph91_set_object_fixed_position(object, 0x1_9000, -0x1_9000, 0);
+        let properties = &api.graph_object_properties[&object];
+        assert_eq!(properties.native.fixed_position_x_16_16, 0x2_0000);
+        assert_eq!(properties.native.fixed_position_y_16_16, -0x2_0000);
+        assert_eq!((properties.native.position_x, properties.native.position_y), (2, -2));
+
+        // With mode=0, non-zero Z suppresses rounding but +0x7C still mirrors
+        // the arithmetic integer parts into the ordinary GUI position.
+        api.graph91_set_object_fixed_position(object, 0x1_9000, -0x1_9000, 1);
+        let properties = &api.graph_object_properties[&object];
+        assert_eq!(properties.native.fixed_position_x_16_16, 0x1_9000);
+        assert_eq!(properties.native.fixed_position_y_16_16, -0x1_9000);
+        assert_eq!((properties.native.position_x, properties.native.position_y), (1, -2));
+
+        // +0x84==1 forces rounding even when Z is non-zero.
+        api.graph_object_properties
+            .get_mut(&object)
+            .unwrap()
+            .set_property(0x8000, 1, 1);
+        api.graph91_set_object_fixed_position(object, 0x1_9000, -0x1_9000, 1);
+        let properties = &api.graph_object_properties[&object];
+        assert_eq!(properties.native.fixed_position_x_16_16, 0x2_0000);
+        assert_eq!(properties.native.fixed_position_y_16_16, -0x2_0000);
+    }
+
+    #[test]
+    fn window_configuration_uses_cdspobj_alpha_without_surface_double_application() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(1280), Value::Int(720)];
+        let window = match call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected window handle {value:?}"),
+        };
+
+        let mut configure = vec![
+            Value::Int(window),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(256),
+            Value::Int(0),
+            Value::Int(1944),
+        ];
+        call_graph(&mut api, 0x90, 0x85, &mut configure).unwrap();
+
+        assert_eq!(api.graph_surfaces[&window].opacity, 1.0);
+        let properties = &api.graph_object_properties[&window];
+        assert_eq!(properties.blend_mode, 1);
+        assert_eq!(properties.alpha_parameter(), 256);
+        assert_eq!(properties.opacity(), 0.0);
+    }
+
+    #[test]
+    fn native_media_loader_is_owned_by_the_vm_pointer_bridge() {
+        assert!(ethornell_vm::native_ownership::owns_before_host_dispatch(
+            0x92, 0xF1
+        ));
+    }
+
+    #[test]
+    fn title_departure_text_cleanup_keeps_bitmap_backing_and_message_text() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let node = |text: &str, screen_attached: bool| RuntimeTextNode {
+            text: text.into(),
+            enabled: true,
+            owner_object: None,
+            screen_attached,
+            target_surface: None,
+            x: 0.0,
+            y: 0.0,
+            size: 18.0,
+            line_height: 24.0,
+            formatted_layout: false,
+            color: [1.0; 4],
+            z: 0,
+            ruby_spans: Vec::new(),
+            style_spans: Vec::new(),
+        };
+
+        api.text_nodes.insert(1023, node("bitmap", false));
+        api.text_nodes.insert(40, node("menu", true));
+        api.text_nodes.insert(-100_000, node("menu child", true));
+        api.text_nodes.insert(-20_000, node("message", true));
+        api.screen_text_children.insert(40, vec![40, -100_000]);
+
+        assert_eq!(api.clear_transient_screen_text_nodes(), 2);
+        assert!(api.text_nodes.contains_key(&1023));
+        assert!(api.text_nodes.contains_key(&-20_000));
+        assert!(!api.text_nodes.contains_key(&40));
+        assert!(!api.text_nodes.contains_key(&-100_000));
+        assert!(api.screen_text_children.is_empty());
+    }
+
+    #[test]
+    fn formatted_ruby_reserves_the_target_band_without_moving_plain_text() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.graph_defaults
+            .text_layout
+            .configure([0, 1, 0, 40, 16, 1])
+            .unwrap();
+        api.graph_defaults.text_style.ruby_x_offset = 0;
+        api.graph_defaults.text_style.ruby_y_offset = -3;
+        api.graph_config
+            .text_global_properties
+            .insert(0x8000_0002, 1);
+
+        let mut node = RuntimeTextNode {
+            text: "矢古民町".into(),
+            enabled: true,
+            owner_object: None,
+            screen_attached: true,
+            target_surface: Some(275_696),
+            x: 100.0,
+            y: 50.0,
+            size: 28.0,
+            line_height: 36.0,
+            formatted_layout: true,
+            color: [1.0; 4],
+            z: 0,
+            ruby_spans: vec![RuntimeRubySpan {
+                start_char: 0,
+                end_char: 4,
+                reading: "やこたみちょう".into(),
+            }],
+            style_spans: Vec::new(),
+        };
+
+        let layout = api.formatted_text_layout(&node);
+        assert_eq!(layout.body_y_offset, 14.0);
+        assert_eq!(layout.line_height, 36.0);
+        let runs = ruby_draw_runs(&node, layout);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, "やこたみちょう");
+        assert_eq!(runs[0].2, 50.0);
+        assert_eq!(runs[0].3, 11.0);
+
+        node.formatted_layout = false;
+        let plain_layout = api.formatted_text_layout(&node);
+        assert_eq!(plain_layout.body_y_offset, 0.0);
+        assert!(ruby_draw_runs(&node, plain_layout).is_empty());
+    }
+
+    #[test]
+    fn graph92_91_direct_formatted_draw_preserves_ruby_and_style_spans() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 12_345;
+        let mut args = vec![
+            Value::Int(target),
+            Value::Str("<Rしんき>神気</R>が<c FF0000><b>満</b></c>ちる".into()),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+        ];
+
+        call_graph(&mut api, 0x92, 0x91, &mut args).unwrap();
+
+        assert!(args.is_empty());
+        let node = api.text_nodes.get(&target).expect("formatted text node");
+        assert_eq!(node.text, "神気が満ちる");
+        assert!(node.formatted_layout);
+        assert_eq!(
+            node.ruby_spans,
+            vec![RuntimeRubySpan {
+                start_char: 0,
+                end_char: 2,
+                reading: "しんき".into(),
+            }]
+        );
+        assert_eq!(node.style_spans.len(), 1);
+        assert_eq!(
+            (
+                node.style_spans[0].start_char,
+                node.style_spans[0].end_char,
+                node.style_spans[0].style.packed_rgb,
+                node.style_spans[0].style.bold,
+            ),
+            (3, 4, Some(0xff0000), true)
+        );
+        assert_eq!(
+            api.surface_text_buffers.get(&target).map(String::as_str),
+            Some("神気が満ちる")
+        );
+    }
+
+    #[test]
+    fn graph_icon_batch_rebuilds_window_backing_in_record_order() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = 0xB000_0000_u32 as i32;
+        api.graph_surfaces
+            .insert(window, RuntimeSurface::display(window, 3.0, 2.0));
+
+        let old_key = format!("runtime:bitmap:{window}");
+        api.store_graph_image(
+            old_key.clone(),
+            DecodedImage {
+                width: 3,
+                height: 2,
+                rgba: vec![0, 0, 255, 255].repeat(6),
+            },
+        );
+        api.graph_resources
+            .insert(window, RuntimeGraphResource::whole(old_key));
+
+        for (bitmap, key, rgba) in [
+            (101, "test:icon:red", [255, 0, 0, 255]),
+            (102, "test:icon:green", [0, 255, 0, 255]),
+        ] {
+            api.store_graph_image(
+                key.into(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: rgba.to_vec(),
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.into()));
+        }
+
+        assert!(api.draw_graph_icon_batch(
+            window,
+            &[
+                GraphIconRecord {
+                    x: 1,
+                    y: 1,
+                    bitmap: 101,
+                    parameter: 77,
+                },
+                GraphIconRecord {
+                    x: 1,
+                    y: 1,
+                    bitmap: 102,
+                    parameter: -1,
+                },
+                GraphIconRecord {
+                    x: 2,
+                    y: 0,
+                    bitmap: 999,
+                    parameter: 0,
+                },
+            ],
+        ));
+
+        let backing = api.graph_bitmap_image(window).unwrap();
+        assert_eq!((backing.width, backing.height), (3, 2));
+        assert_eq!(&backing.rgba[0..4], &[0, 0, 0, 0]);
+        let overlap = ((backing.width + 1) * 4) as usize;
+        assert_eq!(&backing.rgba[overlap..overlap + 4], &[0, 255, 0, 255]);
+        assert_eq!(api.graph_redraw_requested, Some(false));
+    }
+
+    #[test]
+    fn native_surface_retains_and_renders_released_bitmap_backing() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 11;
+        let surface = 0xB000_0000_u32 as i32;
+        let capture = 12;
+        let key = "test:surface-source".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 2,
+                height: 2,
+                rgba: vec![255; 2 * 2 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key));
+        api.bitmap_dimensions.insert(bitmap, (32, 24));
+        api.graph_surfaces
+            .insert(surface, RuntimeSurface::display(surface, 32.0, 24.0));
+
+        let mut configure = vec![
+            Value::Int(surface),
+            Value::Int(-1),
+            Value::Int(-1),
+            Value::Int(bitmap),
+        ];
+        call_graph(&mut api, 0x90, 0x86, &mut configure).unwrap();
+        let retained = api.graph_bitmap_image(surface).unwrap();
+        assert_eq!((retained.width, retained.height), (32, 24));
+        assert_eq!(&retained.rgba[..4], &[255; 4]);
+        assert_eq!(&retained.rgba[retained.rgba.len() - 4..], &[0; 4]);
+
+        let child_key = "test:surface-child".to_string();
+        api.store_graph_image(
+            child_key.clone(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 255, 255],
+            },
+        );
+        api.graph_layers.insert(
+            70,
+            RuntimeGraphLayer {
+                hit_id: 70,
+                owner_object: Some(71),
+                key: child_key,
+                target_surface: Some(surface),
+                x: 30.0,
+                y: 22.0,
+                width: 1.0,
+                height: 1.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 10,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        api.text_nodes.insert(
+            72,
+            RuntimeTextNode {
+                text: "A".into(),
+                enabled: true,
+                owner_object: Some(73),
+                screen_attached: true,
+                target_surface: Some(surface),
+                x: 4.0,
+                y: 2.0,
+                size: 12.0,
+                line_height: 18.0,
+                formatted_layout: false,
+                color: [1.0; 4],
+                z: 11,
+                ruby_spans: Vec::new(),
+                style_spans: Vec::new(),
+            },
+        );
+
+        let mut release = vec![Value::Int(bitmap)];
+        call_graph(&mut api, 0x90, 0x12, &mut release).unwrap();
+        assert!(api.graph_bitmap_image(bitmap).is_none());
+        assert_eq!(
+            api.graph_bitmap_image(surface)
+                .map(|image| (image.width, image.height)),
+            Some((32, 24))
+        );
+
+        let mut render = vec![Value::Int(capture), Value::Int(surface)];
+        call_graph(&mut api, 0x90, 0x83, &mut render).unwrap();
+        assert_eq!(api.bitmap_dimensions.get(&capture), Some(&(32, 24)));
+        let captured = api.graph_bitmap_image(capture).unwrap();
+        let child = ((22 * captured.width + 30) * 4) as usize;
+        assert_eq!(&captured.rgba[child..child + 4], &[0, 0, 255, 255]);
+        assert!(
+            captured
+                .rgba
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] != 0)
+                .count()
+                > 5,
+            "surface text was not included in the offscreen capture"
+        );
+    }
+
+    #[test]
+    fn alpha_mask_conversion_uses_second_argument_as_source() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let destination = 21;
+        let source = 22;
+        let key = "test:descriptor-source".to_string();
+        let pixels = vec![100, 150, 200, 128];
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: pixels.clone(),
+            },
+        );
+        api.graph_resources
+            .insert(source, RuntimeGraphResource::whole(key));
+        api.bitmap_dimensions.insert(source, (1, 1));
+        api.bitmap_formats.insert(source, 2);
+        api.bitmap_dimensions.insert(destination, (9, 9));
+
+        let mut args = vec![Value::Int(destination), Value::Int(source)];
+        call_graph(&mut api, 0x92, 0x18, &mut args).unwrap();
+        assert_eq!(api.bitmap_dimensions.get(&destination), Some(&(1, 1)));
+        assert_eq!(api.bitmap_formats.get(&destination), Some(&3));
+        assert_eq!(
+            api.graph_bitmap_image(destination).unwrap().rgba,
+            vec![70, 70, 70, 70]
+        );
+    }
+
+    #[test]
+    fn bitmap_text_draw_uses_native_argument_order_and_returns_advance() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 41;
+        api.graph_surfaces
+            .insert(bitmap, RuntimeSurface::bitmap(bitmap, 320.0, 96.0));
+        let mut args = vec![
+            Value::Int(bitmap),
+            Value::Int(20),
+            Value::Int(30),
+            Value::Str("画面".into()),
+            Value::Int(0),
+            Value::Int(20),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(0x00FF_0000),
+        ];
+
+        let result = call_graph(&mut api, 0x92, 0x1e, &mut args).unwrap();
+
+        assert!(args.is_empty());
+        assert!(matches!(result, Value::Int(advance) if advance > 20));
+        let run = api.bitmap_text_runs.get(&bitmap).unwrap().last().unwrap();
+        assert_eq!(run.text, "画面");
+        assert_eq!((run.x, run.y, run.size), (20.0, 30.0, 20.0));
+        assert_eq!(run.color, [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn font_override_does_not_clobber_persistent_ruby_style_globals() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut ruby_style = vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(7),
+            Value::Int(-3),
+            Value::Int(-1),
+            Value::Int(-1),
+            Value::Int(-1),
+        ];
+        call_graph(&mut api, 0x92, 0x97, &mut ruby_style).unwrap();
+
+        let mut font_override = vec![
+            Value::Str("MS Gothic".into()),
+            Value::Int(24),
+            Value::Int(400),
+            Value::Int(1),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x92, 0x9d, &mut font_override).unwrap();
+
+        let style = &api.graph_defaults.text_style;
+        assert_eq!(
+            (
+                style.ruby_height,
+                style.ruby_font_field,
+                style.ruby_x_offset,
+                style.ruby_y_offset,
+                style.override_0,
+                style.override_1,
+            ),
+            (0, 7, -3, -1, -1, -1)
+        );
+        let font = &api.graph_defaults.text_font_override;
+        assert_eq!(font.face_name.as_deref(), Some("MS Gothic"));
+        assert_eq!(
+            (
+                font.height,
+                font.creation_field_0,
+                font.creation_field_1,
+                font.italic
+            ),
+            (24, 400, 1, false)
+        );
+    }
+
+    #[test]
+    fn bitmap_tile_composition_preserves_the_allocated_destination_canvas() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let destination = 30;
+        let source = 31;
+        let destination_key = "runtime:bitmap:30".to_string();
+        let source_key = "test:tile".to_string();
+        api.store_graph_image(
+            destination_key.clone(),
+            DecodedImage {
+                width: 4,
+                height: 1,
+                rgba: vec![0; 4 * 4],
+            },
+        );
+        api.store_graph_image(
+            source_key.clone(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![255; 4],
+            },
+        );
+        api.graph_resources
+            .insert(destination, RuntimeGraphResource::whole(destination_key));
+        api.graph_resources
+            .insert(source, RuntimeGraphResource::whole(source_key));
+        api.graph_surfaces
+            .insert(destination, RuntimeSurface::bitmap(destination, 4.0, 1.0));
+
+        api.composite_graph_bitmap(destination, source, 0, 0, 128, 0)
+            .unwrap();
+        api.composite_graph_bitmap(destination, source, 3, 0, 128, 0)
+            .unwrap();
+
+        let image = api.graph_bitmap_image(destination).unwrap();
+        assert_eq!((image.width, image.height), (4, 1));
+        assert_eq!(&image.rgba[..4], &[255; 4]);
+        assert_eq!(&image.rgba[12..16], &[255; 4]);
+    }
+
+    #[test]
+    fn graph90_11_replaces_stale_same_handle_bitmap_storage() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 128;
+        let stale_key = format!("runtime:bitmap:{bitmap}");
+        api.store_graph_image(
+            stale_key.clone(),
+            DecodedImage {
+                width: 1380,
+                height: 820,
+                rgba: vec![255; 1380 * 820 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(stale_key));
+        api.bitmap_dimensions.insert(bitmap, (1380, 820));
+        api.bitmap_formats.insert(bitmap, 2);
+        api.graph_surfaces
+            .insert(bitmap, RuntimeSurface::bitmap(bitmap, 1380.0, 820.0));
+
+        let mut create = vec![
+            Value::Int(bitmap),
+            Value::Int(1280),
+            Value::Int(720),
+            Value::Int(1),
+        ];
+        call_graph(&mut api, 0x90, 0x11, &mut create).unwrap();
+
+        assert_eq!(api.bitmap_dimensions[&bitmap], (1280, 720));
+        assert_eq!(api.bitmap_formats[&bitmap], 1);
+        let image = api.graph_bitmap_image(bitmap).unwrap();
+        assert_eq!((image.width, image.height), (1280, 720));
+        assert!(image.rgba.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            api.graph_surfaces[&bitmap].resource_id,
+            Some(bitmap),
+            "the replacement surface must bind only its new storage"
+        );
+    }
+
+    #[test]
+    fn cloned_bitmaps_own_independent_pixel_storage() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let source = 40;
+        let destination = 41;
+        let source_key = "test:clone-source".to_string();
+        api.store_graph_image(
+            source_key.clone(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![10, 20, 30, 255],
+            },
+        );
+        api.graph_resources
+            .insert(source, RuntimeGraphResource::whole(source_key.clone()));
+        api.bitmap_dimensions.insert(source, (1, 1));
+        api.bitmap_formats.insert(source, 2);
+
+        assert!(api.clone_graph_bitmap(source, destination));
+        api.store_graph_image(
+            source_key,
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![200, 210, 220, 255],
+            },
+        );
+
+        assert_eq!(
+            api.graph_bitmap_image(destination).unwrap().rgba,
+            vec![10, 20, 30, 255]
+        );
+        assert_eq!(api.bitmap_formats.get(&destination), Some(&2));
+        assert_eq!(
+            api.resolve_resource_key(destination),
+            Some("runtime:bitmap:41")
+        );
+    }
+
+    #[test]
+    fn transition_nodes_keep_text_drawn_into_runtime_bitmaps() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let run = RuntimeTextNode {
+            text: "history text".into(),
+            enabled: true,
+            owner_object: None,
+            screen_attached: false,
+            target_surface: None,
+            x: 14.0,
+            y: 20.0,
+            size: 28.0,
+            line_height: 36.0,
+            formatted_layout: false,
+            color: [1.0; 4],
+            z: 0,
+            ruby_spans: Vec::new(),
+            style_spans: Vec::new(),
+        };
+        api.bitmap_text_runs.insert(100, vec![run.clone()]);
+        api.bitmap_text_runs.insert(101, vec![run]);
+
+        assert!(api.configure_transition_bitmap_text_node(
+            50,
+            100,
+            101,
+            128,
+            6.0,
+            16.0,
+            110,
+            Some(49),
+        ));
+        let text = &api.text_nodes[&50];
+        assert_eq!(text.text, "history text");
+        assert_eq!((text.x, text.y, text.z), (20.0, 36.0, 110));
+        assert_eq!(text.owner_object, Some(49));
+        assert!(text.screen_attached);
+    }
+
+    #[test]
+    fn surface_control_layers_keep_bitmap_text_on_the_same_surface() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_007;
+        let bitmap = 1856;
+        let key = "runtime:bitmap:1856".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 320,
+                height: 96,
+                rgba: vec![0; 320 * 96 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key));
+        api.bitmap_text_runs.insert(
+            bitmap,
+            vec![RuntimeTextNode {
+                text: "history text".into(),
+                enabled: true,
+                owner_object: None,
+                screen_attached: false,
+                target_surface: None,
+                x: 14.0,
+                y: 20.0,
+                size: 28.0,
+                line_height: 36.0,
+                formatted_layout: false,
+                color: [1.0; 4],
+                z: 0,
+                ruby_spans: Vec::new(),
+                style_spans: Vec::new(),
+            }],
+        );
+        let mut display = RuntimeSurface::display(surface, 1280.0, 720.0);
+        display.x = 40.0;
+        display.y = 30.0;
+        api.graph_surfaces.insert(surface, display);
+        let descriptor = GraphInputDescriptor {
+            groups: vec![GraphInputGroup {
+                index: 0,
+                initial_current_item: -1,
+                selection_enabled: true,
+                pointer_selection_enabled: false,
+                pointer_activation_enabled: true,
+                selection_exclusion_key: -1,
+                extended_flags: 0,
+            }],
+            regions: vec![GraphInputRegion {
+                group: 3,
+                index: 0,
+                ordinal: 11,
+                enabled_depth: 1,
+                selected: false,
+                x: 6,
+                y: 16,
+                width: 320,
+                height: 96,
+                normal_resource: bitmap,
+                selected_resource: -1,
+                hover_resource: -1,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        };
+
+        assert_eq!(api.replace_surface_control_layers(surface, &descriptor), 1);
+        let layer = *api
+            .graph_layers
+            .iter()
+            .find_map(|(id, layer)| (layer.target_surface == Some(surface)).then_some(id))
+            .unwrap();
+        let text = &api.text_nodes[&layer];
+        assert_eq!(text.text, "history text");
+        assert_eq!((text.x, text.y), (20.0, 36.0));
+        assert_eq!(text.target_surface, Some(surface));
+        assert!(text.screen_attached);
+
+        api.remove_surface_control_layers(surface);
+        assert!(!api.graph_layers.contains_key(&layer));
+        assert!(!api.text_nodes.contains_key(&layer));
+    }
+
+    #[test]
+    fn base_icon_hover_uses_dedicated_resource_and_keeps_layer_identity() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_008;
+        let normal = 1900;
+        let selected = 1901;
+        let hover = 1902;
+        for (bitmap, key, color) in [
+            (normal, "sysgrp.arc:SGMsgWnd000000", [10, 20, 30, 255]),
+            (selected, "sysgrp.arc:SGMsgWnd000002", [200, 210, 220, 255]),
+            (hover, "sysgrp.arc:SGMsgWnd000001", [100, 110, 120, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 40,
+                    height: 20,
+                    rgba: color.repeat(40 * 20),
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+        }
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        display.z = 1940;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            77,
+            super::graph_input::RuntimeGraphInputObject::new(surface),
+        );
+        let descriptor = GraphInputDescriptor {
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index: 2,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x: 10,
+                y: 20,
+                width: 40,
+                height: 20,
+                normal_resource: normal,
+                selected_resource: selected,
+                hover_resource: hover,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                flags: 0x20,
+            }],
+            ..GraphInputDescriptor::default()
+        };
+
+        GraphApi::configure_graph_input_object(&mut api, 77, descriptor);
+        let control_key = |api: &super::RuntimeTraceApi| {
+            api.graph_layers
+                .iter()
+                .find_map(|(id, layer)| {
+                    api.surface_controls
+                        .contains_layer(*id)
+                        .then(|| layer.key.clone())
+                })
+                .unwrap()
+        };
+        assert_eq!(control_key(&api), "sysgrp.arc:SGMsgWnd000000");
+        let control_layer = *api
+            .graph_layers
+            .iter()
+            .find_map(|(id, _)| api.surface_controls.contains_layer(*id).then_some(id))
+            .unwrap();
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseMove { x: 111.0, y: 521.0 },
+        );
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0x1000_0001, 0, 2]
+        );
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0x1000_0002, super::graph_input::pack_words(0, 2), 1]
+        );
+        assert_eq!(api.poll_object_event_record(77), [0; 3]);
+        assert_eq!(control_key(&api), "sysgrp.arc:SGMsgWnd000001");
+        assert!(api.graph_layers.contains_key(&control_layer));
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseMove { x: 200.0, y: 600.0 },
+        );
+        assert_eq!(api.poll_object_event_record(77), [0x1000_0001, -1, -1]);
+        assert_eq!(api.poll_object_event_record(77), [0x1000_0002, -1, 0]);
+        assert_eq!(api.poll_object_event_record(77), [0; 3]);
+        assert_eq!(control_key(&api), "sysgrp.arc:SGMsgWnd000000");
+        assert!(api.graph_layers.contains_key(&control_layer));
+    }
+
+    #[test]
+    fn native_icon_hit_test_follows_materialized_child_sprite_bounds() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_009;
+        let bitmap = 1903;
+        let key = "sysgrp.arc:SGMsgWnd000000";
+        api.store_graph_image(
+            key.to_string(),
+            DecodedImage {
+                width: 40,
+                height: 20,
+                rgba: vec![255; 40 * 20 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            78,
+            super::graph_input::RuntimeGraphInputObject::new(surface),
+        );
+        let descriptor = GraphInputDescriptor {
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index: 0,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x: 10,
+                y: 20,
+                width: 40,
+                height: 20,
+                normal_resource: bitmap,
+                selected_resource: -1,
+                hover_resource: -1,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        };
+        GraphApi::configure_graph_input_object(&mut api, 78, descriptor);
+        let control_layer = *api
+            .graph_layers
+            .iter()
+            .find_map(|(id, _)| api.surface_controls.contains_layer(*id).then_some(id))
+            .unwrap();
+
+        // Model the target child CDspObjSprite acquiring a final resolved
+        // position that differs from its configure-time descriptor offset.
+        // sub_4495C0 must follow this rendered rectangle, not stale BP x/y.
+        api.graph_layers.get_mut(&control_layer).unwrap().x = 60.0;
+        let (region, local_x, local_y) = api
+            .hit_test_graph_input_object(78, (161.0, 521.0))
+            .expect("materialized child Sprite should be hittable at its rendered position");
+        assert_eq!((region.group, region.index), (0, 0));
+        assert_eq!((local_x, local_y), (1, 1));
+        assert!(api.hit_test_graph_input_object(78, (111.0, 521.0)).is_none());
+    }
+
+    #[test]
+    fn configured_icon_children_follow_disabled_and_transparent_parent_window() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_010;
+        let object = 79;
+        let bitmap = 1904;
+        let key = "test:preloaded-message-window-control";
+        api.store_graph_image(
+            key.to_string(),
+            DecodedImage {
+                width: 40,
+                height: 20,
+                rgba: vec![255; 40 * 20 * 4],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        display.enabled = false;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 0,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: false,
+                    x: 10,
+                    y: 20,
+                    width: 40,
+                    height: 20,
+                    normal_resource: bitmap,
+                    selected_resource: -1,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+
+        let draws_key = |api: &super::RuntimeTraceApi| {
+            api.graph_draw_items().iter().any(|item| item.key == key)
+        };
+        assert!(!draws_key(&api));
+        assert!(api
+            .hit_test_graph_input_object(object, (111.0, 521.0))
+            .is_none());
+
+        let surface_record = api.graph_surfaces.get_mut(&surface).unwrap();
+        surface_record.enabled = true;
+        surface_record.opacity = 0.0;
+        assert!(!draws_key(&api));
+        assert!(api
+            .hit_test_graph_input_object(object, (111.0, 521.0))
+            .is_none());
+
+        api.graph_surfaces.get_mut(&surface).unwrap().opacity = 1.0;
+        assert!(draws_key(&api));
+        assert!(api
+            .hit_test_graph_input_object(object, (111.0, 521.0))
+            .is_some());
+    }
+
+    #[test]
+    fn native_sgmsgwnd_layers_are_not_hidden_by_compatibility_key_filters() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (layer_id, key) in [
+            (31_001, "sysgrp.arc:SGMsgWnd800000"),
+            (31_002, "sysgrp.arc:SGMsgWnd000000"),
+        ] {
+            api.display_tree
+                .register(layer_id, super::NativeDisplayKind::Sprite);
+            api.graph_layers.insert(
+                layer_id,
+                super::RuntimeGraphLayer {
+                    hit_id: layer_id,
+                    owner_object: None,
+                    key: key.to_string(),
+                    target_surface: None,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1280.0,
+                    height: 240.0,
+                    src_x: 0.0,
+                    src_y: 0.0,
+                    opacity: 1.0,
+                    z: 100,
+                    enabled: true,
+                    transform_x: 0.0,
+                    transform_y: 0.0,
+                    transform_z: 0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    rotation_degrees: 0.0,
+                    clip: None,
+                },
+            );
+            assert!(api.should_draw_graph_layer(layer_id, &api.graph_layers[&layer_id]));
+        }
+    }
+
+    #[test]
+    fn native_auto_advance_uses_the_same_press_release_path_as_real_input() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.scenario_bootstrapped = true;
+        api.native_message_active = true;
+        api.legacy_scenario_mode_input = true;
+        api.scenario_auto_mode = true;
+        api.scenario_auto_wait_frames = 45;
+
+        assert!(api.maybe_inject_scenario_mode_input());
+        assert_eq!(api.mouse_pos, Some((640.0, 650.0)));
+        assert!(api.mouse_pressed);
+        assert_eq!(api.pending_object_state, Some((640.0, 650.0)));
+        assert_eq!(api.pending_click, None);
+        assert_eq!(api.pending_input_state, Some(0x1000_0002));
+        assert_eq!(
+            api.pending_input_descriptor,
+            Some(super::INPUT_DESCRIPTOR_MOUSE_LEFT)
+        );
+        assert!(api.scenario_mode_release_pending);
+
+        api.finish_native_tick_input();
+        assert!(api.maybe_inject_scenario_mode_input());
+        assert!(!api.mouse_pressed);
+        assert_eq!(api.pending_click, Some((640.0, 650.0)));
+        assert_eq!(api.pending_input_state, Some(0x1000_0006));
+        assert!(!api.scenario_mode_release_pending);
+    }
+
+    #[test]
+    fn base_icon_hover_bf_event_is_destructive_and_press_uses_bc_state() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let mut input = super::graph_input::RuntimeGraphInputObject::new(0);
+        input.configure(GraphInputDescriptor {
+            initial_group: 0,
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index: 1,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 50,
+                normal_resource: 0,
+                selected_resource: -1,
+                hover_resource: 77,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        });
+        api.graph_input_objects.insert(77, input);
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseMove { x: 21.0, y: 31.0 },
+        );
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0x1000_0001, 0, 1]
+        );
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0x1000_0002, super::graph_input::pack_words(0, 1), 1]
+        );
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0x1000_0004, super::graph_input::pack_words(0, 1), 0]
+        );
+        assert_eq!(api.poll_object_event_record(77), [0; 3]);
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 21.0, y: 31.0 },
+        );
+        assert_eq!(
+            api.poll_object_state_record(77),
+            [0, 0, 1, 1, 11, 11],
+            "base activation is reported by Graph90:BC; native running becomes zero"
+        );
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0; 3],
+            "base DCIPIcon must not synthesize DCIPIconEx 0x10000006/07 events"
+        );
+    }
+
+    #[test]
+    fn pointer_selection_and_pointer_activation_are_independent_group_flags() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let mut input = super::graph_input::RuntimeGraphInputObject::new(0);
+        input.configure(GraphInputDescriptor {
+            initial_group: 0,
+            groups: vec![GraphInputGroup {
+                index: 0,
+                initial_current_item: -1,
+                selection_enabled: true,
+                pointer_selection_enabled: true,
+                pointer_activation_enabled: false,
+                selection_exclusion_key: -1,
+                extended_flags: 0,
+            }],
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index: 1,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 50,
+                normal_resource: 0,
+                selected_resource: -1,
+                hover_resource: 77,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        });
+        let configured_descriptor = input.descriptor.clone();
+        api.graph_input_objects.insert(77, input);
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseMove { x: 21.0, y: 31.0 },
+        );
+        assert_eq!(api.poll_object_event_record(77), [0x1000_0001, 0, 1]);
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0x1000_0002, super::graph_input::pack_words(0, 1), 1]
+        );
+        assert_eq!(
+            api.poll_object_event_record(77),
+            [0x1000_0004, super::graph_input::pack_words(0, 1), 0]
+        );
+        assert_eq!(api.poll_object_event_record(77), [0; 3]);
+        assert_eq!(
+            api.poll_object_state_record(77),
+            [1, -1, -1, 0, 0, 0],
+            "hover/current selection must not leak into Graph90:BC activation state"
+        );
+        assert_eq!(
+            api.graph_input_objects.get(&77).unwrap().descriptor,
+            configured_descriptor,
+            "runtime hover/current state must not mutate the configure-time descriptor"
+        );
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 21.0, y: 31.0 },
+        );
+        assert_eq!(
+            api.poll_object_state_record(77),
+            [0, 0, 1, 1, 11, 11],
+            "group+0x14 only controls held-button reinjection; fresh MouseDown still maps to action 1"
+        );
+        assert_eq!(api.poll_object_event_record(77), [0; 3]);
+    }
+
+    #[test]
+    fn effector_create_has_zero_arguments_and_returns_a_tagged_handle() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut stack = vec![Value::Int(0x1234_5678)];
+
+        let result = call_graph(&mut api, 0x91, 0x60, &mut stack).unwrap();
+
+        let Value::Int(handle) = result else {
+            panic!("effector creation did not return a handle");
+        };
+        assert_eq!(handle as u32, 0x9100_0000);
+        assert_eq!(stack, vec![Value::Int(0x1234_5678)]);
+        assert!(api.graph91_effectors.contains_key(&handle));
+        assert_eq!(api.graph_object_enabled.get(&handle), Some(&true));
+    }
+
+    #[test]
     fn windows_file_patterns_are_case_insensitive() {
         assert!(super::windows_wildcard_matches("save*.dat", "SAVE012.DAT"));
         assert!(super::windows_wildcard_matches("??.sav", "01.SAV"));
@@ -3700,88 +11364,403 @@ mod input_tests {
     }
 
     #[test]
-    fn report_registered_native_calls_not_owned_by_the_app_layer() {
+    fn default_runtime_trace_api_never_presents_native_dialogs() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
-        let mut unowned = Vec::new();
-        for group in [0x80, 0x81, 0x90, 0x91, 0x92, 0xA0, 0xB0, 0xC0] {
-            for id in 0..=u8::MAX {
-                let Some(abi) = ethornell_script::native_abi::lookup(group, u16::from(id)) else {
-                    continue;
-                };
-                let mut api = super::RuntimeTraceApi::new(manager.clone());
-                let mut stack = vec![Value::Int(0); abi.argc];
-                let owned = match group {
-                    0x80 | 0x81 => {
-                        let _ = SysApi::call_sys(&mut api, group, u16::from(id), &mut stack);
-                        !SysApi::take_runtime_stub(&mut api)
-                    }
-                    0x90 | 0x91 | 0x92 => {
-                        let _ = GraphApi::call_graph(&mut api, group, u16::from(id), &mut stack);
-                        !SysApi::take_runtime_stub(&mut api)
-                    }
-                    0xA0 => {
-                        let _ = SoundApi::call_sound(&mut api, group, u16::from(id), &mut stack);
-                        !SysApi::take_runtime_stub(&mut api)
-                    }
-                    0xB0 | 0xC0 => SoundApi::call_user(
-                        &mut api,
-                        group,
-                        u16::from(id),
-                        &mut stack,
-                    )
-                    .is_ok_and(|result| result.is_some()),
-                    _ => unreachable!(),
-                };
-                if !owned {
-                    unowned.push((group, id));
-                }
-            }
-        }
-        assert!(
-            unowned.iter().all(|&(group, id)| {
-                ethornell_vm::native_ownership::owns_before_host_dispatch(group, u16::from(id))
-            }),
-            "registered calls have neither a VM nor app owner: {unowned:02X?}"
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        assert_eq!(
+            SysApi::open_file_dialog(&mut api, "", "files", "dat", "open", 0),
+            Ok(None)
         );
-        let recovered = [0x80, 0x81, 0x90, 0x91, 0x92, 0xA0, 0xB0, 0xC0]
-            .into_iter()
-            .flat_map(|group| (0..=u8::MAX).map(move |id| (group, id)))
-            .filter(|&(group, id)| {
-                ethornell_script::native_abi::lookup(group, u16::from(id)).is_some()
-            })
-            .count();
-        assert_eq!(recovered, 695);
+        assert_eq!(
+            SysApi::open_resource_file_dialog(
+                &mut api,
+                0,
+                "resource",
+                "",
+                &[("files".into(), "dat".into())]
+            ),
+            Ok(None)
+        );
+        assert!(!SysApi::show_resource_list_dialog(
+            &mut api,
+            "resources",
+            "*"
+        ));
+        assert_eq!(SysApi::browse_folder(&mut api, "folder", 0), None);
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeWindowMessage {
+    serial: i32,
+    message_id: i32,
+    lparam: i32,
+    wparam: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum RuntimeInputEvent {
     MouseMove { x: f32, y: f32 },
     MousePress { x: f32, y: f32 },
     MouseRelease { x: f32, y: f32 },
     KeyPress { descriptor: i32 },
+    KeyRelease { descriptor: i32 },
+}
+
+fn queue_runtime_input_event(queue: &mut VecDeque<RuntimeInputEvent>, event: RuntimeInputEvent) {
+    if matches!(event, RuntimeInputEvent::MouseMove { .. })
+        && matches!(queue.back(), Some(RuntimeInputEvent::MouseMove { .. }))
+    {
+        queue.pop_back();
+    }
+    queue.push_back(event);
+}
+
+#[cfg(test)]
+mod runtime_input_queue_tests {
+    use super::{
+        apply_runtime_input_event, cursor_motion_scale_tolerance, queue_runtime_input_event,
+        RuntimeCursorMotion, RuntimeInputEvent, RuntimeTraceApi,
+    };
+    use ethornell_vm::Value;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn coalesces_motion_but_preserves_press_and_release_frame_edges() {
+        let mut queue = VecDeque::new();
+        queue_runtime_input_event(
+            &mut queue,
+            RuntimeInputEvent::MouseMove { x: 10.0, y: 20.0 },
+        );
+        queue_runtime_input_event(
+            &mut queue,
+            RuntimeInputEvent::MouseMove { x: 30.0, y: 40.0 },
+        );
+        queue_runtime_input_event(
+            &mut queue,
+            RuntimeInputEvent::MousePress { x: 30.0, y: 40.0 },
+        );
+        queue_runtime_input_event(
+            &mut queue,
+            RuntimeInputEvent::MouseRelease { x: 30.0, y: 40.0 },
+        );
+
+        assert_eq!(queue.len(), 3);
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeInputEvent::MouseMove { x: 30.0, y: 40.0 })
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeInputEvent::MousePress { .. })
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeInputEvent::MouseRelease { .. })
+        ));
+    }
+
+    #[test]
+    fn scoped_input_events_accumulate_and_drain_per_descriptor() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+        ethornell_vm::SysApi::register_input_scope(&mut api, 7);
+
+        apply_runtime_input_event(&mut api, RuntimeInputEvent::KeyPress { descriptor: 13 });
+        apply_runtime_input_event(&mut api, RuntimeInputEvent::KeyPress { descriptor: 13 });
+        assert_eq!(
+            ethornell_vm::SysApi::query_scoped_input_event(&mut api, 13, 7),
+            i32::MIN | 1,
+            "sub_46DA80 only increments the counters on an up-to-down edge"
+        );
+        assert_eq!(
+            ethornell_vm::SysApi::query_scoped_input_event(&mut api, 13, 7),
+            0
+        );
+
+        // Target aggregate descriptor 193 contains descriptor 13.
+        apply_runtime_input_event(&mut api, RuntimeInputEvent::KeyRelease { descriptor: 13 });
+        apply_runtime_input_event(&mut api, RuntimeInputEvent::KeyPress { descriptor: 13 });
+        assert_eq!(
+            ethornell_vm::SysApi::query_scoped_input_event(&mut api, 193, 7),
+            i32::MIN | 1
+        );
+        assert_eq!(
+            ethornell_vm::SysApi::query_scoped_input_event(&mut api, 13, 5),
+            0,
+            "a scope below the target chain head must not drain the descriptor"
+        );
+    }
+
+    #[test]
+    fn scoped_keyboard_queries_follow_the_target_priority_chain() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+        ethornell_vm::SysApi::register_input_scope(&mut api, 7);
+        ethornell_vm::SysApi::register_input_scope(&mut api, 9);
+        apply_runtime_input_event(&mut api, RuntimeInputEvent::KeyPress { descriptor: 13 });
+
+        assert_eq!(
+            ethornell_vm::SysApi::query_scoped_input_event(&mut api, 13, 7),
+            0,
+            "sub_46D810 rejects a keyboard query below the descending chain head"
+        );
+        assert_eq!(
+            ethornell_vm::SysApi::query_scoped_input_event(&mut api, 13, 10),
+            i32::MIN | 1,
+            "sub_46D810 accepts a keyboard query at or above the chain head"
+        );
+    }
+
+    #[test]
+    fn cursor_motion_uses_target_fixed_point_rounding_and_scale_tolerance() {
+        let motion = RuntimeCursorMotion::new((10, 10), (0, -1), 1_000, 3, 0, false);
+        assert_eq!(motion.steps, 3);
+        assert_eq!(motion.point_for_step(1), (6, 6));
+        assert_eq!(motion.point_for_step(3), (0, -1));
+        assert_eq!(cursor_motion_scale_tolerance(1280, 1280), 1);
+        assert_eq!(cursor_motion_scale_tolerance(640, 1280), 2);
+    }
+
+    #[test]
+    fn cursor_motion_ticks_to_target_and_cancels_after_external_displacement() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+        api.screen_width = 1280;
+        api.screen_height = 720;
+        api.window_surface_width = 1280;
+        api.window_surface_height = 720;
+        api.mouse_pos = Some((0.0, 0.0));
+        api.configure_cursor_motion(1, 4, 1_000, 0, 40, 100);
+        api.tick_cursor_motion(250);
+        assert_eq!(api.pending_cursor_position, Some((25.0, 10.0)));
+        assert!(api.cursor_motion.is_some());
+
+        api.mouse_pos = Some((30.0, 10.0));
+        api.tick_cursor_motion(250);
+        assert!(api.cursor_motion.is_none());
+        assert_eq!(api.pending_cursor_position, Some((25.0, 10.0)));
+    }
+
+    #[test]
+    fn cursor_idle_timeout_uses_the_shared_frame_and_input_paths() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+
+        let mut enable = ethornell_vm::NativeCallFrame::new(
+            ethornell_vm::NativeOpcode {
+                group: 0xB0,
+                id: 0x05,
+            },
+            vec![Value::Int(100)],
+        );
+        api.dispatch_native_user(&mut enable).unwrap().unwrap();
+        api.advance_cursor_idle(99);
+        assert!(api.cursor_visible);
+        api.advance_cursor_idle(1);
+        assert!(!api.cursor_visible);
+        assert!(!api.cursor_visibility_latch);
+        assert!(!api.cursor_idle_visible);
+        assert_eq!(api.pending_cursor_visible, Some(false));
+
+        apply_runtime_input_event(&mut api, RuntimeInputEvent::MouseMove { x: 10.0, y: 20.0 });
+        assert!(api.cursor_visible);
+        assert!(api.cursor_visibility_latch);
+        assert!(api.cursor_idle_visible);
+        assert_eq!(api.cursor_idle_remaining_ms, 100);
+
+        api.advance_cursor_idle(100);
+        assert!(!api.cursor_visible);
+        let mut disable = ethornell_vm::NativeCallFrame::new(
+            ethornell_vm::NativeOpcode {
+                group: 0xB0,
+                id: 0x05,
+            },
+            vec![Value::Int(0)],
+        );
+        api.dispatch_native_user(&mut disable).unwrap().unwrap();
+        assert!(api.cursor_visible);
+        assert!(api.cursor_visibility_latch);
+        assert_eq!(api.cursor_idle_timeout_ms, 0);
+    }
+
+    #[test]
+    fn cursor_visibility_query_returns_old_latch_then_refreshes_when_unbound() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = RuntimeTraceApi::new(manager);
+
+        assert!(api.query_cursor_visibility_latch(true));
+        assert!(!api.cursor_visibility_latch);
+        assert!(!api.query_cursor_visibility_latch(false));
+        assert!(!api.cursor_visibility_latch);
+
+        api.cursor_visibility_latch = true;
+        api.native_user.cursor_object = Some((77, 0, 0));
+        assert!(api.query_cursor_visibility_latch(true));
+        assert!(api.cursor_visibility_latch);
+    }
+}
+
+fn pack_window_message_point(x: f32, y: f32) -> i32 {
+    let x = x.round() as i16 as u16 as u32;
+    let y = y.round() as i16 as u16 as u32;
+    ((y << 16) | x) as i32
+}
+
+fn push_runtime_window_message(
+    api: &mut RuntimeTraceApi,
+    message_id: i32,
+    lparam: i32,
+    wparam: i32,
+) {
+    api.window_messages.push_back(RuntimeWindowMessage {
+        serial: api.input_message_serial,
+        message_id,
+        lparam,
+        wparam,
+    });
+    // The target waiter list stores only the latest payload per registered
+    // message. Bound the portable history while preserving enough ordering for
+    // multiple simultaneously installed VM instances.
+    while api.window_messages.len() > 256 {
+        api.window_messages.pop_front();
+    }
+}
+
+fn cursor_motion_scale_tolerance(logical: i32, surface: i32) -> u32 {
+    if logical <= 0 || surface <= 0 {
+        return 1;
+    }
+    let smaller = logical.min(surface) as u64;
+    let larger = logical.max(surface) as u64;
+    ((larger + smaller - 1) / smaller).clamp(1, u64::from(u32::MAX)) as u32
+}
+
+fn drain_native_input_descriptor(api: &mut RuntimeTraceApi, descriptor: i32) -> i32 {
+    let aggregate: &[i32] = match descriptor {
+        193 => &[13],
+        194 => &[32],
+        195 => &[38, 14],
+        196 => &[40, 15],
+        197..=215 => &[],
+        _ => {
+            let count = api.input_event_counts.remove(&descriptor).unwrap_or(0) as i32;
+            let first_held = api.input_down_descriptors.contains(&descriptor)
+                && api.input_down_reported.insert(descriptor);
+            return count | if first_held { i32::MIN } else { 0 };
+        }
+    };
+    let mut count = 0i32;
+    let mut held = 0i32;
+    for child in aggregate {
+        let value = drain_native_input_descriptor(api, *child);
+        count = count.wrapping_add(value & i32::MAX);
+        held |= value & i32::MIN;
+    }
+    count | held
+}
+
+fn note_native_input_press(api: &mut RuntimeTraceApi, descriptor: i32) {
+    if !api.input_down_descriptors.insert(descriptor) {
+        return;
+    }
+    let count = api.input_event_counts.entry(descriptor).or_default();
+    *count = count.saturating_add(1).min(i32::MAX as u32);
+    let accumulator = api
+        .input_descriptor_accumulators
+        .entry(descriptor)
+        .or_default();
+    *accumulator = accumulator.saturating_add(1).min(i32::MAX as u32);
+    api.input_down_reported.remove(&descriptor);
+}
+
+fn note_native_input_release(api: &mut RuntimeTraceApi, descriptor: i32) {
+    api.input_down_descriptors.remove(&descriptor);
+    api.input_down_reported.remove(&descriptor);
+}
+
+/// `sub_46E070(mask)` sums the non-consuming +0x0C activation accumulator for
+/// every descriptor linked from each selected input-class list.  Our
+/// `configured_input_classes` is the portable copy of those target lists and
+/// `input_descriptor_accumulators` is the recovered dword_518CA4 table.
+fn native_input_activation_serial(api: &RuntimeTraceApi, mask: i32) -> u64 {
+    let mut total = 0_u64;
+    for (&class_mask, descriptors) in &api.configured_input_classes {
+        // sub_46E070's table ends at 0x40000000.  The sign-bit descriptor
+        // list belongs to sub_46DE30 and is sampled separately.
+        if class_mask == i32::MIN || (mask & class_mask) == 0 {
+            continue;
+        }
+        for descriptor in descriptors {
+            total = total.saturating_add(u64::from(
+                api.input_descriptor_accumulators
+                    .get(descriptor)
+                    .copied()
+                    .unwrap_or_default(),
+            ));
+        }
+    }
+    total
+}
+
+fn native_keyboard_scope_eligible(api: &RuntimeTraceApi, packed: i32) -> bool {
+    api.input_configuration_enabled != 0
+        && api
+            .registered_keyboard_input_scopes
+            .top_scope()
+            .is_none_or(|top| packed as u32 >= top)
+}
+
+fn native_pointer_scope_eligible(api: &RuntimeTraceApi, packed: i32) -> bool {
+    api.registered_pointer_input_scopes.top_scope() == Some(packed as u32)
 }
 
 fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent) {
+    let acknowledges_blocking_message = matches!(
+        &event,
+        RuntimeInputEvent::MouseRelease { .. }
+            | RuntimeInputEvent::KeyPress {
+                descriptor: INPUT_DESCRIPTOR_ENTER
+            }
+    );
+    if acknowledges_blocking_message && api.native_user.acknowledge_blocking_message() {
+        tracing::info!(?event, "blocking native message acknowledged");
+        return;
+    }
     if api.input_requires_focus && !api.window_focused {
         tracing::debug!(?event, "input ignored while the game window is not focused");
         return;
     }
+    api.note_cursor_activity();
+    api.input_message_serial = api.input_message_serial.wrapping_add(1);
     match event {
         RuntimeInputEvent::MouseMove { x, y } => {
-            api.mouse_pos = Some((x, y));
+            let point = (x, y);
+            api.mouse_pos = Some(point);
+            api.update_graph_pointer_hover(point);
+            push_runtime_window_message(api, 0x0200, pack_window_message_point(x, y), 0);
         }
         RuntimeInputEvent::MousePress { x, y } => {
+            note_native_input_press(api, INPUT_DESCRIPTOR_MOUSE_LEFT);
             let point = Some((x, y));
             api.mouse_pos = point;
+            api.process_graph_input_mouse_press((x, y));
             api.mouse_pressed = true;
             api.pending_object_state = point;
             api.pending_input_state = Some(0x1000_0002);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
             api.pending_input_consumed = false;
+            push_runtime_window_message(api, 0x0201, pack_window_message_point(x, y), 1);
         }
         RuntimeInputEvent::MouseRelease { x, y } => {
+            note_native_input_release(api, INPUT_DESCRIPTOR_MOUSE_LEFT);
             let point = Some((x, y));
             api.mouse_pos = point;
             api.mouse_pressed = false;
@@ -3790,11 +11769,21 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             api.pending_input_state = Some(0x1000_0006);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
             api.pending_input_consumed = false;
+            push_runtime_window_message(api, 0x0202, pack_window_message_point(x, y), 0);
         }
         RuntimeInputEvent::KeyPress { descriptor } => {
+            note_native_input_press(api, descriptor);
             api.pending_input_state = Some(0x1000_0002);
             api.pending_input_descriptor = Some(descriptor);
             api.pending_input_consumed = false;
+            push_runtime_window_message(api, 0x0100, 0, descriptor);
+        }
+        RuntimeInputEvent::KeyRelease { descriptor } => {
+            note_native_input_release(api, descriptor);
+            api.pending_input_state = Some(0x1000_0006);
+            api.pending_input_descriptor = Some(descriptor);
+            api.pending_input_consumed = false;
+            push_runtime_window_message(api, 0x0101, 0, descriptor);
         }
     }
 }
@@ -3810,6 +11799,13 @@ fn apply_headless_input_event(api: &mut RuntimeTraceApi, event: HeadlessInputEve
                 return;
             };
             RuntimeInputEvent::KeyPress { descriptor }
+        }
+        HeadlessInputEvent::KeyRelease { key } => {
+            let Some(descriptor) = input_descriptor_for_headless_key(&key) else {
+                tracing::warn!(key, "unsupported headless input key");
+                return;
+            };
+            RuntimeInputEvent::KeyRelease { descriptor }
         }
     };
     tracing::info!(event = ?runtime_event, "scripted runtime input");
@@ -3841,13 +11837,438 @@ fn empty_bp_program(name: String) -> ethornell_script::BpProgram {
     }
 }
 
+fn contains_byte_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+impl RuntimeTraceApi {
+    /// Advance pointer-hit/current-item state for one host pointer movement.
+    ///
+    /// This mirrors the pointer prefix of target `sub_448690` in its observed
+    /// order. The native processor itself runs independently of Graph90:BC/BF:
+    /// 1. `sub_4495C0(...,0,0)` updates DCIPIcon+0x80 and queues 0x10000001
+    ///    when the raw hit changes.
+    /// 2. `sub_449760 -> vtable+0x1C` updates pointer-current DCIPIcon+0x74;
+    ///    vtable+0x10 queues 0x10000002 when it changes.
+    /// 3. When pointer processing and the group's +0x10 flag are enabled,
+    ///    pointer motion can update the group's +0x08 current item through
+    ///    `sub_449A60 -> sub_449BC0`, then queue 0x10000004.
+    ///
+    /// None of these pointer states are Graph90:BC activation group/item/state.
+    fn update_graph_pointer_hover(&mut self, point: (f32, f32)) {
+        let objects = self
+            .graph_input_objects
+            .iter()
+            .filter_map(|(&object, input)| (!input.descriptor.regions.is_empty()).then_some(object))
+            .collect::<Vec<_>>();
+
+        for object in objects {
+            let hit = self.hit_test_graph_input_object(object, point);
+            let current_hit = hit
+                .as_ref()
+                .map(|(region, _, _)| (region.group, region.index));
+            let (previous_raw, previous_hover, is_extended) = self
+                .graph_input_objects
+                .get(&object)
+                .map(|input| (input.raw_hit, input.hovered, input.extended))
+                .unwrap_or((None, None, false));
+
+            // sub_448690 queues event 1 before it updates pointer-current.
+            if previous_raw != current_hit {
+                let event = current_hit
+                    .map(|(group, item)| [0x1000_0001, group, item])
+                    .unwrap_or([0x1000_0001, -1, -1]);
+                if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                    input.raw_hit = current_hit;
+                    input.queue_event(event);
+                }
+            }
+
+            if previous_hover != current_hit {
+                let (event_payload, event_parameter, suppress_extended_event) = match hit {
+                    Some((region, local_x, local_y)) => {
+                        if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                            input.observe_hit(Some((region, local_x, local_y)));
+                        }
+                        (
+                            graph_input::pack_words(region.group, region.index),
+                            i32::from(region.hover_resource != -1),
+                            region.flags & 0x4 != 0,
+                        )
+                    }
+                    None => {
+                        if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                            input.observe_hit(None);
+                        }
+                        (-1, 0, false)
+                    }
+                };
+                let should_queue =
+                    !is_extended || !suppress_extended_event || current_hit.is_none();
+                if should_queue {
+                    if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                        input.queue_event([0x1000_0002, event_payload, event_parameter]);
+                    }
+                }
+                self.refresh_graph_input_control_layers(object);
+            }
+
+            // Pointer movement can also move the per-group current item, but
+            // only when the descriptor explicitly enables that behavior. This
+            // is separate from pointer-current hover and may therefore update
+            // the selected/current visual even while the hovered item itself
+            // did not change.
+            if let Some((region, _, _)) = hit {
+                let changed = self
+                    .graph_input_objects
+                    .get_mut(&object)
+                    .is_some_and(|input| input.select_pointer_item(region.group, region.index));
+                if changed {
+                    if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                        input.queue_event([
+                            0x1000_0004,
+                            graph_input::pack_words(region.group, region.index),
+                            0,
+                        ]);
+                    }
+                    self.refresh_graph_input_control_layers(object);
+                }
+            }
+
+            tracing::debug!(
+                target: "graph_input",
+                object,
+                ?previous_raw,
+                ?previous_hover,
+                ?current_hit,
+                "advanced native icon pointer state"
+            );
+        }
+    }
+
+    /// Recompute the pointer-current item immediately after Graph90:BA/Graph91
+    /// configure. Target sub_447C10/sub_44A900 initializes the raw hit field
+    /// silently, then invokes the pointer-current callback and may queue only
+    /// the corresponding 0x10000002 record. It does not run pointer-driven
+    /// group selection as though a new MouseMove had arrived.
+    fn initialize_graph_pointer_after_config(&mut self, object: i32, point: (f32, f32)) {
+        let hit = self.hit_test_graph_input_object(object, point);
+        let current_hit = hit
+            .as_ref()
+            .map(|(region, _, _)| (region.group, region.index));
+        let (previous_hover, is_extended) = self
+            .graph_input_objects
+            .get(&object)
+            .map(|input| (input.hovered, input.extended))
+            .unwrap_or((None, false));
+        if let Some(input) = self.graph_input_objects.get_mut(&object) {
+            input.raw_hit = current_hit;
+        }
+        if previous_hover == current_hit {
+            return;
+        }
+        let (payload, parameter, suppress_extended_event) = match hit {
+            Some((region, local_x, local_y)) => {
+                if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                    input.observe_hit(Some((region, local_x, local_y)));
+                }
+                (
+                    graph_input::pack_words(region.group, region.index),
+                    i32::from(region.hover_resource != -1),
+                    region.flags & 0x4 != 0,
+                )
+            }
+            None => {
+                if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                    input.observe_hit(None);
+                }
+                (-1, 0, false)
+            }
+        };
+        if !is_extended || !suppress_extended_event || current_hit.is_none() {
+            if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                input.queue_event([0x1000_0002, payload, parameter]);
+            }
+        }
+        self.refresh_graph_input_control_layers(object);
+    }
+
+    /// Advance active DCIPIcon/DCIPIconEx processors for one fresh left-button
+    /// edge. This mirrors the action-1 path of target `sub_4485A0 ->
+    /// sub_448690`; Graph90:BC/BF only expose state already produced here.
+    ///
+    /// Fresh MouseDown is first masked by root+0x14 and mapped through the
+    /// root+0x18 action table. Internal group+0x14 is not a fresh-click gate;
+    /// it is consulted only by the later held-button reinjection path.
+    fn process_graph_input_mouse_press(&mut self, point: (f32, f32)) {
+        // sub_448690 updates raw/pointer-current state before resolving action.
+        self.update_graph_pointer_hover(point);
+
+        let objects = self
+            .graph_input_objects
+            .iter()
+            .filter_map(|(&object, input)| {
+                (input.is_running() && !input.descriptor.regions.is_empty()).then_some(object)
+            })
+            .collect::<Vec<_>>();
+
+        for object in objects {
+            let action = self
+                .graph_input_objects
+                .get(&object)
+                .map(|input| input.map_fresh_mouse_left_action(&self.graph_key_assignments))
+                .unwrap_or_default();
+            if action != 1 {
+                tracing::debug!(
+                    target: "graph_input",
+                    object,
+                    action,
+                    "fresh mouse-left did not map to DCIPIcon action 1"
+                );
+                continue;
+            }
+
+            let hit = self.hit_test_graph_input_object(object, point);
+            let Some((region, local_x, local_y)) = hit else {
+                // Base DCIPIcon's action-with-no-item callback is a no-op.
+                // DCIPIconEx overrides vtable+0x18 with sub_44B9E0 and queues
+                // 0x10000007 carrying processor-local coordinates.
+                if self
+                    .graph_input_objects
+                    .get(&object)
+                    .is_some_and(|input| input.extended)
+                {
+                    let (object_x, object_y) = self.graph_input_object_local_point(object, point);
+                    if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                        input.queue_event([
+                            0x1000_0007,
+                            -1,
+                            graph_input::pack_words(object_y, object_x),
+                        ]);
+                    }
+                }
+                continue;
+            };
+
+            let (extended, activation_allowed) = self
+                .graph_input_objects
+                .get(&object)
+                .map(|input| (input.extended, input.pointer_activation_allowed(region)))
+                .unwrap_or((false, false));
+            if !activation_allowed {
+                tracing::info!(
+                    target: "graph_input",
+                    object,
+                    group = region.group,
+                    item = region.index,
+                    extended,
+                    "native icon-input press rejected by target item gates"
+                );
+                continue;
+            }
+
+            if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                input.begin_interaction(region, local_x, local_y);
+                if extended {
+                    let payload = graph_input::pack_words(region.group, region.index);
+                    input.queue_event([
+                        0x1000_0007,
+                        payload,
+                        graph_input::pack_words(local_y, local_x),
+                    ]);
+                    input.queue_event([0x1000_0006, payload, 1]);
+                }
+            }
+            self.last_hit_control = graph_input::pack_words(region.group, region.index);
+            self.last_hit_payload = region.index;
+            tracing::info!(
+                target: "graph_input",
+                object,
+                group = region.group,
+                item = region.index,
+                local_x,
+                local_y,
+                extended,
+                "native icon-input press activated item"
+            );
+        }
+    }
+
+    fn refresh_graph_input_control_layers(&mut self, object: i32) {
+        let Some((surface, descriptor, hovered, selections, extended)) = self
+            .graph_input_objects
+            .get(&object)
+            .map(|input| {
+                (
+                    input.layer,
+                    input.descriptor.clone(),
+                    input.hovered,
+                    input.selected_region_values(),
+                    input.extended,
+                )
+            })
+        else {
+            return;
+        };
+        if !self.graph_surfaces.contains_key(&surface) {
+            return;
+        }
+
+        // Target DCIPIcon has three independent visual state inputs:
+        //   item+0x0C normal, item+0x14 pointer-hover, item+0x10 group-selected.
+        // sub_4499F0 applies hover first and selected last, so selected wins when
+        // both are active. DCIPIconEx additionally owns item+0x2C for the
+        // hover+selected combination. Never encode any of these runtime states
+        // back into descriptor.selected: the BP descriptor is configure-time
+        // data and target pointer tracking lives in separate object fields.
+        let updates = self
+            .graph_layers
+            .iter()
+            .filter_map(|(&layer_id, layer)| {
+                if layer.target_surface != Some(surface)
+                    || !self.surface_controls.contains_layer(layer_id)
+                {
+                    return None;
+                }
+                let region = descriptor.regions.get(usize::try_from(layer.hit_id).ok()?)?;
+                let selected = usize::try_from(region.group)
+                    .ok()
+                    .and_then(|group| selections.get(group))
+                    .is_some_and(|&index| index == region.index);
+                let is_hovered = hovered == Some((region.group, region.index));
+
+                let preferred = if extended
+                    && selected
+                    && is_hovered
+                    && region.hover_selected_resource >= 0
+                {
+                    region.hover_selected_resource
+                } else if selected && region.selected_resource >= 0 {
+                    region.selected_resource
+                } else if is_hovered && region.hover_resource >= 0 {
+                    region.hover_resource
+                } else {
+                    region.normal_resource
+                };
+                let resource_id = self
+                    .resource_image_region(preferred)
+                    .map(|_| preferred)
+                    .or_else(|| {
+                        self.resource_image_region(region.normal_resource)
+                            .map(|_| region.normal_resource)
+                    })?;
+                let (key, source) = self.resource_image_region(resource_id)?;
+                let width = if region.width > 0 {
+                    region.width as f32
+                } else {
+                    source.width
+                };
+                let height = if region.height > 0 {
+                    region.height as f32
+                } else {
+                    source.height
+                };
+                Some((
+                    layer_id,
+                    resource_id,
+                    key.to_string(),
+                    source,
+                    region.x as f32,
+                    region.y as f32,
+                    width,
+                    height,
+                    layer.z,
+                    selected,
+                    is_hovered,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        for (layer_id, resource_id, key, source, x, y, width, height, z, selected, hovered) in updates {
+            let changed = self.graph_layers.get(&layer_id).is_some_and(|layer| {
+                layer.key != key
+                    || layer.src_x != source.x
+                    || layer.src_y != source.y
+                    || layer.x != x
+                    || layer.y != y
+                    || layer.width != width
+                    || layer.height != height
+            });
+            if !changed {
+                continue;
+            }
+            if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
+                layer.key = key.clone();
+                layer.src_x = source.x;
+                layer.src_y = source.y;
+                layer.x = x;
+                layer.y = y;
+                layer.width = width;
+                layer.height = height;
+            }
+            // Keep the native control layer identity stable. Only its bitmap is
+            // changed, matching sub_4497A0/sub_449BC0 instead of destroying and
+            // recreating the window's control layer set.
+            // `configure_image_bitmap_text_node` atomically replaces the
+            // compatibility text children itself. Do not explicitly release
+            // the node first: that used to perform the same destructive
+            // teardown twice on every pointer-current change.
+            if self.configure_image_bitmap_text_node(layer_id, resource_id, x, y, z, None) {
+                self.set_screen_text_node_surface(layer_id, Some(surface));
+            }
+            tracing::debug!(
+                target: "graph_input",
+                object,
+                layer_id,
+                resource_id,
+                selected,
+                hovered,
+                key,
+                "updated icon input visual state"
+            );
+        }
+    }
+
+}
+
 impl ethornell_vm::SysApi for RuntimeTraceApi {
+    fn seed_native_crt_rng(&mut self, seed: u32) {
+        RuntimeTraceApi::seed_native_crt_rng(self, seed);
+    }
+
+    fn next_native_crt_rand(&mut self) -> Option<i32> {
+        Some(RuntimeTraceApi::next_native_crt_rand(self))
+    }
+
     fn take_runtime_stub(&mut self) -> bool {
         std::mem::take(&mut self.runtime_stubbed)
     }
 
-    fn observe_dispatch(&mut self, group: u8, id: u16) {
-        self.record_call(group, id);
+    fn set_performance_profiling(&mut self, enabled: bool) {
+        self.performance_profile.set_enabled(enabled);
+    }
+
+    fn read_performance_metric(&mut self, selector: i32) -> i32 {
+        self.performance_profile.metric(selector)
+    }
+
+    fn presentation_state(&mut self) -> i32 {
+        self.presentation_state
+    }
+
+    fn graphics_capability_record(&mut self) -> [u32; 16] {
+        self.graphics_capabilities
+    }
+
+    fn graphics_memory_metric(&mut self) -> i32 {
+        self.graphics_memory_metric
+    }
+
+    fn observe_dispatch(&mut self, opcode: ethornell_vm::NativeOpcode) {
+        self.record_call(opcode.group, opcode.id);
     }
 
     fn register_graphic_resource(&mut self, namespace: i32, resource_id: i32, path: &str) -> bool {
@@ -3938,8 +12359,363 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         self.cached_file_size(archive, file)
     }
 
+    fn primary_resource_root(&mut self) -> Option<String> {
+        Some(self.native_root.to_string_lossy().into_owned())
+    }
+
+    fn directory_exists(&mut self, path: &str) -> bool {
+        let normalized = path.replace('\\', std::path::MAIN_SEPARATOR_STR);
+        let candidate = Path::new(&normalized);
+        let path = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.native_root.join(candidate)
+        };
+        let exists = path.is_dir();
+        tracing::debug!(path = %path.display(), exists, "DirectoryExists");
+        exists
+    }
+
+    fn special_folder_path(&mut self, mode: i32) -> Option<String> {
+        let game_root = self.native_root.clone();
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        let path = match mode {
+            0 => std::env::var_os("WINDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| game_root.clone()),
+            1 => home.as_ref().map(|root| root.join("Desktop"))?,
+            2 => {
+                #[cfg(target_os = "windows")]
+                {
+                    std::env::var_os("APPDATA")
+                        .map(PathBuf::from)
+                        .map(|root| root.join("Microsoft/Windows/Start Menu/Programs"))?
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    home.as_ref()?.join(".local/share/applications")
+                }
+            }
+            3 => home.as_ref().map(|root| root.join("Documents"))?,
+            4 => std::env::var_os("CommonProgramFiles")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| game_root.clone()),
+            5 => std::env::var_os("ProgramFiles")
+                .map(PathBuf::from)
+                .unwrap_or(game_root),
+            _ => return None,
+        };
+        Some(path.to_string_lossy().into_owned())
+    }
+
+    fn open_file_dialog(
+        &mut self,
+        initial_dir: &str,
+        description: &str,
+        extension: &str,
+        title: &str,
+        mode: i32,
+    ) -> std::result::Result<Option<String>, i32> {
+        if !self.native_dialog_presentation {
+            return Ok(None);
+        }
+        let dialog_mode = match mode {
+            0 => host_dialog::PathDialogMode::OpenFile,
+            1 => host_dialog::PathDialogMode::SaveFile,
+            _ => return Err(4),
+        };
+        let filters = [host_dialog::PathDialogFilter {
+            label: description.to_string(),
+            extension: extension.to_string(),
+        }];
+        Ok(host_dialog::choose_path(
+            dialog_mode,
+            title,
+            initial_dir,
+            "",
+            &filters,
+        ))
+    }
+
+    fn open_resource_file_dialog(
+        &mut self,
+        mode: i32,
+        title: &str,
+        default_name: &str,
+        filters: &[(String, String)],
+    ) -> std::result::Result<Option<String>, i32> {
+        if !self.native_dialog_presentation {
+            return Ok(None);
+        }
+        if filters.is_empty() {
+            return Err(7);
+        }
+        let dialog_mode = match mode {
+            0 => host_dialog::PathDialogMode::OpenFile,
+            1 => host_dialog::PathDialogMode::SaveFile,
+            _ => return Err(4),
+        };
+        let filters = filters
+            .iter()
+            .map(|(label, extension)| host_dialog::PathDialogFilter {
+                label: label.clone(),
+                extension: extension.clone(),
+            })
+            .collect::<Vec<_>>();
+        let initial_directory = self.native_root.to_string_lossy().into_owned();
+        Ok(host_dialog::choose_path(
+            dialog_mode,
+            title,
+            &initial_directory,
+            default_name,
+            &filters,
+        ))
+    }
+
+    fn show_resource_list_dialog(&mut self, title: &str, pattern: &str) -> bool {
+        if !self.native_dialog_presentation {
+            return false;
+        }
+        let entries = self.enumerate_user_files(pattern, true, usize::MAX);
+        let text = if entries.is_empty() {
+            format!("No resources matched: {pattern}")
+        } else {
+            entries.join("\n")
+        };
+        host_dialog::show_text(title, &text)
+    }
+
+    fn browse_folder(&mut self, title: &str, root: i32) -> Option<String> {
+        if !self.native_dialog_presentation {
+            return None;
+        }
+        let initial = self
+            .special_folder_path(root)
+            .unwrap_or_else(|| self.native_root.to_string_lossy().into_owned());
+        host_dialog::choose_path(
+            host_dialog::PathDialogMode::Folder,
+            title,
+            &initial,
+            "",
+            &[],
+        )
+    }
+
+    fn locate_removable_archive_root(
+        &mut self,
+        archive_name: &str,
+        prompt: &str,
+        subdirectory: &str,
+        retry: bool,
+    ) -> Option<String> {
+        fn append_directory_children(root: &Path, output: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    output.push(entry.path());
+                }
+            }
+        }
+
+        fn native_relative_path(value: &str) -> Option<PathBuf> {
+            let normalized = value.trim().replace('\\', "/");
+            let without_drive = if normalized.as_bytes().get(1) == Some(&b':')
+                && normalized
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic())
+            {
+                &normalized[2..]
+            } else {
+                &normalized
+            };
+            let normalized = without_drive.trim_start_matches('/');
+            if normalized.is_empty() {
+                return None;
+            }
+            let mut path = PathBuf::new();
+            for component in Path::new(normalized).components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::Normal(name) => path.push(name),
+                    std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_) => return None,
+                }
+            }
+            (!path.as_os_str().is_empty()).then_some(path)
+        }
+
+        fn matched_root(marker: &Path) -> Option<PathBuf> {
+            if marker.is_dir() {
+                Some(marker.to_path_buf())
+            } else if marker.is_file() {
+                marker.parent().map(Path::to_path_buf)
+            } else {
+                None
+            }
+        }
+
+        let archive_marker = native_relative_path(archive_name);
+        let secondary_marker = native_relative_path(subdirectory);
+        let title = self
+            .pending_window_title
+            .clone()
+            .unwrap_or_else(|| "Ethornell".to_string());
+        let game_root = self.native_root.clone();
+
+        tracing::info!(
+            archive_name,
+            subdirectory,
+            retry,
+            game_root = %game_root.display(),
+            loaded_archives = self.manager.archives().archives.len(),
+            "LocateRemovableArchiveRoot"
+        );
+
+        loop {
+            if let Some(root) = std::env::var_os("ETHORNELL_SECONDARY_RESOURCE_ROOT")
+                .map(PathBuf::from)
+                .filter(|root| root.is_dir())
+            {
+                tracing::info!(root = %root.display(), "secondary resource root selected from environment");
+                return Some(root.to_string_lossy().into_owned());
+            }
+
+            let mut candidates = vec![game_root.clone()];
+            if let Some(parent) = game_root.parent() {
+                candidates.push(parent.to_path_buf());
+            }
+            if let Ok(current) = std::env::current_dir() {
+                candidates.push(current);
+            }
+            if let Ok(executable) = std::env::current_exe() {
+                if let Some(parent) = executable.parent() {
+                    candidates.push(parent.to_path_buf());
+                }
+            }
+            #[cfg(target_os = "windows")]
+            for drive in b'A'..=b'Z' {
+                let root = PathBuf::from(format!("{}:\\", drive as char));
+                if root.exists() {
+                    candidates.push(root);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            append_directory_children(Path::new("/Volumes"), &mut candidates);
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                append_directory_children(Path::new("/mnt"), &mut candidates);
+                if let Some(user) = std::env::var_os("USER") {
+                    append_directory_children(&Path::new("/media").join(&user), &mut candidates);
+                    append_directory_children(&Path::new("/run/media").join(user), &mut candidates);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+
+            let mut marker_variants = Vec::<PathBuf>::new();
+            if let Some(marker) = archive_marker.as_ref() {
+                marker_variants.push(marker.clone());
+            }
+            if let Some(marker) = secondary_marker.as_ref() {
+                marker_variants.push(marker.clone());
+            }
+            if let (Some(first), Some(second)) =
+                (secondary_marker.as_ref(), archive_marker.as_ref())
+            {
+                marker_variants.push(first.join(second));
+                marker_variants.push(second.join(first));
+            }
+            marker_variants.sort();
+            marker_variants.dedup();
+
+            for candidate in &candidates {
+                for marker in &marker_variants {
+                    if let Some(found) = resolve_existing_path_case_insensitive(candidate, marker) {
+                        if let Some(root) = matched_root(&found) {
+                            tracing::info!(
+                                candidate = %candidate.display(),
+                                marker = %marker.display(),
+                                found = %found.display(),
+                                root = %root.display(),
+                                "removable archive marker matched filesystem"
+                            );
+                            return Some(root.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+
+            // ResourceManager has already parsed every archive below the game
+            // root. A request for one of those archive containers is a valid
+            // hit even though it is not an entry *inside* another archive.
+            for archive in &self.manager.archives().archives {
+                let relative = archive
+                    .path
+                    .strip_prefix(&game_root)
+                    .unwrap_or(archive.path.as_path());
+                let relative_key = relative.to_string_lossy().replace('\\', "/");
+                let file_name = archive
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let matched = marker_variants.iter().any(|marker| {
+                    let marker_key = marker.to_string_lossy().replace('\\', "/");
+                    relative_key.eq_ignore_ascii_case(&marker_key)
+                        || file_name.eq_ignore_ascii_case(
+                            marker
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or_default(),
+                        )
+                });
+                if matched {
+                    let root = archive.path.parent().unwrap_or_else(|| game_root.as_path());
+                    tracing::info!(
+                        archive = %archive.path.display(),
+                        root = %root.display(),
+                        "removable archive marker matched loaded archive"
+                    );
+                    return Some(root.to_string_lossy().into_owned());
+                }
+            }
+
+            tracing::warn!(
+                archive_name,
+                subdirectory,
+                candidates = ?candidates,
+                loaded_archives = ?self
+                    .manager
+                    .archives()
+                    .archives
+                    .iter()
+                    .map(|archive| archive.path.display().to_string())
+                    .collect::<Vec<_>>(),
+                "removable archive marker not found"
+            );
+
+            if !retry
+                || !host_dialog::show_message(
+                    host_dialog::MessageDialogKind::RetryCancel,
+                    &title,
+                    prompt,
+                    true,
+                )
+                .unwrap_or(false)
+            {
+                return None;
+            }
+        }
+    }
+
     fn write_file_bytes(&mut self, path: &str, bytes: &[u8]) -> bool {
-        let Some(path) = runtime_file_path(&self.manager, path) else {
+        let Some(path) = runtime_file_path_from_root(&self.manager, &self.native_root, path) else {
             tracing::warn!(path, "WriteFileBytes rejected path");
             return false;
         };
@@ -3980,7 +12756,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     }
 
     fn read_user_file_bytes(&mut self, path: &str) -> Option<Vec<u8>> {
-        let path = runtime_file_path(&self.manager, path)?;
+        let path = runtime_file_path_from_root(&self.manager, &self.native_root, path)?;
         match std::fs::read(&path) {
             Ok(bytes) => {
                 tracing::info!(path = %path.display(), size = bytes.len(), "ReadUserFileBytes");
@@ -4010,7 +12786,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             .and_then(|name| name.to_str())
             .unwrap_or("*");
         let parent = pattern_path.parent().unwrap_or_else(|| Path::new(""));
-        let Some(root) = runtime_file_path(&self.manager, &parent.to_string_lossy()) else {
+        let Some(root) = runtime_file_path_from_root(
+            &self.manager,
+            &self.native_root,
+            &parent.to_string_lossy(),
+        ) else {
             return Vec::new();
         };
         let mut files = Vec::new();
@@ -4044,17 +12824,62 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         if !self.native_system.drag_drop_enabled {
             return None;
         }
-        self.dropped_files.pop_front()
+        self.dropped_files.front().cloned()
     }
 
-    fn native_save_header(&mut self, slot: i32) -> Option<[u8; 64]> {
-        self.native_system.save_headers.get(&slot).copied()
+    fn configure_fullscreen_hotkeys(&mut self, enabled: bool, descriptors: &[i32]) {
+        self.native_system.fullscreen_hotkeys_enabled = enabled;
+        // Target sub_461740 only replaces dword_566700 while enabled. A
+        // disable call retains the descriptor list for a later re-enable.
+        if enabled {
+            self.native_system.fullscreen_hotkeys.clear();
+            self.native_system
+                .fullscreen_hotkeys
+                .extend_from_slice(descriptors);
+        }
+    }
+
+    fn select_bootstrap(&mut self, root_or_archive_path: &str, archive_namespace: &str) {
+        self.native_system.bootstrap_root_or_archive = root_or_archive_path.to_owned();
+        self.native_system.bootstrap_namespace = archive_namespace.to_owned();
+        tracing::info!(root_or_archive_path, archive_namespace, "SelectBootstrap");
+    }
+
+    fn display_aspect_mismatch(&mut self) -> bool {
+        let desktop_width = self.window_surface_width;
+        let desktop_height = self.window_surface_height;
+        if desktop_width <= 0
+            || desktop_height <= 0
+            || self.screen_width <= 0
+            || self.screen_height <= 0
+        {
+            return false;
+        }
+        let desktop_aspect = i64::from(desktop_width) * 10_000 / i64::from(desktop_height);
+        let game_aspect = i64::from(self.screen_width) * 10_000 / i64::from(self.screen_height);
+        desktop_aspect != game_aspect
     }
 
     fn registered_object_value(&mut self, object: i32) -> Option<i32> {
         self.graph_input_objects
             .get(&object)
             .map(|input| input.registered_state)
+    }
+
+    fn set_registered_object_value(&mut self, object: i32, value: i32) -> bool {
+        let Some(input) = self.graph_input_objects.get_mut(&object) else {
+            return false;
+        };
+        input.registered_state = value;
+        true
+    }
+
+    fn set_system_mode_flag(&mut self, mode: i32) -> bool {
+        if !(0..=1).contains(&mode) {
+            return false;
+        }
+        self.system_mode_flag = mode;
+        true
     }
 
     fn host_user_name(&mut self) -> String {
@@ -4069,9 +12894,13 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             .unwrap_or_else(|_| "localhost".into())
     }
 
+    fn window_active(&mut self) -> bool {
+        self.window_focused
+    }
+
     fn keyboard_state(&mut self) -> [u8; 256] {
         let mut state = [0u8; 256];
-        if self.pending_input_state.unwrap_or_default() != 0 {
+        if !self.pending_input_consumed && self.pending_input_state.unwrap_or_default() != 0 {
             if let Some(descriptor) = self.pending_input_descriptor {
                 if let Ok(index) = usize::try_from(descriptor) {
                     if let Some(value) = state.get_mut(index) {
@@ -4095,6 +12924,44 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         std::env::args().collect::<Vec<_>>().join(" ")
     }
 
+    fn runtime_screen_dimensions(&mut self) -> (i32, i32) {
+        if self.screen_width > 0 && self.screen_height > 0 {
+            (self.screen_width, self.screen_height)
+        } else {
+            (1280, 720)
+        }
+    }
+
+    fn configure_screen_size(&mut self, width: i32, height: i32) {
+        if width > 0 && height > 0 {
+            self.screen_width = width;
+            self.screen_height = height;
+            self.graph90_refresh_background_screen_layout();
+            tracing::info!(width, height, "native screen size configured");
+        }
+    }
+
+    fn set_window_monitor_adapter_mode(&mut self, mode: i32) -> bool {
+        if !(0..=1).contains(&mode) {
+            return false;
+        }
+        self.window_monitor_adapter_mode = mode;
+        true
+    }
+
+    fn set_config_input_mode(&mut self, mode: i32) -> bool {
+        if !(0..=2).contains(&mode) {
+            return false;
+        }
+        self.system_config_input_mode = mode;
+        true
+    }
+
+    fn set_shader_effect_enabled(&mut self, enabled: bool) -> bool {
+        self.shader_effect_enabled = enabled;
+        true
+    }
+
     fn delete_file(&mut self, root: &str, file: &str) -> bool {
         let file_path = Path::new(file);
         let combined = if file_path.is_absolute() || is_empty_archive_arg(root.trim()) {
@@ -4102,7 +12969,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         } else {
             Path::new(root).join(file_path)
         };
-        let Some(path) = runtime_file_path(&self.manager, &combined.to_string_lossy()) else {
+        let Some(path) = runtime_file_path_from_root(
+            &self.manager,
+            &self.native_root,
+            &combined.to_string_lossy(),
+        ) else {
             return false;
         };
         let ok = std::fs::remove_file(&path).is_ok();
@@ -4118,13 +12989,557 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     }
 
     fn user_data_root(&mut self, kind: i32) -> Option<String> {
-        let root = game_root_path(&self.manager);
+        let root = self.native_root.clone();
         tracing::debug!(kind, root = %root.display(), "GetUserDataRoot");
         let mut root = root.to_string_lossy().into_owned();
         if !root.ends_with(['/', '\\']) {
             root.push(std::path::MAIN_SEPARATOR);
         }
         Some(root)
+    }
+
+    fn launch_process(
+        &mut self,
+        working_directory: &str,
+        command_line: &str,
+        error_message: &str,
+        restore_parent_window: bool,
+        wait_for_uninstaller: bool,
+    ) -> bool {
+        let mut arguments = native_system::split_native_command_line(command_line);
+        if arguments.is_empty() {
+            tracing::warn!(
+                command_line,
+                error_message,
+                "LaunchProcess empty command line"
+            );
+            return false;
+        }
+        let executable = arguments.remove(0);
+        let working_path = if working_directory.trim().is_empty() {
+            self.native_root.clone()
+        } else {
+            runtime_file_path_from_root(&self.manager, &self.native_root, working_directory)
+                .unwrap_or_else(|| PathBuf::from(working_directory))
+        };
+        let executable_path = {
+            let path = PathBuf::from(&executable);
+            if path.is_absolute() {
+                path
+            } else {
+                let candidate = working_path.join(&path);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    path
+                }
+            }
+        };
+        let mut command = std::process::Command::new(&executable_path);
+        command.args(&arguments).current_dir(&working_path);
+        let result = command.spawn().and_then(|mut child| child.wait());
+        let ok = result.is_ok();
+        match result {
+            Ok(status) => tracing::info!(
+                executable = %executable_path.display(),
+                ?arguments,
+                working_directory = %working_path.display(),
+                ?status,
+                restore_parent_window,
+                wait_for_uninstaller,
+                uninstaller_mutex = %self.native_system.uninstaller_mutex_name,
+                "LaunchProcess"
+            ),
+            Err(err) => tracing::warn!(
+                executable = %executable_path.display(),
+                ?arguments,
+                working_directory = %working_path.display(),
+                %err,
+                error_message,
+                "LaunchProcess failed"
+            ),
+        }
+        ok
+    }
+
+    fn schedule_restart(
+        &mut self,
+        working_directory: &str,
+        command_line: &str,
+        error_message: &str,
+    ) {
+        self.native_system.restart_working_directory = working_directory.to_owned();
+        self.native_system.restart_command_line = command_line.to_owned();
+        self.native_system.restart_error_message = error_message.to_owned();
+        self.quit_requested = true;
+        tracing::info!(
+            working_directory,
+            command_line,
+            error_message,
+            "ScheduleRestart"
+        );
+    }
+
+    fn shell_open(&mut self, target: &str) -> bool {
+        #[cfg(target_os = "windows")]
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "start", "", target])
+            .spawn();
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("open").arg(target).spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let result = std::process::Command::new("xdg-open").arg(target).spawn();
+        #[cfg(not(any(target_os = "windows", unix)))]
+        let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "shell open is unsupported on this host",
+        ));
+        let ok = result.is_ok();
+        if let Err(err) = result {
+            tracing::warn!(target, %err, "ShellOpen failed");
+        }
+        ok
+    }
+
+    fn set_uninstaller_product(&mut self, product: &str) {
+        self.native_system.uninstaller_mutex_name =
+            format!("Uninstaller for {product} is executing.");
+    }
+
+    fn remove_uninstall_listed_files(&mut self, root: &str, exclusions: &[String]) -> bool {
+        let Some(root_path) = runtime_file_path_from_root(&self.manager, &self.native_root, root)
+        else {
+            return false;
+        };
+        let list_path = root_path.join("uninst.lst");
+        let Ok(bytes) = std::fs::read(&list_path) else {
+            return false;
+        };
+        let exclusions = exclusions
+            .iter()
+            .map(|value| native_system::encode_native_text(value))
+            .collect::<Vec<_>>();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() || line[0] == b'@' || line == b"uninst.lst" {
+                continue;
+            }
+            if exclusions
+                .iter()
+                .any(|excluded| excluded.as_slice() == line)
+            {
+                continue;
+            }
+            let entry = native_system::decode_native_text(line);
+            let path = root_path.join(entry.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            let _ = std::fs::remove_file(path);
+        }
+        // sub_471C10 returns the open-file result, independently of individual
+        // DeleteFileA failures.
+        true
+    }
+
+    fn append_uninstall_list_entries(&mut self, root: &str, entries: &[String]) -> bool {
+        let Some(root_path) = runtime_file_path_from_root(&self.manager, &self.native_root, root)
+        else {
+            return false;
+        };
+        let list_path = root_path.join("uninst.lst");
+        let Ok(mut bytes) = std::fs::read(&list_path) else {
+            return false;
+        };
+        // sub_471E10 treats the file buffer as a C string and writes
+        // strlen(buffer)+1 bytes back to disk.
+        if bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        for entry in entries {
+            let encoded = native_system::encode_native_text(entry);
+            if !contains_byte_subslice(&bytes, &encoded) {
+                bytes.extend_from_slice(&encoded);
+                bytes.push(b'\n');
+            }
+        }
+        bytes.push(0);
+        std::fs::write(list_path, bytes).is_ok()
+    }
+
+    fn remove_installer_shortcuts(
+        &mut self,
+        file_name: &str,
+        program_group: &str,
+        secondary_file: &str,
+        remove_group: bool,
+    ) {
+        let desktop = self.special_folder_path(1).map(PathBuf::from);
+        let programs = self.special_folder_path(2).map(PathBuf::from);
+        if let Some(desktop) = desktop {
+            let _ = std::fs::remove_file(desktop.join(file_name));
+        }
+        if let Some(programs) = programs {
+            let group = programs.join(program_group);
+            let _ = std::fs::remove_file(group.join(file_name));
+            let _ = std::fs::remove_file(group.join(secondary_file));
+            if remove_group {
+                let _ = std::fs::remove_dir(group);
+            }
+        }
+    }
+
+    fn show_system_input_dialog(
+        &mut self,
+        request: &ethornell_vm::SystemInputDialogRequest,
+    ) -> Option<ethornell_vm::SystemInputDialogResponse> {
+        let text = host_dialog::prompt_text(
+            &request.caption,
+            &request.caption,
+            &request.initial_text,
+            779,
+            host_dialog::TextInputConstraint::Any,
+        )?;
+        let option_value1 = host_dialog::prompt_text(
+            &request.caption,
+            "Option 1",
+            &request.option_value1.to_string(),
+            11,
+            host_dialog::TextInputConstraint::SignedDecimal,
+        )?
+        .parse()
+        .unwrap_or(request.option_value1);
+        let option_value2 = host_dialog::prompt_text(
+            &request.caption,
+            "Option 2",
+            &request.option_value2.to_string(),
+            11,
+            host_dialog::TextInputConstraint::SignedDecimal,
+        )?
+        .parse()
+        .unwrap_or(request.option_value2);
+        Some(ethornell_vm::SystemInputDialogResponse {
+            text,
+            option_value1,
+            option_value2,
+        })
+    }
+
+    fn show_installer_dialog(&mut self, request: &ethornell_vm::InstallerDialogRequest) -> bool {
+        let title = if request.text2.trim().is_empty() {
+            "Installer"
+        } else {
+            request.text2.as_str()
+        };
+        let text = [
+            request.text1.as_str(),
+            request.text3.as_str(),
+            request.text4.as_str(),
+        ]
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+        let kind = if request.mode1 == 0 && request.mode2 == 0 {
+            host_dialog::MessageDialogKind::Information
+        } else {
+            host_dialog::MessageDialogKind::YesNo
+        };
+        host_dialog::show_message(kind, title, &text, true).unwrap_or(false)
+    }
+
+    fn run_installer_workflow(&mut self, request: &ethornell_vm::InstallerWorkflowRequest) -> bool {
+        let root = {
+            let candidate =
+                PathBuf::from(request.root.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                self.native_root.join(candidate)
+            }
+        };
+        if std::fs::create_dir_all(&root).is_err() {
+            return false;
+        }
+        for directory in request
+            .optional_directories
+            .iter()
+            .chain(&request.required_directories)
+        {
+            let path = root.join(directory.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            if std::fs::create_dir_all(path).is_err() {
+                return false;
+            }
+        }
+        if request.source_files.len() != request.destination_files.len() {
+            return false;
+        }
+        for (source, destination) in request.source_files.iter().zip(&request.destination_files) {
+            let Some(source) =
+                runtime_file_path_from_root(&self.manager, &self.native_root, source)
+            else {
+                return false;
+            };
+            let destination = root.join(destination.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            if let Some(parent) = destination.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    return false;
+                }
+            }
+            if std::fs::copy(source, destination).is_err() {
+                return false;
+            }
+        }
+        let mut uninstall_entries = request.destination_files.clone();
+        uninstall_entries.extend(
+            request
+                .metadata
+                .iter()
+                .filter(|value| !value.is_empty())
+                .cloned(),
+        );
+        if !uninstall_entries.is_empty() {
+            let mut bytes = uninstall_entries.join("\n").into_bytes();
+            bytes.push(b'\n');
+            bytes.push(0);
+            if std::fs::write(root.join("uninst.lst"), bytes).is_err() {
+                return false;
+            }
+        }
+        if !request.vendor.is_empty() && !request.product.is_empty() {
+            let key = format!(
+                "hklm/software/{}/{}/installedfolder",
+                request.vendor, request.product
+            );
+            self.platform_store
+                .ensure_path(self.native_root.join(".ethornell-platform-store"));
+            if !self
+                .platform_store
+                .set(&key, root.to_string_lossy().into_owned())
+            {
+                return false;
+            }
+        }
+        tracing::info!(
+            root = %root.display(),
+            vendor = request.vendor,
+            product = request.product,
+            mode = request.mode,
+            flags = request.flags,
+            "portable installer workflow completed"
+        );
+        true
+    }
+
+    fn run_installation_procedure(
+        &mut self,
+        request: &ethornell_vm::InstallationProcedureRequest,
+    ) -> std::result::Result<(), i32> {
+        if request.root.trim().is_empty() {
+            return Err(3);
+        }
+        if request.source_files.len() != request.destination_files.len()
+            || request.source_files.len() != request.descriptor_values.len()
+        {
+            return Err(-1);
+        }
+        let root = {
+            let candidate =
+                PathBuf::from(request.root.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                self.native_root.join(candidate)
+            }
+        };
+        std::fs::create_dir_all(&root).map_err(|_| 3)?;
+        for directory in &request.required_directories {
+            let path = root.join(directory.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            std::fs::create_dir_all(path).map_err(|_| 3)?;
+        }
+        for directory in &request.optional_directories {
+            let path = root.join(directory.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            let _ = std::fs::create_dir_all(path);
+        }
+        for ((source, destination), descriptor) in request
+            .source_files
+            .iter()
+            .zip(&request.destination_files)
+            .zip(&request.descriptor_values)
+        {
+            if source.is_empty() || destination.is_empty() {
+                return Err(-1);
+            }
+            let Some(source_path) =
+                runtime_file_path_from_root(&self.manager, &self.native_root, source)
+            else {
+                return Err(-1);
+            };
+            let destination_path =
+                root.join(destination.replace('\\', std::path::MAIN_SEPARATOR_STR));
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|_| 3)?;
+            }
+            std::fs::copy(&source_path, &destination_path).map_err(|_| -1)?;
+            if *descriptor != 0 {
+                tracing::trace!(
+                    descriptor,
+                    source = %source_path.display(),
+                    destination = %destination_path.display(),
+                    "copied DCProcInstallation entry"
+                );
+            }
+        }
+        tracing::info!(
+            root = %root.display(),
+            mode = request.mode,
+            item_count = request.source_files.len(),
+            text1 = request.text1,
+            text2 = request.text2,
+            text3 = request.text3,
+            text4 = request.text4,
+            text5 = request.text5,
+            "portable DCProcInstallation workflow completed"
+        );
+        Ok(())
+    }
+
+    fn run_shortcut_installer_workflow(
+        &mut self,
+        request: &ethornell_vm::ShortcutInstallerWorkflowRequest,
+    ) -> bool {
+        let primary_target = Path::new(&request.target_root)
+            .join(&request.primary_target)
+            .to_string_lossy()
+            .into_owned();
+        let secondary_target = Path::new(&request.target_root)
+            .join(&request.secondary_target)
+            .to_string_lossy()
+            .into_owned();
+        let mut success = true;
+        if request.create_desktop {
+            success &= self.create_special_folder_shortcut(
+                1,
+                None,
+                &request.primary_shortcut_name,
+                &primary_target,
+            );
+        }
+        if request.create_program_group {
+            let group =
+                (!request.program_group.is_empty()).then_some(request.program_group.as_str());
+            success &= self.create_special_folder_shortcut(
+                2,
+                group,
+                &request.primary_shortcut_name,
+                &primary_target,
+            );
+            if !request.secondary_shortcut_name.is_empty() && !request.secondary_target.is_empty() {
+                success &= self.create_special_folder_shortcut(
+                    2,
+                    group,
+                    &request.secondary_shortcut_name,
+                    &secondary_target,
+                );
+            }
+        }
+        success
+    }
+
+    fn create_shortcut(
+        &mut self,
+        program_group: Option<&str>,
+        shortcut_name: &str,
+        target: &str,
+    ) -> bool {
+        self.create_special_folder_shortcut(
+            if program_group.is_some() { 2 } else { 1 },
+            program_group,
+            shortcut_name,
+            target,
+        )
+    }
+
+    fn create_special_folder_shortcut(
+        &mut self,
+        special_folder_mode: i32,
+        program_group: Option<&str>,
+        shortcut_name: &str,
+        target: &str,
+    ) -> bool {
+        let Some(folder) = self.special_folder_path(special_folder_mode) else {
+            return false;
+        };
+        let mut destination = PathBuf::from(folder);
+        if let Some(group) = program_group.filter(|value| !value.trim().is_empty()) {
+            destination.push(group);
+        }
+        destination.push(shortcut_name);
+        let success = host_installer::create_shortcut(&destination, target);
+        tracing::info!(
+            special_folder_mode,
+            ?program_group,
+            shortcut_name,
+            target,
+            destination = %destination.display(),
+            success,
+            "CreateShortcut"
+        );
+        success
+    }
+
+    fn read_installed_folder(&mut self, vendor: &str, product: &str) -> Option<String> {
+        if let Some(path) = host_installer::read_installed_folder(vendor, product) {
+            return Some(path);
+        }
+        let key = format!("hklm/software/{vendor}/{product}/installedfolder");
+        self.platform_store.get(&key).map(str::to_string)
+    }
+
+    fn delete_installed_registry_key(&mut self, vendor: &str, product: &str) -> bool {
+        let native = host_installer::delete_installed_registry_key(vendor, product);
+        let key = format!("hklm/software/{vendor}/{product}/installedfolder");
+        self.platform_store
+            .ensure_path(self.native_root.join(".ethornell-platform-store"));
+        let portable = self.platform_store.remove(&key);
+        native || portable
+    }
+
+    fn register_file_association(
+        &mut self,
+        extension: &str,
+        class_name: &str,
+        description: &str,
+        icon: &str,
+        open_command: &str,
+    ) -> bool {
+        let native = host_installer::register_file_association(
+            extension,
+            class_name,
+            description,
+            icon,
+            open_command,
+        );
+        self.platform_store
+            .ensure_path(self.native_root.join(".ethornell-platform-store"));
+        let extension = extension.trim().trim_start_matches('.');
+        let base = format!("hkcr/.{extension}");
+        let portable = self.platform_store.set(&base, class_name.to_string())
+            && self.platform_store.set(
+                &format!("hkcr/{class_name}/description"),
+                description.to_string(),
+            )
+            && self
+                .platform_store
+                .set(&format!("hkcr/{class_name}/defaulticon"), icon.to_string())
+            && self.platform_store.set(
+                &format!("hkcr/{class_name}/shell/open/command"),
+                open_command.to_string(),
+            );
+        native || portable
+    }
+
+    fn launcher_mode(&mut self) -> i32 {
+        std::env::var("ETHORNELL_LAUNCHER_MODE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
     }
 
     fn save_global_user_data(&mut self) -> bool {
@@ -4171,6 +13586,10 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         count: i32,
         descriptor: &[ethornell_vm::Value],
     ) -> ethornell_vm::VmResult<()> {
+        let values = descriptor.iter().map(value_to_i32).collect::<Vec<_>>();
+        if let Some(input) = self.graph_input_objects.get_mut(&object) {
+            input.queue_indirect_message(values);
+        }
         let event = descriptor.first().map(value_to_i32).unwrap_or_default();
         let packed_payload = descriptor.get(1).map(value_to_i32);
         let payload = if matches!(event, 0x1000_0006 | 0x1000_0007) {
@@ -4201,7 +13620,18 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         Ok(())
     }
 
+    fn peek_input_state(&mut self, descriptor: i32) -> i32 {
+        self.input_descriptor_accumulators
+            .get(&descriptor)
+            .copied()
+            .unwrap_or_default()
+            .min(i32::MAX as u32) as i32
+    }
+
     fn read_input_state(&mut self, descriptor: i32) -> i32 {
+        if self.pending_input_consumed {
+            return 0;
+        }
         let state = input_state_for_descriptor(
             self.pending_input_state,
             self.pending_input_descriptor,
@@ -4232,7 +13662,6 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         if state != 0 {
             let was_animating = self.text_runtime.is_animating();
             self.pending_input_consumed = true;
-            self.reveal_text_on_input();
             if was_animating
                 && self.pending_input_descriptor == Some(INPUT_DESCRIPTOR_MOUSE_LEFT)
                 && (state & 0xf) == 0x2
@@ -4243,32 +13672,133 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         state
     }
 
-    fn query_input_class_state(&mut self, scope: i32) -> i32 {
-        let mut state = input_class_state_for_descriptor(
-            self.pending_input_state,
-            self.pending_input_descriptor,
-        );
-        if self.input_master_gate != 0 && self.input_latched_state != 0 {
-            state |= i32::MIN;
+    fn input_message_serial(&mut self) -> i32 {
+        self.input_message_serial
+    }
+
+    fn poll_window_message(
+        &mut self,
+        message_id: i32,
+        registered_after_serial: i32,
+    ) -> Option<(i32, i32)> {
+        let index = self.window_messages.iter().position(|message| {
+            message.message_id == message_id
+                && message.serial.wrapping_sub(registered_after_serial) > 0
+        })?;
+        let message = self.window_messages.remove(index)?;
+        Some((message.lparam, message.wparam))
+    }
+
+    fn sample_configured_input(&mut self) {
+        self.input_poll_active = true;
+        let descriptors = self
+            .configured_input_classes
+            .get(&i32::MIN)
+            .cloned()
+            .unwrap_or_default();
+        for descriptor in descriptors {
+            let _ = drain_native_input_descriptor(self, descriptor);
         }
-        if state != 0 {
-            let was_animating = self.text_runtime.is_animating();
-            self.pending_input_consumed = true;
-            self.reveal_text_on_input();
-            if was_animating && self.pending_input_descriptor == Some(INPUT_DESCRIPTOR_MOUSE_LEFT) {
-                self.suppress_message_mouse_release = true;
+        tracing::debug!("native configured-input poll armed");
+    }
+
+    fn reset_input_configuration(&mut self, value: i32) {
+        self.input_configuration_enabled = value;
+        self.input_event_counts.clear();
+        self.input_down_descriptors.clear();
+        self.input_down_reported.clear();
+        self.input_poll_active = false;
+        tracing::debug!(
+            value,
+            "native input configuration and transient descriptor state reset"
+        );
+    }
+
+    fn register_input_scope(&mut self, scope: i32) {
+        let packed = scope.wrapping_shl(16) | 0xffff;
+        self.registered_keyboard_input_scopes.register(packed);
+        self.registered_pointer_input_scopes.register(packed);
+        // sub_488110 discards only sub_46DF00's return value. The query itself
+        // remains stateful: sub_46DC80/sub_46DB40 clear descriptor event counts
+        // and advance the first-held latch after both scope nodes are present.
+        let _ = query_runtime_input_event_bits(self, scope, false, false);
+        tracing::debug!(
+            scope,
+            packed = format_args!("0x{packed:08X}"),
+            "registered and initially queried native input scope"
+        );
+    }
+
+    fn query_and_unregister_input_scope(&mut self, scope: i32) {
+        let packed = scope.wrapping_shl(16) | 0xffff;
+        let _ = query_runtime_input_event_bits(self, scope, false, false);
+        self.registered_keyboard_input_scopes.unregister_one(packed);
+        self.registered_pointer_input_scopes.unregister_one(packed);
+        tracing::debug!(
+            scope,
+            packed = format_args!("0x{packed:08X}"),
+            "queried and unregistered native input scope"
+        );
+    }
+
+    fn register_message_input_scope(&mut self, input_scope: i32) {
+        // CProcDspMsg+0x78 is already in target representation.  Literal 2
+        // remains literal 2; all other constructor modes have already packed
+        // the selected scope as `(scope << 16) | 0xFFFF`.
+        self.registered_keyboard_input_scopes.register(input_scope);
+        self.registered_pointer_input_scopes.register(input_scope);
+        let _ = query_runtime_input_event_bits(self, input_scope, true, true);
+        tracing::debug!(
+            input_scope = format_args!("0x{input_scope:08X}"),
+            "CProcDspMsg registered exact input scope and drained initial sample"
+        );
+    }
+
+    fn unregister_message_input_scope(&mut self, input_scope: i32) {
+        // sub_432D00 removes the exact member from both registries and does
+        // not perform the Sys80:19 final query.
+        self.registered_keyboard_input_scopes.unregister_one(input_scope);
+        self.registered_pointer_input_scopes.unregister_one(input_scope);
+        tracing::debug!(
+            input_scope = format_args!("0x{input_scope:08X}"),
+            "CProcDspMsg unregistered exact input scope"
+        );
+    }
+
+    fn query_input_event_bits(&mut self, scope: i32) -> i32 {
+        query_runtime_input_event_bits(self, scope, true, false)
+    }
+
+    fn query_message_input_event_bits(&mut self, input_scope: i32) -> i32 {
+        query_runtime_input_event_bits(self, input_scope, true, true)
+    }
+
+    fn query_configured_input_gate(&mut self) -> i32 {
+        let mut latched = self.input_latched_state != 0;
+        let mut any_down = false;
+        if self.window_focused && self.input_configuration_enabled != 0 {
+            let descriptors = self
+                .configured_input_classes
+                .get(&i32::MIN)
+                .cloned()
+                .unwrap_or_default();
+            for descriptor in descriptors {
+                let down = self.input_down_descriptors.contains(&descriptor);
+                any_down |= down;
+                if self.input_poll_active {
+                    if drain_native_input_descriptor(self, descriptor) != 0 && self.window_focused {
+                        latched = true;
+                    }
+                } else if down && self.window_focused {
+                    latched = true;
+                    break;
+                }
             }
         }
-        if self.pending_input_state.is_some() {
-            tracing::info!(
-                scope,
-                active_descriptor = ?self.pending_input_descriptor,
-                pending_state = ?self.pending_input_state.map(|value| format!("0x{value:08X}")),
-                result = format_args!("0x{state:08X}"),
-                "runtime input class state queried"
-            );
+        if self.input_poll_active && !any_down {
+            self.input_poll_active = false;
         }
-        state
+        i32::from(latched && self.input_master_gate != 0)
     }
 
     fn set_input_master_gate(&mut self, value: i32) {
@@ -4281,16 +13811,79 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         tracing::debug!(value, "native input latched state changed");
     }
 
-    fn query_input_descriptor_state(&mut self, class_mask: i32) -> i32 {
-        let state = input_class_state_for_descriptor(
-            self.pending_input_state,
-            self.pending_input_descriptor,
-        );
-        let selected = state & class_mask;
-        if selected != 0 {
-            self.pending_input_consumed = true;
+    fn register_input_class_descriptors(&mut self, class_mask: i32, descriptors: &[i32]) {
+        const VALID_CLASS_MASKS: [i32; 10] = [
+            0x40,
+            0x80,
+            0x100,
+            0x200,
+            0x1000,
+            0x2000,
+            0x4000,
+            0x8000,
+            0x4000_0000,
+            i32::MIN,
+        ];
+        if !VALID_CLASS_MASKS.contains(&class_mask) || descriptors.len() >= 16 {
+            tracing::warn!(
+                class_mask = format_args!("0x{class_mask:08X}"),
+                count = descriptors.len(),
+                "rejected invalid native input-class descriptor table"
+            );
+            return;
         }
-        selected
+        self.configured_input_classes
+            .insert(class_mask, descriptors.to_vec());
+        tracing::debug!(
+            class_mask = format_args!("0x{class_mask:08X}"),
+            ?descriptors,
+            "registered native input-class descriptors"
+        );
+    }
+
+    fn query_input_descriptor_state(&mut self, class_mask: i32) -> i32 {
+        let mut total = 0_i32;
+        for (&registered_mask, descriptors) in &self.configured_input_classes {
+            if registered_mask == i32::MIN || class_mask & registered_mask == 0 {
+                continue;
+            }
+            for descriptor in descriptors {
+                total = total.wrapping_add(
+                    self.input_descriptor_accumulators
+                        .get(descriptor)
+                        .copied()
+                        .unwrap_or_default()
+                        .min(i32::MAX as u32) as i32,
+                );
+            }
+        }
+        total
+    }
+
+    fn query_scoped_input_event(&mut self, input_descriptor: i32, scope: i32) -> i32 {
+        let packed = scope.wrapping_shl(16) | 0xffff;
+        let registered = if matches!(input_descriptor, 1 | 2) {
+            self.registered_pointer_input_scopes.top_scope() == Some(packed as u32)
+        } else {
+            self.registered_keyboard_input_scopes
+                .top_scope()
+                .is_none_or(|top| packed as u32 >= top)
+        };
+        if !registered {
+            return 0;
+        }
+        // sub_46DB40 owns an independent count/down/latch triple per logical
+        // descriptor; this drain must not consume the single-frame InputGet*
+        // shadow used by other native handlers.
+        let result = drain_native_input_descriptor(self, input_descriptor);
+        tracing::debug!(
+            input_descriptor,
+            scope,
+            packed = format_args!("0x{packed:08X}"),
+            result = format_args!("0x{result:08X}"),
+            "drained scoped native input event"
+        );
+        result
     }
 
     fn take_frame_yield(&mut self) -> bool {
@@ -4299,16 +13892,16 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn call_sys(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
-        if let Some(result) = self.dispatch_native_system(group, id, stack) {
+        if let Some(result) = self.dispatch_native_system(call) {
             return result;
         }
-        if let Some(result) = self.dispatch_native_system_ext(group, id, stack) {
+        if let Some(result) = self.dispatch_native_system_ext(call) {
             return result;
         }
+        let (group, id) = (call.group(), call.id());
+        let stack = call.args_mut();
         match (group, id) {
             (0x80, 0x40) => {
                 let file = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
@@ -4335,6 +13928,8 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x34) => {
+                // Target sub_4888C0 pops file first and archive/root second,
+                // then passes both values to sub_4665C0.
                 let file = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let exists = self.cached_file_exists(&archive, &file);
@@ -4346,9 +13941,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Int(i32::from(exists)));
             }
             (0x80, 0x35) => {
+                // Target sub_488900 pops file first and archive/root second,
+                // then passes both values to sub_4662E0.
                 let file = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
                 let archive = pop_string_value(stack).unwrap_or_default();
-                let size = self.cached_file_size(&archive, &file);
+                let size = self.cached_file_size(&archive, &file).max(0);
                 tracing::info!(archive, file, size, "GetFileSize");
                 return Ok(ethornell_vm::Value::Int(size));
             }
@@ -4373,30 +13970,37 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 tracing::debug!(x, y, "ReadCursorPoint");
                 return Ok(ethornell_vm::Value::None);
             }
-            (0x80, 0x1f) => {
-                let args = pop_args(stack, 6);
-                let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let duration_ms = ints.get(1).copied().unwrap_or_default().max(0) as u32;
-                if duration_ms > 0 {
-                    self.animation_queue_remaining = self
-                        .animation_queue_remaining
-                        .max(duration_ms.div_ceil(16).max(1));
-                }
-                tracing::debug!(?ints, "ConfigureUiMotion");
-                trace_graph!(self, "ui motion args={ints:?}");
-                return Ok(ethornell_vm::Value::None);
+            (0x80, 0x27) => {
+                // Target sub_488560 pops source first and destination second,
+                // then calls MoveFileA(source, destination). In BP argument
+                // order this is destination, source.
+                let source = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
+                let destination = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
+                let ok = match (
+                    runtime_file_path_from_root(&self.manager, &self.native_root, &source),
+                    runtime_file_path_from_root(&self.manager, &self.native_root, &destination),
+                ) {
+                    (Some(source_path), Some(destination_path)) => {
+                        std::fs::rename(source_path, destination_path).is_ok()
+                    }
+                    _ => false,
+                };
+                tracing::info!(source, destination, ok, "MoveFile");
+                return Ok(ethornell_vm::Value::Int(i32::from(ok)));
             }
             (0x80, 0x28) => {
                 let path = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                let ok = runtime_file_path(&self.manager, &path)
-                    .map(|path| std::fs::create_dir_all(path).is_ok())
+                // CreateDirectoryA creates one level and fails when a parent
+                // is absent; create_dir is the portable equivalent.
+                let ok = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
+                    .map(|path| std::fs::create_dir(path).is_ok())
                     .unwrap_or(false);
                 tracing::info!(path, ok, "CreateDirectory");
                 return Ok(ethornell_vm::Value::Int(i32::from(ok)));
             }
             (0x80, 0x2a) => {
                 let path = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                let exists = runtime_file_path(&self.manager, &path)
+                let exists = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
                     .map(|path| path.is_dir())
                     .unwrap_or(false);
                 tracing::info!(path, exists, "DirectoryExists");
@@ -4412,7 +14016,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0x29) => {
                 let path = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                let ok = runtime_file_path(&self.manager, &path)
+                let ok = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
                     .map(|path| std::fs::remove_dir(&path).is_ok())
                     .unwrap_or(false);
                 tracing::info!(path, ok, "RemoveDirectory");
@@ -4427,7 +14031,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             (0x80, 0x2d) => {
                 let attrs = pop_int_value(stack).unwrap_or_default();
                 let path = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                let ok = runtime_file_path(&self.manager, &path)
+                let ok = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
                     .map(|path| {
                         if let Ok(mut perms) =
                             std::fs::metadata(&path).map(|meta| meta.permissions())
@@ -4443,21 +14047,27 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Int(i32::from(ok)));
             }
             (0x80, 0x2f) => {
-                let from = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                let to = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
+                let source = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
+                let destination = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
                 let ok = match (
-                    runtime_file_path(&self.manager, &from),
-                    runtime_file_path(&self.manager, &to),
+                    runtime_file_path_from_root(&self.manager, &self.native_root, &source),
+                    runtime_file_path_from_root(&self.manager, &self.native_root, &destination),
                 ) {
-                    (Some(from), Some(to)) => {
-                        if let Some(parent) = to.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                    (Some(source_path), Some(destination_path)) => {
+                        // Target sub_488700 clears FILE_ATTRIBUTE_READONLY on
+                        // an existing destination before CopyFileA(..., FALSE).
+                        if let Ok(metadata) = std::fs::metadata(&destination_path) {
+                            let mut permissions = metadata.permissions();
+                            if permissions.readonly() {
+                                permissions.set_readonly(false);
+                                let _ = std::fs::set_permissions(&destination_path, permissions);
+                            }
                         }
-                        std::fs::copy(&from, &to).is_ok()
+                        std::fs::copy(&source_path, &destination_path).is_ok()
                     }
                     _ => false,
                 };
-                tracing::info!(from, to, ok, "CopyFile");
+                tracing::info!(source, destination, ok, "CopyFile");
                 return Ok(ethornell_vm::Value::Int(i32::from(ok)));
             }
             (0x80, 0x31) => {
@@ -4536,33 +14146,19 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 tracing::info!(path, "AddResourceSearchPath");
                 return Ok(ethornell_vm::Value::None);
             }
-            (0x80, 0x15) => {
-                let visible = pop_int_value(stack).unwrap_or_default() != 0;
-                tracing::debug!(visible, "ShowCursor");
-                return Ok(ethornell_vm::Value::None);
-            }
             (0x80, 0x52) => {
-                self.window_mode = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(mode = self.window_mode, "SetHeadlessWindowMode");
+                self.native_system.main_loop_wait_override =
+                    pop_int_value(stack).unwrap_or_default();
+                tracing::info!(
+                    value = self.native_system.main_loop_wait_override,
+                    "SetMainLoopWaitOverride"
+                );
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x50) => {
                 let enabled = stack.pop();
                 tracing::debug!(?enabled, "SetSystemUiState");
                 return Ok(ethornell_vm::Value::None);
-            }
-            (0x80, 0x13) => {
-                let value = self
-                    .call_coverage
-                    .get(&(group, id))
-                    .copied()
-                    .unwrap_or_default()
-                    .min(i32::MAX as usize) as i32;
-                if self.should_yield_frame() {
-                    self.frame_yield_requested = true;
-                }
-                tracing::debug!(value, "PumpWaitState");
-                return Ok(ethornell_vm::Value::Int(value));
             }
             (0x80, 0x5f) => {
                 self.frame_yield_requested = true;
@@ -4575,13 +14171,21 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x5a) => {
-                tracing::info!("PumpMessages");
+                // The VM owns this target-confirmed CProcedure boundary.
+                // `PumpMessages` is only a legacy port/early-callsite guess;
+                // this fallback intentionally supplies no invented behavior.
+                tracing::debug!("Sys80:5A host fallback reached");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x60) => {
                 let fullscreen = pop_int_value(stack).unwrap_or_default() != 0;
                 let adapter = pop_int_value(stack).unwrap_or_default();
                 let mode = pop_int_value(stack).unwrap_or_default();
+                if !(0..2).contains(&adapter) || !(0..8).contains(&mode) {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Sys80:60 invalid display mode={mode} adapter={adapter}"
+                    )));
+                }
                 self.window_mode = i32::from(fullscreen);
                 self.pending_fullscreen = Some(fullscreen);
                 tracing::info!(mode, adapter, fullscreen, "ConfigureDisplayMode");
@@ -4599,10 +14203,14 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x62) => {
-                let descriptor = stack.pop();
-                let mode = stack.pop();
-                tracing::info!(?descriptor, ?mode, "CommitMemoryClasses");
-                return Ok(ethornell_vm::Value::None);
+                // This selector owns a BP-memory descriptor list and must be
+                // consumed by Vm::try_builtin_sys_with_api before host
+                // dispatch. Keep the host side non-panicking so an ownership
+                // regression reports a normal runtime error instead of
+                // poisoning winit's macOS application-state lock.
+                return Err(ethornell_vm::VmError::Runtime(
+                    "Sys80:62 reached host dispatch without VM descriptor decoding".into(),
+                ));
             }
             (0x80, 0x64) => {
                 let visible = pop_int_value(stack).unwrap_or_default() != 0;
@@ -4636,13 +14244,22 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x67) => {
-                let value = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(value, "Sys67");
+                let cursor_index = pop_int_value(stack).unwrap_or_default();
+                if !(0..=4).contains(&cursor_index) {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Sys80:67 invalid cursor index {cursor_index}"
+                    )));
+                }
+                self.native_system.cursor_index = cursor_index;
+                tracing::info!(cursor_index, "SetCursorIndex");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x68) => {
-                let enabled = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(enabled, "CaptureCloseEvent");
+                self.native_system.native_close_mode = pop_int_value(stack).unwrap_or_default();
+                tracing::info!(
+                    mode = self.native_system.native_close_mode,
+                    "SetNativeCloseMode"
+                );
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x69) => {
@@ -4653,7 +14270,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x6a) => {
-                tracing::info!("Sys6A");
+                tracing::info!("TerminateInterpreter");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x70) => {
@@ -4663,7 +14280,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0x74) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(value, "Sys74");
+                tracing::info!(value, "SetSaveDataIntegrity");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0xaf) => {
@@ -4677,13 +14294,13 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0xc1) => {
                 let ptr = stack.pop();
-                tracing::info!(?ptr, "SysC1Buffer");
+                tracing::info!(?ptr, "SdcDecodeBuffer");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0xc5) => {
                 let dst = stack.pop();
                 let src = stack.pop();
-                tracing::info!(?src, ?dst, "SysC5Buffers");
+                tracing::info!(?src, ?dst, "SdcDecodeStructArray");
                 return Ok(ethornell_vm::Value::Int(1));
             }
             (0x80, 0xd1) => {
@@ -4713,11 +14330,6 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 tracing::info!(?arg1, ?arg2, ?arg3, "SysDATriple");
                 return Ok(ethornell_vm::Value::None);
             }
-            (0x80, 0x07) => {
-                let args = pop_args(stack, 2);
-                tracing::debug!(args = ?summarize_values(&args), "ReadPerformanceMetric");
-                return Ok(ethornell_vm::Value::None);
-            }
             (0x80, 0x25) => {
                 let args = pop_args(stack, 5);
                 tracing::info!(args = ?summarize_values(&args), "EnumerateFiles");
@@ -4729,9 +14341,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Int(0));
             }
             (0x80, 0x59) => {
-                let delta = pop_int_value(stack).unwrap_or_default();
-                self.frame_yield_requested = true;
-                tracing::debug!(delta, "AdvanceDeadlineAndPoll");
+                let arg0_unrecovered = pop_int_value(stack).unwrap_or_default();
+                // Target ABI marks 0x59 as synchronous (one input, one output,
+                // no CProcedure). Do not turn the legacy port
+                // `AdvanceDeadlineAndPoll` guess into a scheduler yield.
+                tracing::debug!(arg0_unrecovered, "Sys80:59 unresolved synchronous poll");
                 return Ok(ethornell_vm::Value::Int(0));
             }
             (0x80, 0x9e) => {
@@ -4789,7 +14403,9 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Int(0));
             }
             (0x80, 0xf2) => {
-                let args = pop_args(stack, 16);
+                // funcs_48B30E[0xF2] -> sub_48AD50 performs fourteen
+                // sub_4450B0/sub_48DF50 pops before opening the installer UI.
+                let args = pop_args(stack, 14);
                 tracing::info!(args = ?summarize_values(&args), "ShowInstallerDialog unavailable on this platform");
                 return Ok(ethornell_vm::Value::Int(0));
             }
@@ -4800,7 +14416,25 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0xf8) => {
                 let args = pop_args(stack, 3);
-                tracing::info!(args = ?summarize_values(&args), "ReadInstalledFolder unavailable outside native Windows registry");
+                let strings = args
+                    .iter()
+                    .filter_map(|value| match value {
+                        ethornell_vm::Value::Str(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let simulated_matches = self
+                    .platform_store
+                    .candidate_matches(strings.iter().copied());
+                // The portable registry backend is ready, but the target
+                // handler's three parameter roles and output representation
+                // are not recovered. Do not write a guessed string/pointer to
+                // the BP stack. The matches are diagnostic evidence only.
+                tracing::info!(
+                    args = ?summarize_values(&args),
+                    simulated_matches = ?simulated_matches,
+                    "ReadInstalledFolder target contract unrecovered"
+                );
                 return Ok(ethornell_vm::Value::Int(0));
             }
             (0x80, 0xe8) => {
@@ -4809,12 +14443,13 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0xfd) => {
-                tracing::info!("IsLauncher");
-                return Ok(ethornell_vm::Value::Int(0));
+                let mode = ethornell_vm::SysApi::launcher_mode(self);
+                tracing::info!(mode, "QueryLauncherMode");
+                return Ok(ethornell_vm::Value::Int(mode));
             }
             (0x81, 0x0e) => {
                 let value = stack.pop();
-                tracing::info!(?value, "Sys2_0E");
+                tracing::info!(?value, "GetAdjustedDesktopDimensions");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x81, 0x0f) => {
@@ -4833,7 +14468,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x81, 0x2f) => {
                 let path = pop_string_value(stack).unwrap_or_default();
-                let writable = runtime_file_path(&self.manager, &path)
+                let writable = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
                     .as_deref()
                     .map(platform::test_path_writable)
                     .unwrap_or(false);
@@ -4883,6 +14518,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 self.screen_height = pop_int_value(stack).unwrap_or_default();
                 self.screen_width = pop_int_value(stack).unwrap_or_default();
                 let flags = pop_int_value(stack).unwrap_or_default();
+                self.graph90_refresh_background_screen_layout();
                 tracing::info!(
                     flags,
                     width = self.screen_width,
@@ -4893,8 +14529,12 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x81, 0x62) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(value, "Sys2_62");
-                return Ok(ethornell_vm::Value::None);
+                let accepted = (0..=1).contains(&value);
+                if accepted {
+                    self.window_monitor_adapter_mode = value;
+                }
+                tracing::info!(value, accepted, "SetWindowMonitorAdapterMode");
+                return Ok(ethornell_vm::Value::Int(i32::from(accepted)));
             }
             (0x81, 0x63) => {
                 let value = pop_int_value(stack).unwrap_or_default();
@@ -4905,6 +14545,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             (0x81, 0x64) => {
                 self.screen_height = pop_int_value(stack).unwrap_or_default();
                 self.screen_width = pop_int_value(stack).unwrap_or_default();
+                self.graph90_refresh_background_screen_layout();
                 tracing::info!(
                     width = self.screen_width,
                     height = self.screen_height,
@@ -4914,8 +14555,12 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x81, 0x6f) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(value, "Sys2_6F");
-                return Ok(ethornell_vm::Value::None);
+                let accepted = (0..=1).contains(&value);
+                if accepted {
+                    self.shader_effect_enabled = value != 0;
+                }
+                tracing::info!(value, accepted, "SetShaderEffectEnabled");
+                return Ok(ethornell_vm::Value::Int(i32::from(accepted)));
             }
             _ => {}
         }
@@ -4934,6 +14579,171 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 }
 
 impl ethornell_vm::GraphApi for RuntimeTraceApi {
+    fn native_graph_procedure_is_active(&self, opcode: ethornell_vm::NativeOpcode) -> bool {
+        match (opcode.group, opcode.id) {
+            (0x90, 0x20..=0x24) | (0x90, 0x28..=0x29) | (0x90, 0x2C) => {
+                self.has_active_graph_animation()
+            }
+            (0xB0, 0x08) => self.has_active_native_screen_shake(),
+            _ => false,
+        }
+    }
+
+    fn cancel_native_graph_procedure(&mut self, opcode: ethornell_vm::NativeOpcode) {
+        if (opcode.group, opcode.id) == (0xB0, 0x08) {
+            self.cancel_native_screen_shake();
+        }
+    }
+
+    fn native_graph_object_procedure_is_active(
+        &self,
+        opcode: ethornell_vm::NativeOpcode,
+        object_id: i32,
+    ) -> bool {
+        match (opcode.group, opcode.id) {
+            (0x90, 0x20..=0x23) | (0x90, 0x28) => {
+                self.layer_animations.has_native_object_control(object_id)
+            }
+            _ => self.native_graph_procedure_is_active(opcode),
+        }
+    }
+
+    fn native_graph_control_procedure_is_active(
+        &self,
+        opcode: ethornell_vm::NativeOpcode,
+        object_id: i32,
+        control_id: u64,
+    ) -> bool {
+        match (opcode.group, opcode.id) {
+            // These selectors install CProcCtrlDspObj-family instances.  The
+            // target waits on that instance, not on the object and certainly
+            // not on a renderer-wide "anything is animating" predicate.
+            (0x90, 0x20..=0x24) | (0x90, 0x28..=0x29) | (0x90, 0x2C) => {
+                self.layer_animations.has_native_control(control_id)
+            }
+            _ => self.native_graph_object_procedure_is_active(opcode, object_id),
+        }
+    }
+
+    fn poll_native_graph_control_procedure(
+        &mut self,
+        opcode: ethornell_vm::NativeOpcode,
+        object_id: i32,
+        control_id: u64,
+    ) -> bool {
+        if !matches!(
+            (opcode.group, opcode.id),
+            (0x90, 0x20..=0x24) | (0x90, 0x28..=0x29) | (0x90, 0x2C)
+        ) {
+            return self.native_graph_object_procedure_is_active(opcode, object_id);
+        }
+        if !self.layer_animations.has_native_control(control_id) {
+            return false;
+        }
+
+        // CProcCtrlDspObj::Tick (sub_431F00) samples input and invokes only
+        // this procedure's virtual updater. Engine time advances once per host
+        // pass, so a second cooperative-scheduler poll in the same pass gets
+        // zero elapsed time instead of advancing the animation twice.
+        self.sample_native_control_input(control_id);
+        let now = self.engine_time_ms;
+        let elapsed_ms = match self.native_control_last_poll_ms.get_mut(&control_id) {
+            Some(last) => {
+                let elapsed = now.saturating_sub(*last);
+                *last = now;
+                elapsed
+            }
+            None => {
+                self.native_control_last_poll_ms.insert(control_id, now);
+                0
+            }
+        };
+        let events = self
+            .layer_animations
+            .tick_native_control(control_id, elapsed_ms);
+        self.apply_native_control_events(events);
+        self.layer_animations.has_native_control(control_id)
+    }
+
+    fn take_native_graph_control_procedure_completion(
+        &mut self,
+        opcode: ethornell_vm::NativeOpcode,
+        _object_id: i32,
+        control_id: u64,
+    ) -> [i32; 2] {
+        match (opcode.group, opcode.id) {
+            (0x90, 0x20..=0x24) | (0x90, 0x28..=0x29) | (0x90, 0x2C) => {
+                let completion = self
+                    .layer_animations
+                    .take_native_control_completion(control_id);
+                self.unregister_native_control_input_latch(control_id);
+                [completion.progress_per_mille, completion.status]
+            }
+            _ => [1000, 0],
+        }
+    }
+
+    fn cancel_native_graph_control_procedure(
+        &mut self,
+        opcode: ethornell_vm::NativeOpcode,
+        object_id: i32,
+        control_id: u64,
+    ) {
+        if !matches!(
+            (opcode.group, opcode.id),
+            (0x90, 0x20..=0x24) | (0x90, 0x28..=0x29) | (0x90, 0x2C)
+        ) || !self.layer_animations.abort_native_control(control_id)
+        {
+            return;
+        }
+        self.unregister_native_control_input_latch(control_id);
+
+        // sub_431AF0 drains a callback and sets base CProcedure+0x10. The
+        // following sub_4319C0 check fails before CProcCtrlDspObj's subclass
+        // updater is called, so target cancellation preserves the currently
+        // rendered intermediate state and reports terminal status -1.
+        trace_graph!(
+            self,
+            "native graph control base-cancelled opcode=0x{:02X}:0x{:02X} object=#{} control_id={}",
+            opcode.group,
+            opcode.id,
+            object_id,
+            control_id
+        );
+    }
+
+    fn poll_native_graph_selection(&mut self) -> Option<i32> {
+        let (event, payload) = self.poll_object_event_payload(0);
+        (event != 0).then_some(payload & 0xffff)
+    }
+
+    fn native_message_is_animating(&self) -> bool {
+        self.native_message_active && self.text_runtime.is_animating()
+    }
+
+    fn reveal_native_message(&mut self) -> bool {
+        let was_animating = self.text_runtime.is_animating();
+        self.reveal_text_on_input();
+        was_animating && !self.text_runtime.is_animating()
+    }
+
+    fn finish_native_message(&mut self) {
+        self.native_message_active = false;
+    }
+
+    fn register_graph_color_lut(&mut self, id: i32, points: [[i32; 2]; 3]) -> bool {
+        if let Some(lut) = graph_color::RuntimeColorLut::from_control_points(points) {
+            self.graph_color_luts.insert(id, lut);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove_graph_color_lut(&mut self, id: i32) -> bool {
+        self.graph_color_luts.remove(&id).is_some()
+    }
+
     fn query_graph_effect_result(&self, process: i32) -> Option<i32> {
         self.graph_effects.result(process)
     }
@@ -4954,14 +14764,268 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         invocation
     }
 
+    fn query_movie_position(&self, bitmap: i32) -> std::result::Result<i32, i32> {
+        self.graph_effects.position_ms(bitmap)
+    }
+
+    fn load_buriko_movie_resource(
+        &mut self,
+        archive: &str,
+        resource: &str,
+    ) -> std::result::Result<(i32, [i32; 5]), i32> {
+        let bytes = read_runtime_bytes(&self.manager, archive, resource).ok_or(1)?;
+        let result =
+            self.graph_buriko_movies
+                .load(archive.to_string(), resource.to_string(), bytes);
+        if let Ok((handle, metadata)) = result {
+            self.graph_process_handles.insert(handle);
+            trace_graph!(
+                self,
+                "BF_Movie load handle=#{handle} source={archive}:{resource} metadata={metadata:?}"
+            );
+        }
+        result
+    }
+
+    fn release_buriko_movie_resource(&mut self, handle: i32) -> i32 {
+        let status = self.graph_buriko_movies.release(handle);
+        if status == 0 {
+            self.graph_process_handles.remove(&handle);
+        }
+        status
+    }
+
+    fn attach_buriko_movie_resource(&mut self, source: i32) -> std::result::Result<i32, i32> {
+        let result = self.graph_buriko_movies.attach(source);
+        if let Ok(handle) = result {
+            self.graph_process_handles.insert(handle);
+        }
+        result
+    }
+
+    fn validate_buriko_movie_decode(
+        &mut self,
+        destination: i32,
+        source: i32,
+        frame_index: i32,
+    ) -> i32 {
+        let destination_info = self
+            .bitmap_dimensions
+            .get(&destination)
+            .map(|&(width, height)| {
+                let format = self
+                    .bitmap_formats
+                    .get(&destination)
+                    .copied()
+                    .unwrap_or_default();
+                (width, height, format)
+            });
+        self.graph_buriko_movies
+            .validate_decode(destination_info, source, frame_index)
+    }
+
+    fn set_item_selection_column_layout(&mut self, window: i32, layout: Option<[i32; 16]>) -> bool {
+        if !Self::is_window_surface_handle(window) || !self.graph_surfaces.contains_key(&window) {
+            return false;
+        }
+        if let Some(layout) = layout {
+            self.graph_item_selection_column_layouts
+                .insert(window, layout);
+        } else {
+            self.graph_item_selection_column_layouts.remove(&window);
+        }
+        true
+    }
+
+    fn query_graph_window_valid_region(&self, window: i32) -> Option<[i32; 4]> {
+        if !Self::is_window_surface_handle(window) {
+            return None;
+        }
+        self.graph_surfaces.get(&window).map(|surface| {
+            [
+                surface.viewport_x as i32,
+                surface.viewport_y as i32,
+                surface.viewport_x as i32 + surface.viewport_width as i32 - 1,
+                surface.viewport_y as i32 + surface.viewport_height as i32 - 1,
+            ]
+        })
+    }
+
+    fn query_graph91_object_property(
+        &self,
+        object: i32,
+        parameter: i32,
+    ) -> std::result::Result<i32, i32> {
+        if !self.graph_handle_exists(object) {
+            return Err(255);
+        }
+        let Some(properties) = self.graph_object_properties.get(&object) else {
+            return Err(5);
+        };
+        properties
+            .properties
+            .get(&(parameter as u32))
+            .map(|&(value, _)| value)
+            .ok_or(5)
+    }
+
+    fn query_graph91_object_composite_position(&self, object: i32) -> Option<[i32; 2]> {
+        if !self.graph_handle_exists(object) {
+            return None;
+        }
+        let (x, y) = self.graph_native_composite_position(object)?;
+        Some([x, y])
+    }
+
+    fn graph91_landscape_hit_test(&self, landscape: i32, alpha_test_mode: i32) -> Option<[i32; 2]> {
+        RuntimeTraceApi::graph91_landscape_hit_test(self, landscape, alpha_test_mode)
+    }
+
+    fn configure_graph91_landscape_parts(
+        &mut self,
+        landscape: i32,
+        bitmap: i32,
+        part_count: i32,
+        part_words: &[i32],
+        part_spacing: i32,
+        column_count: i32,
+        column_words: &[i32],
+    ) -> bool {
+        self.graph91_configure_landscape_parts(
+            landscape,
+            bitmap,
+            part_count,
+            part_words,
+            part_spacing,
+            column_count,
+            column_words,
+        )
+    }
+
+    fn configure_graph91_landscape_map(
+        &mut self,
+        landscape: i32,
+        width: i32,
+        height: i32,
+        map: &[i32],
+    ) -> bool {
+        self.graph91_configure_landscape_map(landscape, width, height, map)
+    }
+
+    fn configure_graph91_landscape_guides(
+        &mut self,
+        landscape: i32,
+        bitmap: i32,
+        guide_count: i32,
+        guide_words: &[i32],
+    ) -> bool {
+        self.graph91_configure_landscape_guides(landscape, bitmap, guide_count, guide_words)
+    }
+
+    fn set_graph91_landscape_cell_guides(
+        &mut self,
+        landscape: i32,
+        pairs: &[i32],
+        layer: i32,
+        guide: i32,
+        value: i32,
+    ) -> bool {
+        self.graph91_set_landscape_cell_guides(landscape, pairs, layer, guide, value)
+    }
+
+    fn query_graph91_landscape_cell_value(
+        &self,
+        landscape: i32,
+        line: i32,
+        column: i32,
+    ) -> Option<i32> {
+        self.graph91_landscape_cell_value(landscape, line, column)
+    }
+
+    fn configure_message_caret_frames(
+        &mut self,
+        table_pointer: u32,
+        frame_count: i32,
+        frames: &[i32],
+    ) -> std::result::Result<(), i32> {
+        // sub_433300 destroys the previous table and publishes the new count
+        // before validating individual bitmap entries. Preserve that state
+        // transition, including a partially copied table on failure.
+        self.graph_defaults.caret_frame_count = frame_count;
+        self.graph_defaults.caret_frame_table_pointer = table_pointer as i32;
+        self.graph_defaults.caret_frames.clear();
+        if frame_count > 1 {
+            for bitmap in frames.iter().copied().take(frame_count as usize) {
+                if bitmap == -1 {
+                    self.graph_defaults.caret_frames.push(None);
+                    continue;
+                }
+                let valid = self.bitmap_dimensions.contains_key(&bitmap)
+                    || self.graph_surfaces.contains_key(&bitmap)
+                    || self.graph_resources.contains_key(&bitmap)
+                    || self.resource_image_region(bitmap).is_some();
+                if !valid {
+                    return Err(bitmap);
+                }
+                self.graph_defaults.caret_frames.push(Some(bitmap));
+            }
+        }
+        Ok(())
+    }
+
     fn cache_graph_blob(&mut self, namespace: &str, name: &str, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
             return false;
         }
-        self.graph_blob_cache
-            .insert((namespace.to_string(), name.to_string()), bytes.to_vec());
+        self.graph_blob_cache.insert(
+            (namespace.to_ascii_lowercase(), name.to_ascii_lowercase()),
+            bytes.to_vec(),
+        );
         tracing::debug!(namespace, name, size = bytes.len(), "GraphCacheBlob");
         true
+    }
+
+    fn register_bg_resource_data(&mut self, namespace: &str, name: &str, bytes: &[u8]) -> bool {
+        if decode_image(bytes).is_err() {
+            return false;
+        }
+        self.cache_graph_blob(namespace, name, bytes)
+    }
+
+    fn encode_graph_bitmap(
+        &mut self,
+        bitmap: i32,
+        format: i32,
+        parameter: i32,
+    ) -> std::result::Result<Vec<u8>, i32> {
+        let Some(image) = self.graph_bitmap_image(bitmap) else {
+            return Err(0x8000_000Au32 as i32);
+        };
+        if image.width.saturating_mul(image.height) > 0x0040_0000 {
+            return Err(0x8000_0006u32 as i32);
+        }
+        if !matches!(format, 0 | 1) {
+            return Err(0x8000_0017u32 as i32);
+        }
+        if format == 1 && !(0..=100).contains(&parameter) {
+            return Err(0x8000_0018u32 as i32);
+        }
+
+        // The target's two encoders are proprietary. Preserve its 16-byte BG
+        // header and BGRA byte order as a deterministic portable payload while
+        // keeping this handler classified Partial rather than claiming codec
+        // equivalence.
+        let width = u16::try_from(image.width).map_err(|_| -1)?;
+        let height = u16::try_from(image.height).map_err(|_| -1)?;
+        let mut bytes = Vec::with_capacity(16 + image.rgba.len());
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        for pixel in image.rgba.chunks_exact(4) {
+            bytes.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+        Ok(bytes)
     }
 
     fn create_bitmap_from_rgb(
@@ -5037,6 +15101,61 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         );
     }
 
+    fn draw_graph_icon_batch(
+        &mut self,
+        window: i32,
+        records: &[ethornell_vm::GraphIconRecord],
+    ) -> bool {
+        let Some(surface) = self.graph_surfaces.get(&window) else {
+            return false;
+        };
+        if !Self::is_window_surface_handle(window) || !(1..=64).contains(&records.len()) {
+            return false;
+        }
+        let width = surface.width.max(1.0) as u32;
+        let height = surface.height.max(1.0) as u32;
+        let composite_key = format!("runtime:bitmap:{window}");
+        self.clear_bitmap_text(window);
+        self.store_graph_image(
+            composite_key.clone(),
+            DecodedImage {
+                width,
+                height,
+                rgba: vec![0; width as usize * height as usize * 4],
+            },
+        );
+        self.graph_resources
+            .insert(window, RuntimeGraphResource::whole(composite_key.clone()));
+        if let Some(surface) = self.graph_surfaces.get_mut(&window) {
+            surface.resource_id = Some(window);
+        }
+
+        let mut drawn = 0_usize;
+        for record in records {
+            if self
+                .composite_graph_bitmap(window, record.bitmap, record.x, record.y, 0, 0)
+                .is_some()
+            {
+                drawn += 1;
+            }
+        }
+        self.graph_redraw_requested = Some(false);
+        let skipped = records.len().saturating_sub(drawn);
+        tracing::debug!(
+            window,
+            count = records.len(),
+            drawn,
+            skipped,
+            "GraphDrawIconBatch"
+        );
+        trace_graph!(
+            self,
+            "window #{window} draw icon batch count={} drawn={drawn} skipped={skipped}",
+            records.len()
+        );
+        true
+    }
+
     fn configure_graph_input_object(
         &mut self,
         object: i32,
@@ -5071,7 +15190,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 .iter()
                 .map(|region| {
                     format!(
-                        "group={} index={} ordinal={} enabled_depth={} selected={} rect=({},{} {}x{}) resources=({},{},{}) flags=0x{:08X}",
+                        "group={} index={} ordinal={} enabled_depth={} selected={} rect=({},{} {}x{}) resources=(normal={},selected={},hover={},hover_selected={},aux={}) flags=0x{:08X}",
                         region.group,
                         region.index,
                         region.ordinal,
@@ -5083,6 +15202,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         region.height,
                         region.normal_resource,
                         region.selected_resource,
+                        region.hover_resource,
+                        region.hover_selected_resource,
                         region.mask_resource,
                         region.flags
                     )
@@ -5095,6 +15216,16 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             .or_insert_with(|| RuntimeGraphInputObject::new(0));
         input.configure(descriptor);
         let input_layer = input.layer;
+        let descriptor = input.descriptor.clone();
+        if self.graph_surfaces.contains_key(&input_layer) {
+            self.replace_surface_control_layers(input_layer, &descriptor);
+        }
+        // sub_44A900 resets the pointer-current item and immediately reruns
+        // hit testing. If the cursor is already over an item, the target can
+        // therefore queue the initial 0x10000002 record during configure.
+        if let Some(point) = self.mouse_pos {
+            self.initialize_graph_pointer_after_config(object, point);
+        }
         trace_graph!(
             self,
             "configure input object #{object} layer=#{} regions={region_count}",
@@ -5135,17 +15266,35 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     (width as f32, height as f32)
                 })
             });
-        let info = dimensions.map(|(width, height)| ethornell_vm::BitmapInfo {
-            width: width.max(0.0).round() as u32,
-            height: height.max(0.0).round() as u32,
-            format: 2,
+        let info = dimensions.map(|(width, height)| {
+            let width = width.max(0.0).round() as u32;
+            let height = height.max(0.0).round() as u32;
+            let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
+            let bytes_per_pixel =
+                graph_bitmap_nodes::target_bitmap_bytes_per_pixel(format).unwrap_or(0);
+            ethornell_vm::BitmapInfo {
+                row_stride: width.saturating_mul(bytes_per_pixel),
+                width,
+                height,
+                format: format as u32,
+                bytes_per_pixel,
+            }
         });
         tracing::debug!(bitmap, ?info, "BitmapQueryInfo");
         info
     }
 
+    fn read_bitmap_pixel(&mut self, bitmap: i32, x: i32, y: i32) -> Option<[u8; 4]> {
+        let image = self.graph_bitmap_image(bitmap)?;
+        if x < 0 || y < 0 || x as u32 >= image.width || y as u32 >= image.height {
+            return None;
+        }
+        let offset = ((y as u32 * image.width + x as u32) * 4) as usize;
+        image.rgba.get(offset..offset + 4)?.try_into().ok()
+    }
+
     fn set_bitmap_dimensions(&mut self, bitmap: i32, width: i32, height: i32) -> bool {
-        if !(0..0x4000).contains(&bitmap) {
+        if !(0..0x4000).contains(&bitmap) || width < 0 || height < 0 {
             return false;
         }
         self.bitmap_dimensions
@@ -5154,351 +15303,393 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         true
     }
 
+    fn set_bitmap_auxiliary_pair(&mut self, bitmap: i32, first: i32, second: i32) -> bool {
+        if self.query_bitmap_info(bitmap).is_none() {
+            return false;
+        }
+        self.bitmap_auxiliary_pairs.insert(bitmap, [first, second]);
+        tracing::debug!(bitmap, first, second, "GraphSetBitmapAuxiliaryPair");
+        true
+    }
+
+    fn query_bitmap_auxiliary_pair(&mut self, bitmap: i32) -> Option<[i32; 2]> {
+        self.query_bitmap_info(bitmap)?;
+        Some(
+            self.bitmap_auxiliary_pairs
+                .get(&bitmap)
+                .copied()
+                .unwrap_or([-1, -1]),
+        )
+    }
+
     fn call_graph_spline_control(
         &mut self,
-        args: &[ethornell_vm::Value],
+        call: &mut ethornell_vm::NativeCallFrame,
         points: &[[i32; 4]],
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
-        let target = args.first().map(value_to_i32).unwrap_or_default();
-        let mode = args.get(3).map(value_to_i32).unwrap_or_default();
-        let start_alpha = args.get(4).map(value_to_i32).unwrap_or(256);
-        let target_alpha = args.get(6).map(value_to_i32).unwrap_or(start_alpha);
-        let duration_ms = args.get(7).map(value_to_i32).unwrap_or_default().max(1);
-        let input_enabled = args.get(10).map(value_to_i32).unwrap_or_default() != 0;
-        let input_descriptor = args.get(11).map(value_to_i32).unwrap_or_default();
-        let duration_frames = duration_ms.unsigned_abs().div_ceil(16).max(1);
-
-        let layer_ids = self.graph_target_layers(target);
-        for layer_id in &layer_ids {
-            if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                let from = (start_alpha as f32 / 256.0).clamp(0.0, 1.0);
-                let to = (target_alpha as f32 / 256.0).clamp(0.0, 1.0);
-                layer.opacity = from;
-                self.layer_animations
-                    .fade_to(*layer_id, from, to, duration_frames);
-
-                if let Some(last) = points.last() {
-                    let x = graph_motion_coord(last[0]);
-                    let y = graph_motion_coord(last[1]);
-                    self.layer_animations.move_x_to(
-                        *layer_id,
-                        layer.transform_x,
-                        x,
-                        duration_frames,
-                    );
-                    self.layer_animations.move_y_to(
-                        *layer_id,
-                        layer.transform_y,
-                        y,
-                        duration_frames,
-                    );
-                }
-            }
+        let Some(schedule) = animation::ScheduledSplineControl::from_source_args(call.args()) else {
+            return Err(ethornell_vm::VmError::Runtime(
+                "Graph90:29 missing recovered spline-control arguments".to_string(),
+            ));
+        };
+        if !self.graph_handle_exists(schedule.target_object) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "Graph90:29 object #{} is not registered",
+                schedule.target_object
+            )));
         }
-        self.animation_queue_remaining = self.animation_queue_remaining.max(duration_frames);
-        self.pending_graph_procedure_schedule = Some(ethornell_vm::GraphProcedureSchedule {
-            duration_ms,
-            input_enabled,
-            input_descriptor,
-            wait_for_input: false,
-            completion: ethornell_vm::GraphProcedureCompletion::ControlProgress,
-        });
-        trace_graph!(self,
-            "spline control target=#{target} mode={mode} duration_ms={duration_ms} alpha={start_alpha}->{target_alpha} points={points:?} layers={layer_ids:?}"
+        if points.is_empty() {
+            // sub_432490 rejects point_count <= 0 with 0x80000001.
+            return Err(ethornell_vm::VmError::Runtime(
+                "Graph90:29 requires at least one spline point".to_string(),
+            ));
+        }
+        if !(0..=256).contains(&schedule.target_alpha) {
+            return Err(ethornell_vm::VmError::Runtime(format!(
+                "Graph90:29 transparency {} is outside 0..=256",
+                schedule.target_alpha
+            )));
+        }
+        if schedule.update_denominator == 0 {
+            return Err(ethornell_vm::VmError::Runtime(
+                "Graph90:29 update denominator must not be zero".to_string(),
+            ));
+        }
+
+        // The VM dispatcher has already copied all twelve BP arguments into
+        // this NativeCallFrame before reading the spline records from guest
+        // memory.  This host override parsed them through `args()` rather than
+        // `pop_*`, so explicitly mark the frame consumed after validation.
+        // Otherwise the ABI auditor reports a false
+        // "native ABI arguments left unconsumed ... remaining=12" warning even
+        // though CProcCtrlDspObjBC was successfully created.
+        call.args_mut().clear();
+
+        // CProcCtrlDspObjBC::Init (sub_432490) snapshots vtable +64 before
+        // appending the script's 16-byte point records.  Only the first three
+        // DWORDs of each record feed the target's three independent natural
+        // cubic splines; the fourth DWORD is retained by the native object but
+        // is not an additional spatial component.
+        let native = self
+            .graph_object_properties
+            .entry(schedule.target_object)
+            .or_default()
+            .native
+            .clone();
+        let from_vector = (
+            native.fixed_position_x_16_16,
+            native.fixed_position_y_16_16,
+            native.fixed_position_z_16_16,
         );
-        tracing::debug!(
-            target,
-            mode,
+        let from_alpha = self
+            .graph_transition_nodes
+            .get(&schedule.target_object)
+            .filter(|transition| transition.blend_selector == 1)
+            .map(|transition| transition.alpha_multiplier.clamp(0, 256))
+            .unwrap_or_else(|| {
+                self.graph_object_properties
+                    .entry(schedule.target_object)
+                    .or_default()
+                    .alpha_parameter()
+            });
+        let raw_fixed_parameter_16_16 = self
+            .graph_object_properties
+            .entry(schedule.target_object)
+            .or_default()
+            .native
+            .fixed_parameter_16_16;
+        let from_fixed_parameter_16_16 =
+            (((raw_fixed_parameter_16_16 as u32 >> 16) & 0xffff) as i32) << 16;
+        let duration_ms = schedule.duration_ms.max(1);
+        let control_id = self.layer_animations.schedule_native_spline_control(
+            schedule.target_object,
+            from_vector,
+            points,
+            schedule.position_curve,
+            from_alpha,
+            schedule.target_alpha,
+            schedule.alpha_curve,
+            from_fixed_parameter_16_16,
+            schedule.fixed_parameter_target,
             duration_ms,
-            start_alpha,
-            target_alpha,
-            ?points,
-            "GraphScheduleSplineControl"
+            schedule.update_denominator,
+            schedule.update_numerator,
+            schedule.spline_time_scale,
+            schedule.input_enabled,
+            schedule.input_descriptor,
+        );
+        self.register_native_control_input_latch(
+            control_id,
+            schedule.input_enabled,
+            schedule.input_descriptor,
+        );
+        call.start_graph_control_procedure(schedule.target_object, control_id);
+        tracing::info!(
+            control_id,
+            object = schedule.target_object,
+            from_x_16_16 = from_vector.0,
+            from_y_16_16 = from_vector.1,
+            from_z_16_16 = from_vector.2,
+            target_alpha = schedule.target_alpha,
+            from_alpha,
+            fixed_parameter_from = from_fixed_parameter_16_16,
+            fixed_parameter_to = schedule.fixed_parameter_target,
+            duration_ms,
+            point_count = points.len(),
+            first_point = ?points.first(),
+            last_point = ?points.last(),
+            input_enabled = schedule.input_enabled,
+            input_scope = schedule.input_descriptor,
+            "GraphStartSplineObjectControl"
+        );
+        trace_graph!(
+            self,
+            "native spline control id={} target=#{} curve={} alpha={}->{} alpha_curve={} time_scale={} fixed=0x{:08X}->{} duration_ms={} update={}/{} input={}:{} points={points:?}",
+            control_id,
+            schedule.target_object,
+            schedule.position_curve,
+            from_alpha,
+            schedule.target_alpha,
+            schedule.alpha_curve,
+            schedule.spline_time_scale,
+            from_fixed_parameter_16_16,
+            schedule.fixed_parameter_target,
+            duration_ms,
+            schedule.update_numerator,
+            schedule.update_denominator,
+            schedule.input_enabled,
+            schedule.input_descriptor,
         );
         Ok(ethornell_vm::Value::None)
     }
 
-    fn take_graph_procedure_schedule(&mut self) -> Option<ethornell_vm::GraphProcedureSchedule> {
-        self.pending_graph_procedure_schedule.take()
+    fn system92_text_output_pair(&self) -> [i32; 2] {
+        self.system92_text_output_pair
+    }
+
+    fn take_system92_text_fragment_records(
+        &mut self,
+    ) -> Vec<ethornell_vm::System92TextFragmentRecord> {
+        std::mem::take(&mut self.system92_text_fragment_records)
     }
 
     fn call_graph(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
-        if let Some(result) = self.dispatch_native_graph(group, id, stack) {
+        if let Some(result) = self.dispatch_native_graph(call) {
             return result;
         }
-        if let Some(result) = self.dispatch_native_graph_ext(group, id, stack) {
+        if let Some(result) = self.dispatch_native_graph_ext(call) {
             return result;
         }
-        if let Some(result) = self.dispatch_native_graph_resource(group, id, stack) {
+        if let Some(result) = self.dispatch_native_graph_resource(call) {
             return result;
         }
-        match (group, id) {
-            (0x90, 0x40) => {
-                let bitmap = pop_int_value(stack).unwrap_or_default();
-                self.primary_bitmap = (bitmap > 0).then_some(bitmap);
-                tracing::debug!(bitmap, "GraphSetPrimaryBitmap");
+        match call.opcode() {
+            ethornell_vm::native_call::opcodes::GRAPH_SET_OBJECT_ALPHA => {
+                // Target handler invokes the CDspObj transparency setter. BP
+                // push order is [object, alpha_parameter], so the native pop
+                // order consumes alpha_parameter first.
+                let alpha_parameter = call.pop_i32("alpha_parameter")?;
+                let object = call.pop_i32("object")?;
+                call.require_consumed()?;
+                if !(0..=256).contains(&alpha_parameter) {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:32 alpha parameter {alpha_parameter} is outside 0..=256"
+                    )));
+                }
+                self.graph90_require_registered_object(0x32, object)?;
+                self.set_graph_object_alpha_recursive(object, alpha_parameter);
+                tracing::debug!(object, alpha_parameter, "GraphSetObjectAlpha");
                 return Ok(ethornell_vm::Value::None);
             }
-            (0x90, 0x47) => {
-                let args = pop_args(stack, 5);
-                tracing::info!(args = ?summarize_values(&args), "GraphConfigureEffectResource");
-                trace_graph!(
-                    self,
-                    "configure effect resource raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
+            ethornell_vm::native_call::opcodes::GRAPH_RENDER_OBJECT_TO_BITMAP => {
+                // BP order [destination_bitmap, source_window]; target pop
+                // order consumes the CDspObjWindow first.
+                let source_window = call.pop_i32("source_window")?;
+                let destination_bitmap = call.pop_i32("destination_bitmap")?;
+                call.require_consumed()?;
+                let rendered = Self::is_window_surface_handle(source_window)
+                    && self.render_graph_object_to_bitmap(source_window, destination_bitmap);
+                tracing::info!(
+                    source_window,
+                    destination_bitmap,
+                    rendered,
+                    "GraphRenderWindowToBitmap"
                 );
                 return Ok(ethornell_vm::Value::None);
             }
-            (0x90, 0x4a) => {
-                let args = pop_args(stack, 5);
-                tracing::debug!(args = ?summarize_values(&args), "GraphConfigureBlitSources");
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x90, 0x4d) => {
-                tracing::debug!("GraphGetRenderTarget");
-                return Ok(ethornell_vm::Value::Int(0));
-            }
-            (0x90, 0xb4) => {
-                let args = pop_args(stack, 3);
-                tracing::debug!(args = ?summarize_values(&args), "GraphCompositeSpriteBatch");
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x90, 0xda) => {
-                let handle = pop_int_value(stack).unwrap_or_default();
-                let state = if self.timelines.contains(handle) {
-                    i32::from(self.timelines.poll(handle).finished)
+            ethornell_vm::native_call::opcodes::GRAPH_BIND_BITMAP_TO_SURFACE => {
+                // BP order [window, decoration_error_context,
+                // frame_error_context, source_bitmap]. Only the outer values
+                // reach sub_42B2A0; the middle pair is diagnostic context.
+                let source_bitmap = call.pop_i32("source_bitmap")?;
+                let frame_error_context = call.pop_i32("frame_error_context")?;
+                let decoration_error_context = call.pop_i32("decoration_error_context")?;
+                let window = call.pop_i32("window")?;
+                call.require_consumed()?;
+                let retained = if !Self::is_window_surface_handle(window) {
+                    false
+                } else if source_bitmap == -1 {
+                    self.graph_resources.remove(&window);
+                    self.graph_surfaces.get_mut(&window).is_some_and(|surface| {
+                        surface.resource_id = None;
+                        true
+                    })
                 } else {
-                    i32::from(self.graph_handle_exists(handle))
+                    self.retain_surface_backing(window, source_bitmap)
                 };
-                tracing::debug!(handle, state, "GraphQuerySpecialHandle");
-                return Ok(ethornell_vm::Value::Int(state));
+                trace_graph!(
+                    self,
+                    "window #{window} background bitmap=#{source_bitmap} retained={retained} diagnostic=({decoration_error_context},{frame_error_context})"
+                );
+                return Ok(ethornell_vm::Value::None);
             }
-            (0x90, 0xdb) => {
-                let handle = self.graph_special_events.pop_front().unwrap_or_default();
-                tracing::debug!(handle, "GraphTakeSpecialEvent");
-                return Ok(ethornell_vm::Value::Int(handle));
-            }
-            (0x90, 0xde) => {
-                let handle = pop_int_value(stack).unwrap_or_default();
-                if handle > 0 {
-                    self.graph_special_watches.insert(handle);
+            ethornell_vm::native_call::opcodes::GRAPH_SET_TEXT_EXTENT_FONT_STATE => {
+                // BP push order is [extent_x, extent_y, reserved, font_size,
+                // line_height, mode]. NativeCallFrame consumes the target pop
+                // order from the end.
+                let mode = call.pop_i32("mode")?;
+                let line_height = call.pop_i32("line_height")?;
+                let font_size = call.pop_i32("font_size")?;
+                let reserved = call.pop_i32("reserved")?;
+                let extent_y = call.pop_i32("extent_y")?;
+                let extent_x = call.pop_i32("extent_x")?;
+                call.require_consumed()?;
+                let args = [extent_x, extent_y, reserved, font_size, line_height, mode];
+                let result = self.graph_defaults.text_layout.configure(args);
+                if result.is_ok() {
+                    self.text_state.font_size = font_size as f32;
+                    if line_height > 0 {
+                        self.text_state.line_height = line_height as f32;
+                    }
                 }
-                tracing::debug!(handle, "GraphWatchSpecialHandle");
+                tracing::info!(?args, ?result, "GraphSetTextExtentFontState");
                 return Ok(ethornell_vm::Value::None);
             }
-            (0x90, 0xdf) => {
-                let handle = pop_int_value(stack).unwrap_or_default();
-                self.graph_special_watches.remove(&handle);
-                self.graph_special_events.retain(|event| *event != handle);
-                tracing::debug!(handle, "GraphUnwatchSpecialHandle");
+            ethornell_vm::native_call::opcodes::GRAPH_SET_PERSISTENT_TEXT_STYLE => {
+                // sub_4865E0 reverse-pops six scalar fields after a registry
+                // string identifier. sub_434440 stores the six scalars in
+                // dword_565CE0..565CEC and dword_507644/507648.
+                let text_override_1 = call.pop_i32("text_override_1")?;
+                let text_override_0 = call.pop_i32("text_override_0")?;
+                let ruby_y_offset = call.pop_i32("ruby_y_offset")?;
+                let ruby_x_offset = call.pop_i32("ruby_x_offset")?;
+                let ruby_font_field = call.pop_i32("ruby_font_field")?;
+                let ruby_height = call.pop_i32("ruby_height")?;
+                let font_name_value = call.pop_value("font_name")?;
+                call.require_consumed()?;
+                let values = [
+                    ruby_height,
+                    ruby_font_field,
+                    ruby_x_offset,
+                    ruby_y_offset,
+                    text_override_0,
+                    text_override_1,
+                ];
+                // A direct VM string is already resolved. Zero clears the
+                // target face buffer. A nonzero numeric registry selector is
+                // retained as unresolved rather than fabricated as a hex font
+                // name; this is one reason the handler remains Partial.
+                match &font_name_value {
+                    ethornell_vm::Value::Str(name) => {
+                        self.graph_defaults.text_style.font_name =
+                            (!name.is_empty()).then(|| name.clone());
+                    }
+                    ethornell_vm::Value::Int(0)
+                    | ethornell_vm::Value::Ptr(0)
+                    | ethornell_vm::Value::None => {
+                        self.graph_defaults.text_style.font_name = None;
+                    }
+                    _ => {}
+                }
+                self.graph_defaults.text_style.set_fields(values);
+                tracing::info!(
+                    ?font_name_value,
+                    ?values,
+                    "GraphSetPersistentTextStyleFields"
+                );
                 return Ok(ethornell_vm::Value::None);
             }
+            _ => {}
+        }
+        let (group, id) = (call.group(), call.id());
+        let stack = call.args_mut();
+        match (group, id) {
             (0x90, 0xf0) => {
                 let args = pop_args(stack, 5);
-                tracing::info!(args = ?summarize_values(&args), "MovieOpenBlocking unavailable in portable renderer");
-                return Ok(ethornell_vm::Value::Int(0));
+                // sub_480160 reverse-pops height, width, two ignored display
+                // parameters, then the movie resource name. Non-positive
+                // dimensions are rejected before DirectShow is opened.
+                let height = args.first().map(value_to_i32).unwrap_or_default();
+                let width = args.get(1).map(value_to_i32).unwrap_or_default();
+                let resource = args.get(4).and_then(value_to_string).unwrap_or_default();
+                if width <= 0 || height <= 0 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph90:F0 invalid movie size {width}x{height}"
+                    )));
+                }
+                let opened = self.open_runtime_movie("", &resource);
+                let duration = opened.map(|(_, duration)| duration).unwrap_or_default();
+                tracing::info!(
+                    args = ?summarize_values(&args),
+                    resource,
+                    width,
+                    height,
+                    handle = opened.map(|(handle, _)| handle),
+                    duration,
+                    "Graph90:F0 open DirectShow movie"
+                );
+                return Ok(ethornell_vm::Value::Int(duration));
             }
             (0x90, 0xf1) => {
-                // funcs_48065E[0xF1] -> sub_480260 tears down the native
-                // graphics/media driver and releases its display state.
-                self.graph_driver_mode = 0;
-                self.graph_process_handles.clear();
-                tracing::info!("GraphShutdownDriver");
+                // sub_480260 releases the process owned by the global
+                // DirectShow movie slot.
+                self.graph_effects.stop_all_movies();
+                self.global_movie_handle = None;
+                tracing::info!("MovieStop");
             }
             (0x90, 0xf2) => {
-                // sub_480280 returns sub_48F690's driver ordering predicate.
-                // The portable renderer has no asynchronous device reset.
-                let status = 0;
-                tracing::debug!(status, "GraphQueryDriverStatus");
-                return Ok(ethornell_vm::Value::Int(status));
+                let playing = self
+                    .global_movie_handle
+                    .is_some_and(|handle| self.graph_effects.state(handle) == 0);
+                tracing::debug!(playing, "MovieIsPlaying");
+                return Ok(ethornell_vm::Value::Int(i32::from(playing)));
             }
             (0x90, 0xf3) => {
-                let volume = pop_int_value(stack).unwrap_or_default().clamp(0, 128);
-                tracing::debug!(volume, "MovieSetVolume");
+                let volume = pop_int_value(stack).unwrap_or_default();
+                // sub_48F6F0 accepts only the inclusive 0..128 range. The
+                // public handler ignores its Boolean result, so an invalid
+                // value leaves the process-global volume unchanged.
+                if (0..=128).contains(&volume) {
+                    self.global_movie_volume = volume;
+                    let _ = self.graph_effects.set_all_movie_volumes(volume);
+                }
+                tracing::debug!(
+                    volume,
+                    accepted = (0..=128).contains(&volume),
+                    "Graph90:F3 set DirectShow movie volume"
+                );
                 return Ok(ethornell_vm::Value::None);
             }
             (0x90, 0xf4) => {
-                let args = pop_args(stack, 4);
-                let handle = self.next_object_handle;
-                self.next_object_handle = self.next_object_handle.saturating_add(1);
-                self.graph_process_handles.insert(handle);
-                tracing::info!(args = ?summarize_values(&args), handle, "MovieCreateLoader unavailable in portable renderer");
-                return Ok(ethornell_vm::Value::Int(handle));
+                // The VM owns both output pointers and must perform the five
+                // metadata DWORD writes. Reaching host dispatch would double-pop.
+                unreachable!("0x90:F4 is handled by the VM BF_Movie pointer bridge");
             }
             (0x90, 0xf5) => {
-                let handle = stack.pop().unwrap_or(ethornell_vm::Value::None);
-                let raw_handle = value_to_i32(&handle);
-                // sub_480370 -> sub_405CD0 removes a graph process from the
-                // native intrusive list. Function-valued BP handles are the
-                // port's tagged representation of an extant process pointer.
-                let released = self.graph_process_handles.remove(&raw_handle)
-                    || matches!(handle, ethornell_vm::Value::Func { .. });
-                let status = if released { 0 } else { 3 };
-                tracing::debug!(raw_handle, status, "GraphReleaseProcess");
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let status = self.graph_buriko_movies.release(handle);
+                if status == 0 {
+                    self.graph_process_handles.remove(&handle);
+                }
+                tracing::debug!(handle, status, "ReleaseBurikoMovieResource");
                 return Ok(ethornell_vm::Value::Int(status));
             }
             (0x90, 0xf7) => {
-                // sub_4804D0 resolves the first BP handle, attaches the second
-                // value as a graph process, and maps native failures to 3/7.
-                let process = pop_int_value(stack).unwrap_or_default();
-                let object = pop_int_value(stack).unwrap_or_default();
-                let status = if !self.graph_handle_exists(object) {
-                    3
-                } else if self.graph_process_handles.contains(&object) {
-                    7
-                } else {
-                    self.graph_process_handles.insert(object);
-                    if process != 0 {
-                        self.graph_bindings.insert(object, process);
-                    }
-                    0
-                };
-                tracing::debug!(object, process, status, "GraphAttachProcess");
-                return Ok(ethornell_vm::Value::Int(status));
-            }
-            (0x91, 0x37) => {
-                let z = fixed_16_to_f32(pop_int_value(stack).unwrap_or_default());
-                let y = fixed_16_to_f32(pop_int_value(stack).unwrap_or_default());
-                let x = fixed_16_to_f32(pop_int_value(stack).unwrap_or_default());
-                let object = pop_int_value(stack).unwrap_or_default();
-                let layer_ids = self.graph_target_layers(object);
-                for layer_id in &layer_ids {
-                    if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                        layer.x = x;
-                        layer.y = y;
-                        layer.z = z.round() as i32;
-                    }
-                }
-                tracing::debug!(object, x, y, z, ?layer_ids, "GraphObjectSetBaseVector3");
-                trace_graph!(
-                    self,
-                    "object #{object} base vector x={x:.2} y={y:.2} z={z:.2} layers={layer_ids:?}"
-                );
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x91, 0x36) => {
-                let z = fixed_16_to_f32(pop_int_value(stack).unwrap_or_default()).round() as i32;
-                let y = fixed_16_to_f32(pop_int_value(stack).unwrap_or_default());
-                let x = fixed_16_to_f32(pop_int_value(stack).unwrap_or_default());
-                let object = pop_int_value(stack).unwrap_or_default();
-                let layer_ids = self.graph_target_layers(object);
-                for layer_id in &layer_ids {
-                    if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                        layer.transform_x = x;
-                        layer.transform_y = y;
-                        layer.transform_z = z;
-                    }
-                }
-                trace_graph!(
-                    self,
-                    "object #{object} transform vector x={x:.2} y={y:.2} z={z} layers={layer_ids:?}"
-                );
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x91, 0x1b) => {
-                let alpha = pop_int_value(stack).unwrap_or_default();
-                let scale_y = pop_int_value(stack).unwrap_or_default();
-                let scale_x = pop_int_value(stack).unwrap_or_default();
-                let source = pop_int_value(stack).unwrap_or_default();
-                let destination = pop_int_value(stack).unwrap_or_default();
-                let source_image = self
-                    .resource_image_region(source)
-                    .and_then(|(key, region)| {
-                        self.graph_images
-                            .get(key)
-                            .map(|image| crop_decoded_image(image, region))
-                    });
-                let destination_image =
-                    self.resource_image_region(destination)
-                        .and_then(|(key, region)| {
-                            self.graph_images
-                                .get(key)
-                                .map(|image| crop_decoded_image(image, region))
-                        });
-                if let (Some(source_image), Some(mut destination_image)) =
-                    (source_image, destination_image)
-                {
-                    if let Some(scaled) = scale_decoded_image_fixed(&source_image, scale_x, scale_y)
-                    {
-                        blend_decoded_image_parameter(&mut destination_image, &scaled, alpha);
-                        let width = destination_image.width;
-                        let height = destination_image.height;
-                        let key = format!("runtime:scaled-blend:{destination}");
-                        self.store_graph_image(key.clone(), destination_image);
-                        self.graph_resources
-                            .insert(destination, RuntimeGraphResource::whole(key));
-                        self.bitmap_dimensions.insert(destination, (width, height));
-                    }
-                }
-                tracing::debug!(
-                    destination,
-                    source,
-                    scale_x,
-                    scale_y,
-                    alpha,
-                    "GraphBlendBitmapsScaled"
-                );
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x91, 0x1c) => {
-                let pixel_format = pop_int_value(stack).unwrap_or_default();
-                let scale_y = pop_int_value(stack).unwrap_or_default();
-                let scale_x = pop_int_value(stack).unwrap_or_default();
-                let source = pop_int_value(stack).unwrap_or_default();
-                let destination = pop_int_value(stack).unwrap_or_default();
-                let scaled = self
-                    .graph_bitmap_image(source)
-                    .and_then(|image| scale_decoded_image_fixed(&image, scale_x, scale_y));
-                if let Some(image) = scaled {
-                    let width = image.width;
-                    let height = image.height;
-                    let key = format!("runtime:scaled-bitmap:{destination}");
-                    self.store_graph_image(key.clone(), image);
-                    self.graph_resources
-                        .insert(destination, RuntimeGraphResource::whole(key));
-                    self.bitmap_dimensions.insert(destination, (width, height));
-                    self.graph_surfaces.insert(
-                        destination,
-                        RuntimeSurface::bitmap(destination, width as f32, height as f32),
-                    );
-                }
-                tracing::debug!(
-                    destination,
-                    source,
-                    scale_x,
-                    scale_y,
-                    pixel_format,
-                    "GraphCreateScaledBitmap"
-                );
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x91, 0xdb) => {
-                tracing::debug!("GraphCurrentSpecialHandle");
-                return Ok(ethornell_vm::Value::Int(0));
-            }
-            (0x92, 0x01) => {
-                let args = pop_args(stack, 7);
-                let configured = self.effects.configure_wave_table(&args);
-                tracing::debug!(args = ?summarize_values(&args), configured, "GraphConfigureWaveTable");
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x92, 0x10) => {
-                let args = pop_args(stack, 5);
-                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let generated =
-                    if let [period, center_y, center_x, direction, bitmap] = values.as_slice() {
-                        self.effects
-                            .generate_ripple_map(*bitmap, *direction, *center_x, *center_y, *period)
-                    } else {
-                        false
-                    };
-                tracing::debug!(args = ?summarize_values(&args), generated, "GraphGenerateRippleMap");
-                return Ok(ethornell_vm::Value::None);
+                // The VM owns the destination pointer write.
+                unreachable!("0x90:F7 is handled by the VM BF_Movie pointer bridge");
             }
             (0x92, 0x8d) => {
                 let args = pop_args(stack, 6);
@@ -5514,78 +15705,103 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x92, 0xf0) => {
                 let args = pop_args(stack, 6);
-                tracing::info!(args = ?summarize_values(&args), "MovieOpen unavailable in portable renderer");
-                return Ok(ethornell_vm::Value::Int(0));
-            }
-            (0x92, 0xf5) => {
-                let args = pop_args(stack, 2);
-                tracing::debug!(args = ?summarize_values(&args), "MovieGetState");
-                return Ok(ethornell_vm::Value::Int(0));
+                // sub_486B80 reverse-pops height, width, two unresolved
+                // consumed operands, resource and archive. It rejects non-positive
+                // dimensions before calling the global movie helper.
+                let height = args.first().map(value_to_i32).unwrap_or_default();
+                let width = args.get(1).map(value_to_i32).unwrap_or_default();
+                let resource = args.get(4).and_then(value_to_string).unwrap_or_default();
+                let archive = args.get(5).and_then(value_to_string).unwrap_or_default();
+                if width <= 0 || height <= 0 {
+                    return Err(ethornell_vm::VmError::Runtime(format!(
+                        "Graph92:F0 invalid movie size {width}x{height}"
+                    )));
+                }
+                let opened = self.open_runtime_movie(&archive, &resource);
+                let duration = opened.map(|(_, duration)| duration).unwrap_or_default();
+                tracing::info!(
+                    args = ?summarize_values(&args),
+                    archive,
+                    resource,
+                    handle = opened.map(|(handle, _)| handle),
+                    duration,
+                    "MovieOpen"
+                );
+                return Ok(ethornell_vm::Value::Int(duration));
             }
             (0x90, 0x06) => {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(x, y, "GraphSetCenter");
+                self.graph_config.center = (x, y);
+                let center_valid = self.screen_width > 0
+                    && self.screen_height > 0
+                    && x >= 0
+                    && y >= 0
+                    && x < self.screen_width
+                    && y < self.screen_height;
+                tracing::info!(x, y, center_valid, "GraphSetCenter");
             }
             (0x90, 0x07) => {
                 let value = pop_int_value(stack).unwrap_or_default();
+                self.graph_config.default_duration = value;
                 tracing::info!(value, "GraphSetDefaultDuration");
             }
             (0x90, 0x00) => {
-                let value = pop_int_value(stack).unwrap_or_default();
-                tracing::debug!(value, "GraphInit");
+                let full_redraw = pop_int_value(stack).unwrap_or_default() != 0;
+                self.graph_redraw_requested =
+                    Some(self.graph_redraw_requested.unwrap_or(false) || full_redraw);
+                tracing::debug!(full_redraw, "GraphRequestRedraw");
             }
             (0x90, 0x01) => {
-                let value = pop_int_value(stack).unwrap_or_default();
-                tracing::debug!(value, "GraphShutdownOrReset");
-                trace_graph!(self, "graph reset/shutdown mode={value}");
+                let enabled = pop_int_value(stack).unwrap_or_default() != 0;
+                self.graph_scheduler_enabled = enabled;
+                tracing::debug!(enabled, "GraphSetSchedulerEnabled");
+                trace_graph!(self, "graph scheduler enabled={enabled}");
             }
             (0x90, 0x02) => {
-                let delay = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(delay, "GraphDelay");
+                let frame_rate = pop_int_value(stack).unwrap_or_default();
+                if (1..=1000).contains(&frame_rate) {
+                    self.graph_frame_rate = frame_rate as u32;
+                }
+                tracing::info!(
+                    frame_rate,
+                    accepted = (1..=1000).contains(&frame_rate),
+                    interval_ms = 1000 / self.graph_frame_rate.max(1),
+                    "GraphSetFrameRate"
+                );
             }
             (0x90, 0x03) => {
                 let limit = pop_int_value(stack).unwrap_or_default();
+                if (0..=0x2000_0000).contains(&limit) {
+                    self.graph_memory_limit = limit as u32;
+                }
                 tracing::info!(limit, "GraphSetMemoryLimit");
             }
             (0x90, 0x04) => {
-                let context = pop_int_value(stack).unwrap_or_default();
-                tracing::debug!(context, "GraphSetDrawContext");
+                let bitmap = pop_int_value(stack).unwrap_or_default();
+                let created = self.create_native_work_bitmap(bitmap, None);
+                let dimensions = self.bitmap_dimensions.get(&bitmap).copied();
+                tracing::debug!(
+                    bitmap,
+                    created,
+                    ?dimensions,
+                    format = 2,
+                    "GraphCreateWorkBitmap"
+                );
             }
             (0x90, 0x05) => {
-                let args = pop_args(stack, 2);
-                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                if let Some(bitmap_id) = values.last().copied().filter(|id| *id > 0) {
-                    self.graph_resources.remove(&bitmap_id);
-                    if let Some(surface) = self.graph_surfaces.get_mut(&bitmap_id) {
-                        surface.resource_id = None;
-                    }
-                    let resource_id = values.first().copied().unwrap_or_default();
-                    let key = self
-                        .graphic_resource_keys
-                        .get(&(0, resource_id))
-                        .cloned()
-                        .or_else(|| {
-                            self.graphic_resource_keys
-                                .iter()
-                                .find_map(|((_, id), key)| {
-                                    (*id == resource_id).then(|| key.clone())
-                                })
-                        });
-                    if let Some(key) = key {
-                        self.load_graph_image_key(&key);
-                        self.graph_resources
-                            .insert(bitmap_id, RuntimeGraphResource::whole(key.clone()));
-                        trace_graph!(
-                            self,
-                            "load resource #{resource_id} into bitmap #{bitmap_id} source={key} values={values:?}"
-                        );
-                    }
-                }
-                tracing::debug!(args = ?summarize_values(&args), "GraphSelectWorkBuffer");
+                // sub_4794F0 -> sub_442F80 creates a bitmap using the
+                // current display dimensions/format, then registers it at
+                // the supplied 16-bit render priority.
+                let priority = pop_int_value(stack).unwrap_or_default();
+                let bitmap = pop_int_value(stack).unwrap_or_default();
+                let created = self.create_native_work_bitmap(bitmap, Some(priority));
+                tracing::debug!(bitmap, priority, created, "GraphCreatePrioritizedBitmap");
             }
             (0x90, 0x08) => {
                 let enabled = pop_int_value(stack).unwrap_or_default();
+                self.graph_config.enabled = enabled;
+                self.graph_redraw_requested = Some(true);
                 tracing::info!(enabled, "GraphSetEnabled");
             }
             (0x90, 0x09) => {
@@ -5601,425 +15817,207 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             (0x90, 0x0c) => {
                 let arg2 = pop_int_value(stack).unwrap_or_default();
                 let arg1 = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(arg1, arg2, "GraphSystemInit");
+                self.graph_config.display_mode = (arg1, arg2);
+                self.graph_redraw_requested = Some(true);
+                tracing::info!(arg1, arg2, "GraphSetDisplayMode");
             }
-            (0x90, 0x4c) => {
-                let arg2 = pop_int_value(stack).unwrap_or_default();
-                let arg1 = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(arg1, arg2, "GraphSystemInit2");
-            }
-            (0x90, 0x50) => {
-                let handle = self.alloc_node();
-                tracing::info!(handle, "GraphCreateNode");
-                trace_graph!(self, "create node #{handle}");
-                return Ok(ethornell_vm::Value::Int(handle));
-            }
-            (0x90, 0x51) => {
-                let target = stack.pop();
-                let node = target.as_ref().map(value_to_i32).unwrap_or_default();
-                let removed_text = self.text_nodes.remove(&node).is_some();
-                let removed_layer = self.graph_layers.remove(&node).is_some();
-                self.graph_transition_nodes.remove(&node);
-                self.graph_object_properties.remove(&node);
-                tracing::debug!(?target, node, removed_text, "GraphNodeRelease");
-                if removed_text || removed_layer {
-                    trace_graph!(self, "release node #{node}");
+            (0x90, 0x0d) => {
+                // sub_42DC80 accepts modes 0..=3 and derives three target
+                // raster layout globals. The portable GPU path corresponds to
+                // the target's hardware-enabled branch.
+                let mode = pop_int_value(stack).unwrap_or_default();
+                if (0..=3).contains(&mode) {
+                    self.graph_raster_format_mode = mode;
+                    self.graph_raster_layout = match mode {
+                        0 => (2, 1, 2),
+                        1 => (4, 2, 4),
+                        2 => (6, 3, 8),
+                        3 => (8, 4, 16),
+                        _ => unreachable!(),
+                    };
+                    // Target sub_4092D0 rebuilds every registered font after
+                    // the mode changes. Portable fonts are regenerated lazily,
+                    // so a full redraw is the visible equivalent boundary.
+                    self.graph_redraw_requested = Some(true);
                 }
-            }
-            (0x90, 0x53) => {
-                let args = pop_args(stack, 5);
-                self.refresh_graph_object_rect(&args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphRefreshObjectRect");
-            }
-            (0x90, 0x54) => {
-                let enabled = stack.pop();
-                let node = stack.pop();
-                tracing::info!(?node, ?enabled, "GraphNodeSetEnabled");
-                if let Some(node) = node.as_ref().map(value_to_i32) {
-                    let enabled = enabled.as_ref().map(value_to_i32).unwrap_or(0) != 0;
-                    if let Some(record) = self.text_nodes.get_mut(&node) {
-                        record.enabled = enabled;
-                    }
-                    if let Some(layer) = self.graph_layers.get_mut(&node) {
-                        layer.enabled = enabled;
-                    }
-                }
-            }
-            (0x90, 0x55) => {
-                let args = pop_args(stack, 2);
-                self.apply_graph_layer_property(&args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphLayerSetProperty");
-            }
-            (0x90, 0x56) => {
-                let args = pop_args(stack, 7);
-                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let node = values.last().copied().unwrap_or_default();
-                if node > 0 {
-                    self.graph_transition_nodes.remove(&node);
-                    let bitmap_id = values.get(3).copied().unwrap_or_default();
-                    if let Some(mut text_node) = self.text_nodes.get(&bitmap_id).cloned() {
-                        let flags = values.first().copied().unwrap_or_default();
-                        let (bitmap_width, bitmap_height) = self
-                            .graph_surfaces
-                            .get(&bitmap_id)
-                            .map(|surface| (surface.width, surface.height))
-                            .unwrap_or((0.0, 0.0));
-                        text_node.screen_attached = true;
-                        text_node.x += values.get(5).copied().unwrap_or_default() as f32;
-                        text_node.y += values.get(4).copied().unwrap_or_default() as f32;
-                        if flags & 0x4 == 0 {
-                            text_node.x -= bitmap_width;
-                        }
-                        if flags & 0x2 != 0 {
-                            text_node.y -= bitmap_height;
-                        }
-                        text_node.z = values.first().copied().unwrap_or(NATIVE_DISPLAY_Z);
-                        self.text_nodes.insert(node, text_node);
-                        self.graph_layers.remove(&node);
-                        trace_graph!(self,
-                            "configure text node #{node} bitmap=#{bitmap_id} x={:.0} y={:.0} flags=0x{flags:X} values={values:?}",
-                            self.text_nodes.get(&node).map(|node| node.x).unwrap_or_default(),
-                            self.text_nodes.get(&node).map(|node| node.y).unwrap_or_default()
-                        );
-                    }
-                    if let Some((key, region)) = self
-                        .resource_image_region(bitmap_id)
-                        .map(|(key, region)| (key.to_string(), region))
-                    {
-                        let x = values.get(5).copied().unwrap_or_default() as f32;
-                        let y = values.get(4).copied().unwrap_or_default() as f32;
-                        self.text_nodes.remove(&node);
-                        self.graph_layers.insert(
-                            node,
-                            RuntimeGraphLayer {
-                                hit_id: node,
-                                owner_object: self.current_graph_object,
-                                key: key.clone(),
-                                target_surface: None,
-                                x,
-                                y,
-                                width: region.width,
-                                height: region.height,
-                                src_x: region.x,
-                                src_y: region.y,
-                                opacity: 1.0,
-                                // sub_47C1E0 pops the native display priority
-                                // last, so it is the first reverse-pop value.
-                                z: values.first().copied().unwrap_or(NATIVE_DISPLAY_Z),
-                                enabled: true,
-                                transform_x: 0.0,
-                                transform_y: 0.0,
-                                transform_z: 0,
-                                scale_x: 1.0,
-                                scale_y: 1.0,
-                                rotation_degrees: 0.0,
-                                clip: None,
-                            },
-                        );
-                        if let Some(owner) = self.current_graph_object {
-                            self.graph_object_layers
-                                .entry(owner)
-                                .or_default()
-                                .insert(node);
-                        }
-                        trace_graph!(self,
-                            "configure image node #{node} bitmap=#{bitmap_id} key={key} pos=({x:.0},{y:.0}) src=({:.0},{:.0} {}x{}) values={values:?}",
-                            region.x,
-                            region.y,
-                            region.width,
-                            region.height
-                        );
-                    }
-                }
-                tracing::debug!(args = ?summarize_values(&args), "GraphNodeConfigure");
-            }
-            (0x90, 0x5c) => {
-                let mut args = Vec::new();
-                for _ in 0..17 {
-                    args.push(stack.pop());
-                }
-                let ints = args
-                    .iter()
-                    .map(|value| value.as_ref().map(value_to_i32).unwrap_or_default())
-                    .collect::<Vec<_>>();
-                if let Some(native) =
-                    NativeImageNodeArgs::from_popped(&ints).filter(|native| native.node_id > 0)
-                {
-                    let node_id = native.node_id;
-                    let resource_id = native.resource_id;
-                    if self.resolve_resource_key(resource_id).is_some() {
-                        if let Some((key, region)) = self
-                            .resource_image_region(resource_id)
-                            .map(|(key, region)| (key.to_string(), region))
-                        {
-                            let width = region.width;
-                            let height = region.height;
-                            let viewport_width = self.screen_width.max(1) as f32;
-                            let viewport_height = self.screen_height.max(1) as f32;
-                            let (x, y) = native.screen_position(
-                                width,
-                                height,
-                                viewport_width,
-                                viewport_height,
-                            );
-                            self.graph_layers.insert(
-                                node_id,
-                                RuntimeGraphLayer {
-                                    hit_id: node_id,
-                                    owner_object: self.current_graph_object,
-                                    key: key.clone(),
-                                    target_surface: None,
-                                    x,
-                                    y,
-                                    width,
-                                    height,
-                                    src_x: region.x,
-                                    src_y: region.y,
-                                    opacity: 1.0,
-                                    // Both 0x56 and 0x5C create nodes in the
-                                    // same native display chain. Opcode-local
-                                    // z bands let an older 0x5C background
-                                    // cover every later 0x56 child window.
-                                    z: NATIVE_DISPLAY_Z,
-                                    enabled: true,
-                                    transform_x: 0.0,
-                                    transform_y: 0.0,
-                                    transform_z: 0,
-                                    scale_x: 1.0,
-                                    scale_y: 1.0,
-                                    rotation_degrees: 0.0,
-                                    clip: None,
-                                },
-                            );
-                            if let Some(object) = self.current_graph_object {
-                                self.graph_object_layers
-                                    .entry(object)
-                                    .or_default()
-                                    .insert(node_id);
-                            }
-                            trace_graph!(self,
-                                    "node image #{node_id} res=#{resource_id} {key} x={x:.0} y={y:.0} origin=({:.1},{:.1},{:.1}) w={width:.0} h={height:.0}",
-                                    fixed_16_to_f32(native.origin_x),
-                                    fixed_16_to_f32(native.origin_y),
-                                    fixed_16_to_f32(native.origin_z)
-                                );
-                        }
-                    }
-                }
-                tracing::info!(?args, "GraphNodeConfigureImage");
-            }
-            (0x90, 0x5d) => {
-                let args = pop_args(stack, 12);
-                let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let duration = ints
-                    .iter()
-                    .copied()
-                    .filter(|value| (1..=10_000).contains(value))
-                    .max()
-                    .unwrap_or_default();
-                if duration > 0 {
-                    self.animation_queue_remaining = self
-                        .animation_queue_remaining
-                        .max(duration.unsigned_abs().div_ceil(16).max(1));
-                }
-                trace_graph!(
-                    self,
-                    "node transition pattern duration={duration} raw={ints:?}"
-                );
-                tracing::debug!(
-                    args = ?summarize_values(&args),
-                    duration,
-                    "GraphNodeTransitionPattern"
-                );
-            }
-            (0x90, 0x60) => {
-                let handle = self.alloc_object();
-                self.set_current_graph_object(handle);
-                tracing::info!(handle, "GraphCreateObject");
-                trace_graph!(self, "create object #{handle}");
-                return Ok(ethornell_vm::Value::Int(handle));
-            }
-            (0x90, 0x61) => {
-                let object = stack.pop();
-                tracing::info!(?object, "GraphObjectUpdate");
-            }
-            (0x90, 0x64) => {
-                let enabled = stack.pop();
-                let object = stack.pop();
-                let object_id = object.as_ref().map(value_to_i32).unwrap_or_default();
-                let enabled_value = enabled.as_ref().map(value_to_i32).unwrap_or_default() != 0;
-                if object_id > 0 {
-                    self.set_graph_object_enabled(object_id, enabled_value);
-                    if self.graph_surfaces.contains_key(&object_id) {
-                        if let Some(surface) = self.graph_surfaces.get_mut(&object_id) {
-                            surface.enabled = enabled_value;
-                        }
-                        trace_graph!(self, "surface/object #{object_id} enabled={enabled_value}");
-                    }
-                    if let Some(layer) = self.graph_layers.get_mut(&object_id) {
-                        layer.enabled =
-                            enabled_value && !is_default_hidden_object_state(&layer.key);
-                    }
-                }
-                tracing::info!(?object, ?enabled, "GraphObjectSetEnabled");
-            }
-            (0x90, 0x65) => {
-                let args = pop_args(stack, 4);
-                if let Some(object) = args.get(3).map(value_to_i32).filter(|object| *object > 0) {
-                    self.set_current_graph_object(object);
-                    trace_graph!(
-                        self,
-                        "object #{object} configure args={:?}",
-                        args.iter().map(value_to_i32).collect::<Vec<_>>()
-                    );
-                }
-                tracing::info!(args = ?summarize_values(&args), "GraphObjectConfigure");
-            }
-            (0x90, 0x66) => {
-                let args = pop_args(stack, 7);
-                self.apply_graph_object_effect(&args);
-                tracing::debug!(
-                    args = ?summarize_values(&args),
-                    "GraphObjectApplyEffect"
-                );
+                tracing::info!(mode, layout = ?self.graph_raster_layout, "GraphSetRasterFormatMode");
             }
             (0x90, 0x80) => {
-                let height = stack.pop();
-                let width = stack.pop();
-                let handle = self.alloc_surface();
-                let width_value = width.as_ref().map(value_to_i32).unwrap_or_default().max(1);
-                let height_value = height.as_ref().map(value_to_i32).unwrap_or_default().max(1);
-                self.graph_surfaces.insert(
+                let height = pop_int_value(stack).unwrap_or_default();
+                let width = pop_int_value(stack).unwrap_or_default();
+                // Target dimensions below 32 are promoted to 32-pixel units.
+                let native_width = if width < 32 {
+                    width.saturating_mul(32)
+                } else {
+                    width
+                };
+                let native_height = if height < 32 {
+                    height.saturating_mul(32)
+                } else {
+                    height
+                };
+                let valid =
+                    (1..=1920).contains(&native_width) && (1..=32768).contains(&native_height);
+                let handle = valid
+                    .then(|| self.alloc_window_surface(native_width, native_height))
+                    .flatten()
+                    .unwrap_or_default();
+                tracing::info!(
                     handle,
-                    RuntimeSurface::display(handle, width_value as f32, height_value as f32),
+                    width,
+                    height,
+                    native_width,
+                    native_height,
+                    "GraphCreateWindowObject"
                 );
-                tracing::info!(handle, ?width, ?height, "GraphCreateSurface");
                 trace_graph!(
                     self,
-                    "create surface #{handle} width={width_value} height={height_value}"
+                    "create window #{handle} source={}x{} native={}x{} valid={valid}",
+                    width,
+                    height,
+                    native_width,
+                    native_height
                 );
                 return Ok(ethornell_vm::Value::Int(handle));
             }
             (0x90, 0x81) => {
-                let target = stack.pop();
-                tracing::debug!(?target, "GraphSurfaceFlush");
-            }
-            (0x90, 0x83) => {
-                let surface = stack.pop();
-                let buffer = stack.pop();
-                let surface_id = surface.as_ref().map(value_to_i32).unwrap_or_default();
-                let buffer_id = buffer.as_ref().map(value_to_i32).unwrap_or_default();
-                let trace = if let Some(record) = self.graph_surfaces.get_mut(&surface_id) {
-                    if self.graph_resources.contains_key(&buffer_id) {
-                        record.resource_id = Some(buffer_id);
-                    }
-                    Some(format!(
-                        "surface #{} bind buffer=#{buffer_id} resource={:?}",
-                        record.id, record.resource_id
-                    ))
-                } else {
-                    None
-                };
-                if let Some(trace) = trace {
-                    self.trace_graph(trace);
-                }
-                tracing::info!(?buffer, ?surface, "GraphSurfaceBindBuffer");
+                let window = pop_int_value(stack).unwrap_or_default();
+                let removed =
+                    Self::is_window_surface_handle(window) && self.remove_graph_surface(window);
+                tracing::debug!(window, removed, "GraphReleaseWindowObject");
+                trace_graph!(self, "release window #{window} removed={removed}");
             }
             (0x90, 0x84) => {
-                let enabled = stack.pop();
-                let surface = stack.pop();
-                let surface_id = surface.as_ref().map(value_to_i32).unwrap_or_default();
-                let enabled_value = enabled.as_ref().map(value_to_i32).unwrap_or_default() != 0;
-                if let Some(record) = self.graph_surfaces.get_mut(&surface_id) {
-                    record.enabled = enabled_value;
-                    trace_graph!(self, "surface #{surface_id} enabled={enabled_value}");
+                let enabled = pop_int_value(stack).unwrap_or_default() != 0;
+                let window = pop_int_value(stack).unwrap_or_default();
+                let updated = Self::is_window_surface_handle(window)
+                    && self.graph_surfaces.get_mut(&window).is_some_and(|record| {
+                        record.enabled = enabled;
+                        true
+                    });
+                if updated {
+                    trace_graph!(self, "window #{window} draw-enabled={enabled}");
                 }
-                tracing::info!(?surface, ?enabled, "GraphSurfaceSetEnabled");
+                tracing::info!(window, enabled, updated, "GraphSetWindowDrawEnabled");
             }
             (0x90, 0x85) => {
+                // Pop order: priority, reserved, transparency, blend, y, x, window.
                 let args = pop_args(stack, 7);
-                if args.len() >= 7 {
-                    let surface_id = value_to_i32(&args[6]);
+                if args.len() == 7 {
                     let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                    let trace = self.graph_surfaces.get_mut(&surface_id).map(|surface| {
-                        surface.z = values[0];
-                        format!("surface #{} region args={:?}", surface.id, values)
-                    });
-                    if let Some(trace) = trace {
-                        self.trace_graph(trace);
-                    }
-                }
-                tracing::info!(?args, "GraphSurfaceSetRegion");
-            }
-            (0x90, 0x86) => {
-                let args = pop_args(stack, 4);
-                if args.len() >= 4 {
-                    let surface_id = value_to_i32(&args[3]);
-                    let resource_id = value_to_i32(&args[0]);
-                    let trace = if let Some(surface) = self.graph_surfaces.get_mut(&surface_id) {
-                        if resource_id > 0 {
-                            surface.resource_id = Some(resource_id);
+                    let window = values[6];
+                    let priority = values[0];
+                    let reserved = values[1];
+                    let transparency = values[2];
+                    let blend_mode = values[3];
+                    let y = values[4];
+                    let x = values[5];
+                    let valid = Self::is_window_surface_handle(window)
+                        && (0..0x1_0000).contains(&priority)
+                        && (0..=256).contains(&reserved)
+                        && (0..=256).contains(&transparency);
+                    if valid {
+                        if let Some(surface) = self.graph_surfaces.get_mut(&window) {
+                            surface.x = x as f32;
+                            surface.y = y as f32;
+                            surface.blend_mode = blend_mode;
+                            surface.z = priority;
                         }
-                        Some(format!(
-                            "surface #{} configure resource={:?} args={:?}",
-                            surface.id,
-                            surface.resource_id,
-                            args.iter().map(value_to_i32).collect::<Vec<_>>()
-                        ))
-                    } else {
-                        None
-                    };
-                    if let Some(trace) = trace {
-                        self.trace_graph(trace);
+                        self.graph90_set_common_state(
+                            window,
+                            Some((x, y)),
+                            Some(blend_mode),
+                            Some(transparency),
+                            Some(priority),
+                        );
+                        trace_graph!(self, "window #{window} pos=({x},{y}) blend={blend_mode} transparency={transparency} reserved={reserved} priority={priority}");
                     }
+                    tracing::info!(
+                        window,
+                        x,
+                        y,
+                        blend_mode,
+                        transparency,
+                        reserved,
+                        priority,
+                        valid,
+                        "GraphConfigureWindowObject"
+                    );
                 }
-                tracing::info!(?args, "GraphSurfaceConfigure");
             }
             (0x90, 0x87) => {
-                let value = stack.pop();
-                let surface = stack.pop();
-                tracing::info!(?surface, ?value, "GraphSurfaceSetOption");
+                let value = pop_int_value(stack).unwrap_or_default();
+                let window = pop_int_value(stack).unwrap_or_default();
+                let updated = Self::is_window_surface_handle(window)
+                    && self.graph_surfaces.get_mut(&window).is_some_and(|record| {
+                        record.isolated_group = value != 0;
+                        true
+                    });
+                tracing::info!(window, value, updated, "GraphSetWindowIsolatedComposition");
+                trace_graph!(
+                    self,
+                    "window #{window} isolated-composition={} updated={updated}",
+                    value != 0
+                );
             }
             (0x90, 0x88) => {
+                // BP order [window, x, y, width, height]; pop order is reversed.
                 let args = pop_args(stack, 5);
-                if args.len() >= 5 {
-                    let surface_id = value_to_i32(&args[4]);
-                    let height = value_to_i32(&args[0]).max(1) as f32;
-                    let width = value_to_i32(&args[1]).max(1) as f32;
-                    let x = value_to_i32(&args[2]) as f32;
-                    let y = value_to_i32(&args[3]) as f32;
-                    let trace = if let Some(surface) = self.graph_surfaces.get_mut(&surface_id) {
-                        surface.viewport_x = x;
-                        surface.viewport_y = y;
-                        surface.viewport_width = width;
-                        surface.viewport_height = height;
-                        Some(format!(
-                            "surface #{} viewport src=({}, {}) size={}x{} display=({}, {}) backing={}x{}",
-                            surface.id,
-                            surface.viewport_x,
-                            surface.viewport_y,
-                            surface.viewport_width,
-                            surface.viewport_height,
-                            surface.x,
-                            surface.y,
-                            surface.width,
-                            surface.height
-                        ))
-                    } else {
-                        None
-                    };
-                    if let Some(trace) = trace {
-                        self.trace_graph(trace);
+                if args.len() == 5 {
+                    let height = value_to_i32(&args[0]);
+                    let width = value_to_i32(&args[1]);
+                    let y = value_to_i32(&args[2]);
+                    let x = value_to_i32(&args[3]);
+                    let window = value_to_i32(&args[4]);
+                    let valid = Self::is_window_surface_handle(window)
+                        && width > 0
+                        && height > 0
+                        && x >= 0
+                        && y >= 0
+                        && self.graph_surfaces.get(&window).is_some_and(|surface| {
+                            x.saturating_add(width) <= surface.width as i32
+                                && y.saturating_add(height) <= surface.height as i32
+                        });
+                    if valid {
+                        if let Some(surface) = self.graph_surfaces.get_mut(&window) {
+                            surface.viewport_x = x as f32;
+                            surface.viewport_y = y as f32;
+                            surface.viewport_width = width as f32;
+                            surface.viewport_height = height as f32;
+                        }
+                        trace_graph!(
+                            self,
+                            "window #{window} valid-region=({x},{y}) {width}x{height}"
+                        );
                     }
+                    tracing::info!(
+                        window,
+                        x,
+                        y,
+                        width,
+                        height,
+                        valid,
+                        "GraphSetWindowValidRegion"
+                    );
                 }
-                tracing::info!(?args, "GraphSurfaceSetViewport");
             }
             (0x90, 0x89) => {
+                // BP order [out_rect_ptr, window]. Direct host calls return
+                // the target success polarity; the VM dispatch bridge performs
+                // the four-DWORD BP pointer write for script execution.
                 let args = pop_args(stack, 2);
-                let target = args.first().map(value_to_i32).unwrap_or_default();
-                let missing = !self.graph_handle_exists(target);
-                tracing::debug!(args = ?summarize_values(&args), missing, "GraphObjectTextLookup");
-                return Ok(ethornell_vm::Value::Int(i32::from(missing)));
+                let window = args.first().map(value_to_i32).unwrap_or_default();
+                let out_rect_ptr = args.get(1).map(value_to_i32).unwrap_or_default();
+                let region = self.graph_surfaces.get(&window).map(|surface| {
+                    [
+                        surface.viewport_x as i32,
+                        surface.viewport_y as i32,
+                        surface.viewport_x as i32 + surface.viewport_width as i32 - 1,
+                        surface.viewport_y as i32 + surface.viewport_height as i32 - 1,
+                    ]
+                });
+                tracing::debug!(window, out_rect_ptr, ?region, "GraphGetWindowValidRegion");
+                return Ok(ethornell_vm::Value::Int(i32::from(region.is_some())));
             }
             (0x90, 0x90) => {
                 let args = pop_args(stack, 6);
@@ -6028,13 +16026,29 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     _ => None,
                 });
                 match text.as_deref() {
-                    Some("\u{c}") | Some("\\c") => {
-                        self.frame_yield_requested = true;
-                        self.trace_graph("text draw control \\c");
-                    }
-                    Some(text) if !text.is_empty() => {
-                        self.render_graph_text(&args);
-                        trace_graph!(self, "text draw control text={text:?}");
+                    Some(text) => {
+                        // sub_47DFA0 has no wrapper-level special case for
+                        // form-feed or "\c" strings. Those bytes belong to
+                        // the target message parser and the call still installs
+                        // CProcDspMsg.
+                        let target = args.get(5).map(value_to_i32).unwrap_or_default();
+                        self.native_message_surface_target = Some(target);
+                        self.start_native_message(text.to_string(), Some(target));
+                        let mut config = self.native_message_procedure_config(
+                            ethornell_vm::NativeMessageProcedureClass::DspMsg,
+                            target,
+                        );
+                        // sub_47DFA0 -> sub_4911E0 exact wrapper mapping:
+                        // pop3 -> +0x30, pop2 -> +0x38, pop1 -> +0x3c;
+                        // +0x40 is the wrapper's constant one.
+                        config.allow_high_bit_input =
+                            args.first().map(value_to_i32).unwrap_or_default() != 0;
+                        config.end_wait_policy = args.get(1).map(value_to_i32).unwrap_or_default();
+                        config.completion_control =
+                            args.get(2).map(value_to_i32).unwrap_or_default();
+                        config.allow_auxiliary_input = true;
+                        call.start_message_procedure(config);
+                        trace_graph!(self, "native message text={text:?}");
                     }
                     _ => {
                         trace_graph!(
@@ -6044,26 +16058,11 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         );
                     }
                 }
-                self.pending_graph_procedure_schedule =
-                    Some(ethornell_vm::GraphProcedureSchedule {
-                        duration_ms: 1,
-                        input_enabled: false,
-                        input_descriptor: 0,
-                        wait_for_input: false,
-                        completion: ethornell_vm::GraphProcedureCompletion::None,
-                    });
                 tracing::debug!(
                     args = ?summarize_values(&args),
                     ?text,
-                    "GraphTextDrawControl"
+                    "GraphStartWindowMessageProcedure"
                 );
-                if text.as_deref().is_some_and(|text| !text.is_empty()) {
-                    tracing::info!(?text, args = ?summarize_values(&args), "GraphTextDrawControlText");
-                }
-            }
-            (0x90, 0x0d) => {
-                let value = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(value, "GraphSetFlag");
             }
             (0x90, 0x10) => {
                 let name = stack.pop();
@@ -6076,7 +16075,9 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     .and_then(value_to_string)
                     .unwrap_or_default();
                 let resource_name = name.as_ref().and_then(value_to_string).unwrap_or_default();
-                if self.load_graph_image_resource(target_id, &archive_name, &resource_name)
+                let loaded =
+                    self.load_graph_image_resource(target_id, &archive_name, &resource_name);
+                if loaded
                     && archive_name.eq_ignore_ascii_case("sysgrp.arc")
                     && resource_name.starts_with("SGTitle")
                 {
@@ -6088,6 +16089,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         self.title_ui_active = true;
                     }
                 }
+                call.complete_procedure(
+                    ethornell_vm::native_call::NativeProcedureClass::LoadBitmap,
+                    if loaded { 0 } else { 1 },
+                );
             }
             (0x90, 0x11) => {
                 let format = stack.pop();
@@ -6099,21 +16104,17 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let height = height_arg.as_ref().map(value_to_i32).unwrap_or_default();
                 let format_id = format.as_ref().map(value_to_i32).unwrap_or_default();
                 if bitmap_id > 0 && width > 0 && height > 0 {
-                    let previous_resource = self
-                        .graph_surfaces
-                        .get(&bitmap_id)
-                        .and_then(|surface| surface.resource_id);
-                    let mut surface =
-                        RuntimeSurface::bitmap(bitmap_id, width as f32, height as f32);
-                    surface.resource_id = previous_resource;
-                    self.graph_surfaces.insert(bitmap_id, surface);
-                    self.bitmap_dimensions
-                        .insert(bitmap_id, (width as u32, height as u32));
-                    if format_id == 6 {
-                        self.effects
-                            .create_vector_map(bitmap_id, width as u32, height as u32);
-                    } else {
-                        self.effects.remove_bitmap(bitmap_id);
+                    self.recreate_native_bitmap(bitmap_id, width as u32, height as u32, format_id);
+                    match format_id {
+                        4 => self.effects.create_displacement_map(
+                            bitmap_id,
+                            width as u32,
+                            height as u32,
+                        ),
+                        6 => self
+                            .effects
+                            .create_vector_map(bitmap_id, width as u32, height as u32),
+                        _ => self.effects.remove_bitmap(bitmap_id),
                     }
                     trace_graph!(
                         self,
@@ -6128,12 +16129,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0x12) => {
                 let bitmap_id = pop_int_value(stack).unwrap_or_default();
+                self.clear_bitmap_text(bitmap_id);
                 self.remove_surface_control_layers(bitmap_id);
                 self.surface_text_states.remove(&bitmap_id);
                 self.surface_text_buffers.remove(&bitmap_id);
                 self.detach_graph_surface_relations(bitmap_id);
                 self.effects.remove_bitmap(bitmap_id);
                 self.bitmap_dimensions.remove(&bitmap_id);
+                self.bitmap_formats.remove(&bitmap_id);
                 let existed = self.graph_surfaces.remove(&bitmap_id).is_some()
                     | self.graph_resources.remove(&bitmap_id).is_some();
                 tracing::debug!(bitmap_id, existed, "GraphReleaseBitmap");
@@ -6142,6 +16145,28 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             (0x90, 0x13) => {
                 let color = pop_int_value(stack).unwrap_or_default();
                 let bitmap_id = pop_int_value(stack).unwrap_or_default();
+                self.clear_bitmap_text(bitmap_id);
+                if let Some(&(width, height)) = self.bitmap_dimensions.get(&bitmap_id) {
+                    let pixel = native_bitmap_clear_color(color);
+                    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+                    for _ in 0..width as usize * height as usize {
+                        rgba.extend_from_slice(&pixel);
+                    }
+                    let key = format!("runtime:bitmap:{bitmap_id}");
+                    self.store_graph_image(
+                        key.clone(),
+                        DecodedImage {
+                            width,
+                            height,
+                            rgba,
+                        },
+                    );
+                    self.graph_resources
+                        .insert(bitmap_id, RuntimeGraphResource::whole(key));
+                    if let Some(surface) = self.graph_surfaces.get_mut(&bitmap_id) {
+                        surface.resource_id = Some(bitmap_id);
+                    }
+                }
                 if color == 0 {
                     self.effects.clear_vector_map(bitmap_id);
                 }
@@ -6161,16 +16186,21 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0x17) => {
                 let args = pop_args(stack, 2);
-                let valid = args.iter().any(|value| match value {
-                    ethornell_vm::Value::Int(value) => *value > 0,
-                    ethornell_vm::Value::Ptr(value) => *value != 0,
-                    ethornell_vm::Value::Str(value) => !value.is_empty(),
-                    ethornell_vm::Value::Func { .. }
-                    | ethornell_vm::Value::Program(_)
-                    | ethornell_vm::Value::None => false,
-                });
-                tracing::debug!(args = ?summarize_values(&args), valid, "GraphValidateBitmap");
-                return Ok(ethornell_vm::Value::Int(i32::from(valid)));
+                let expected_format = args.first().map(value_to_i32).unwrap_or_default();
+                let bitmap = args.get(1).map(value_to_i32).unwrap_or_default();
+                let status = match self.bitmap_formats.get(&bitmap).copied() {
+                    None => 1,
+                    Some(format) if format == expected_format => 0,
+                    // sub_4081B0 is the one conversion accepted by the native
+                    // validator: format 2 may be reduced to format 1 in place.
+                    Some(2) if expected_format == 1 => {
+                        self.bitmap_formats.insert(bitmap, 1);
+                        0
+                    }
+                    Some(_) => 2,
+                };
+                tracing::debug!(bitmap, expected_format, status, "GraphValidateBitmap");
+                return Ok(ethornell_vm::Value::Int(status));
             }
             (0x90, 0x18) => {
                 let args = pop_args(stack, 6);
@@ -6180,147 +16210,154 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let source = values[2];
                     let x = values[4];
                     let y = values[3];
-                    let alpha = values[1];
-                    let mode = values[0];
+                    // sub_479C70 pops source-order `(destination, x, y,
+                    // source, mode, parameter)` and forwards the final pair
+                    // unchanged to sub_402720. Testcase ordinary alpha and
+                    // raw-copy paths use `(1, 0)` and `(128, 0)`.
+                    let mode = values[1];
+                    let parameter = values[0];
+                    let status = self.validate_native_bitmap_blit(destination, source);
+                    if status != 0 {
+                        return Err(ethornell_vm::VmError::Runtime(match status {
+                            1 => format!("Graph90:18 destination bitmap {destination} is missing"),
+                            2 => format!("Graph90:18 source bitmap {source} is missing"),
+                            3 => format!(
+                                "Graph90:18 bitmap formats are incompatible: destination={destination} source={source}"
+                            ),
+                            _ => unreachable!("validated native bitmap status"),
+                        }));
+                    }
+                    let source_key = self.resolve_resource_key(source).map(str::to_owned);
+                    let source_format = self.bitmap_formats.get(&source).copied();
+                    let destination_format = self.bitmap_formats.get(&destination).copied();
                     let copied_vector = self.effects.copy_vector_map(destination, source, x, y);
+                    self.composite_bitmap_text(destination, source, x, y, mode);
                     if let Some(key) =
-                        self.composite_graph_bitmap(destination, source, x, y, mode, alpha)
+                        self.composite_graph_bitmap(destination, source, x, y, mode, parameter)
                     {
+                        tracing::info!(
+                            destination,
+                            source,
+                            x,
+                            y,
+                            mode,
+                            parameter,
+                            source_key = ?source_key,
+                            source_format = ?source_format,
+                            destination_format = ?destination_format,
+                            output_key = %key,
+                            "GraphCompositeBitmap"
+                        );
                         trace_graph!(self,
-                            "bitmap apply source=#{source} destination=#{destination} key={key} x={x} y={y} alpha={alpha} mode={mode} values={values:?}"
+                            "bitmap apply source=#{source} source_key={source_key:?} source_format={source_format:?} destination=#{destination} destination_format={destination_format:?} key={key} x={x} y={y} mode={mode} parameter={parameter} values={values:?}"
                         );
                     } else if copied_vector {
                         trace_graph!(self,
-                            "vector-map apply source=#{source} destination=#{destination} x={x} y={y} alpha={alpha} mode={mode}"
+                            "vector-map apply source=#{source} destination=#{destination} x={x} y={y} mode={mode} parameter={parameter}"
                         );
                     }
                 }
                 tracing::debug!(args = ?summarize_values(&args), "GraphObjectApply");
             }
             (0x90, 0x20) => {
+                // Target sub_47A6A0 pop order is:
+                // input_descriptor, input_enabled, frame_rate,
+                // duration_ms, target_transparency, object.  The previous port
+                // used frame_rate as duration and ignored the explicit
+                // object, accidentally animating `current_graph_object`.
                 let args = pop_args(stack, 6);
-                let ints: Vec<i32> = args.iter().map(value_to_i32).collect();
-                if ints.len() >= 5 {
-                    let duration_ms = ints[2].unsigned_abs();
-                    let duration_frames = duration_ms.div_ceil(16).max(1);
-                    if duration_ms > 0 {
-                        self.animation_queue_remaining =
-                            self.animation_queue_remaining.max(duration_frames);
-                    }
-                    let target = ints[4];
-                    let alpha = (target as f32 / 256.0).clamp(0.0, 1.0);
-                    if let Some(object) = self.current_graph_object {
-                        if alpha > 0.0 {
-                            self.adopt_previous_graph_object_layers(object);
-                        }
-                        if let Some(layer_ids) = self.graph_object_layers.get(&object).cloned() {
-                            let layer_count = layer_ids.len();
-                            for layer_id in layer_ids {
-                                if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                                    let from = layer.opacity;
-                                    if duration_frames > 1 && (from - alpha).abs() > f32::EPSILON {
-                                        self.layer_animations.fade_to(
-                                            layer_id,
-                                            from,
-                                            alpha,
-                                            duration_frames,
-                                        );
-                                    } else {
-                                        layer.opacity = alpha;
-                                    }
-                                }
-                            }
-                            trace_graph!(self,
-                                "object #{object} transition alpha={alpha:.2} duration_ms={duration_ms} frames={duration_frames} layers={layer_count}"
-                            );
-                        }
-                    }
-                }
-                tracing::info!(?args, "GraphObjectTransition");
+                let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
+                let [input_descriptor, input_enabled, frame_rate, duration_ms, target_transparency, object] =
+                    ints.as_slice()
+                else {
+                    return Err(ethornell_vm::VmError::Runtime(
+                        "Graph90:20 expected six arguments".to_string(),
+                    ));
+                };
+                let control_id = self.schedule_native_cdspobj_control(
+                    *object,
+                    None,
+                    0,
+                    *target_transparency,
+                    0,
+                    None,
+                    *duration_ms,
+                    *frame_rate,
+                    0,
+                    *input_enabled != 0,
+                    *input_descriptor,
+                    "Graph90:20",
+                )?;
+                call.start_graph_control_procedure(*object, control_id);
+                tracing::info!(args = ?summarize_values(&args), "GraphObjectTransition");
             }
+
+
             (0x90, 0x1f) => {
                 let args = pop_args(stack, 6);
                 tracing::debug!(args = ?summarize_values(&args), "GraphConfigureBitmapRegion");
                 let ints: Vec<i32> = args.iter().map(value_to_i32).collect();
                 if let [height, width, y, x, source, destination] = ints.as_slice() {
-                    if *width <= 0 || *height <= 0 {
-                        tracing::warn!(
-                            source,
-                            destination,
-                            width,
-                            height,
-                            values = ?ints,
-                            "native bitmap region has invalid dimensions"
-                        );
-                    } else if let Some(resource) = self.resolve_graph_resource(*source).cloned() {
-                        let region = resource.subregion(*x, *y, *width, *height);
-                        let key = region.key.clone();
-                        self.graph_resources.insert(*destination, region);
-                        trace_graph!(self,
-                            "bitmap region destination=#{destination} source=#{source} {key} src=({x},{y} {width}x{height})"
-                        );
-                    } else if let Some(source_image) = self.graph_bitmap_image(*source) {
-                        let image = crop_decoded_image(
-                            &source_image,
-                            RuntimeClipRect {
-                                x: *x as f32,
-                                y: *y as f32,
-                                width: *width as f32,
-                                height: *height as f32,
-                            },
-                        );
-                        let key = format!("runtime:bitmap-region:{destination}");
-                        self.store_graph_image(key.clone(), image);
-                        self.graph_resources
-                            .insert(*destination, RuntimeGraphResource::whole(key));
-                        self.bitmap_dimensions
-                            .insert(*destination, (*width as u32, *height as u32));
-                    } else {
-                        trace_graph!(self,
-                            "bitmap region skipped missing source=#{source} destination=#{destination} src=({x},{y} {width}x{height})"
-                        );
+                    let status = self.create_native_bitmap_region(
+                        *destination,
+                        *source,
+                        *x,
+                        *y,
+                        *width,
+                        *height,
+                    );
+                    if status != 0 {
+                        return Err(ethornell_vm::VmError::Runtime(match status {
+                            1 => format!(
+                                "Graph90:1F failed to allocate destination bitmap {destination}"
+                            ),
+                            2 => format!("Graph90:1F source bitmap {source} is missing"),
+                            3 => format!(
+                                "Graph90:1F bitmap region has zero dimensions: {width}x{height}"
+                            ),
+                            _ => unreachable!("native bitmap-region status"),
+                        }));
                     }
+                    trace_graph!(self,
+                        "bitmap region destination=#{destination} source=#{source} src=({x},{y} {width}x{height}) detached=true"
+                    );
                 }
-            }
-            (0x90, 0x32) => {
-                let value = stack.pop();
-                let object = stack.pop();
-                let object_id = object.as_ref().map(value_to_i32).unwrap_or_default();
-                let alpha_parameter = value.as_ref().map(value_to_i32).unwrap_or_default();
-                if object_id > 0 {
-                    if let Some(transition) = self.graph_transition_nodes.get_mut(&object_id) {
-                        transition.alpha_parameter = alpha_parameter.clamp(0, 256);
-                        let key = self.update_transition_node_image(object_id);
-                        trace_graph!(
-                            self,
-                            "transition node #{object_id} alpha={} key={key:?}",
-                            alpha_parameter.clamp(0, 256)
-                        );
-                    } else {
-                        self.graph_object_properties
-                            .entry(object_id)
-                            .or_default()
-                            .set_property(2, alpha_parameter.clamp(0, 256), 0);
-                    }
-                }
-                tracing::debug!(?object, ?value, "GraphObjectCommit");
             }
             (0x90, 0x30) => {
-                let enabled = stack.pop();
-                let timeline = stack.pop();
-                let handle = timeline.as_ref().map(value_to_i32).unwrap_or_default();
-                let enabled_value = enabled.as_ref().map(value_to_i32).unwrap_or_default() != 0;
-                let event = self.timelines.set_enabled(handle, enabled_value);
-                tracing::info!(?timeline, ?enabled, ?event, "GraphTimelineSetEnabled");
-                self.trace_timeline_event(event);
+                // Target sub_47B0E0 pops draw-enabled first and object second,
+                // then reaches the CDspObj virtual setter at vtable+4. This is
+                // not the portable timeline subsystem used by later selectors.
+                let draw_enabled = pop_int_value(stack).unwrap_or_default() != 0;
+                let object = pop_int_value(stack).unwrap_or_default();
+                self.set_graph_object_draw_enabled(object, draw_enabled);
+                tracing::info!(object, draw_enabled, "GraphSetObjectDrawEnabled");
+            }
+            (0x90, 0x91) => {
+                // sub_47E010 -> sub_463250 -> sub_432D80.
+                // Native pop order is scope value first, then mode.
+                let scope_value = pop_int_value(stack).unwrap_or_default();
+                let mode = pop_int_value(stack).unwrap_or_default();
+                let accepted = self
+                    .graph_defaults
+                    .configure_message_input_scope(mode, scope_value);
+                tracing::info!(mode, scope_value, accepted, "GraphSetMessageInputScope");
+            }
+            (0x90, 0x92) => {
+                let enabled = pop_int_value(stack).unwrap_or_default();
+                self.graph_defaults.message_input_filter_enabled = enabled != 0;
+                tracing::info!(enabled, "GraphSetMessageInputFilter");
             }
             (0x90, 0x94) => {
+                // Graph90:0x94(delay_ms): typewriter glyph cadence.
                 let delay_ms = pop_int_value(stack).unwrap_or_default();
                 self.graph_defaults.text_animation.set_glyph_delay(delay_ms);
                 self.text_runtime.set_glyph_delay_ms(delay_ms);
                 tracing::info!(delay_ms, "GraphSetGlyphRevealDelay");
             }
             (0x90, 0x96) => {
+                // Graph90:0x96(steps, step_delay_ms): settle animation.
+                // BP arguments are pushed in declaration order and popped in
+                // reverse order by the native calling convention.
                 let step_delay_ms = pop_int_value(stack).unwrap_or_default();
                 let steps = pop_int_value(stack).unwrap_or_default();
                 self.graph_defaults
@@ -6329,6 +16366,9 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::info!(steps, step_delay_ms, "GraphSetTextSettleAnimation");
             }
             (0x90, 0x97) => {
+                // Graph90:0x97(enabled, delay_ms): text auto advance.
+                // This is separate from skip mode and from input-interrupted
+                // waits. A disabled call must leave no automatic advance path.
                 let delay_ms = pop_int_value(stack).unwrap_or_default();
                 let enabled = pop_int_value(stack).unwrap_or_default();
                 self.graph_defaults
@@ -6342,6 +16382,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::info!(enabled = value != 0, "GraphSetTextShadowEnabled");
             }
             (0x90, 0x9b) => {
+                // Graph90:0x9B(enabled, delay_ms): message start delay.
                 let delay_ms = pop_int_value(stack).unwrap_or_default();
                 let enabled = pop_int_value(stack).unwrap_or_default();
                 self.graph_defaults
@@ -6349,6 +16390,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::info!(enabled, delay_ms, "GraphSetMessageStartDelay");
             }
             (0x90, 0x95) => {
+                // Graph90:0x95(steps, step_delay_ms): glyph reveal animation.
                 let step_delay_ms = pop_int_value(stack).unwrap_or_default();
                 let steps = pop_int_value(stack).unwrap_or_default();
                 self.graph_defaults
@@ -6358,160 +16400,303 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0x9f) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                self.graph_defaults.instant_reveal = value != 0;
-                tracing::info!(enabled = value != 0, "GraphSetInstantTextReveal");
+                self.graph_defaults.message_input_forces_completion = value != 0;
+                tracing::info!(enabled = value != 0, "GraphSetMessageInputForcesCompletion");
+            }
+            (0x90, 0xa0) | (0x90, 0xa2) | (0x90, 0xa3) => {
+                let count = if id == 0xa0 { 8 } else { 14 };
+                let args = pop_args(stack, count);
+                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
+                let item_count = values.get(count - 2).copied().unwrap_or_default();
+                let column_count = values.get(count - 4).copied().unwrap_or_default();
+                let initial_selection = values.get(count - 7).copied().unwrap_or_default();
+                let valid = (1..=16).contains(&item_count)
+                    && (1..=16).contains(&column_count)
+                    && (0..item_count).contains(&initial_selection);
+                tracing::info!(
+                    selector = format_args!("0x{id:02X}"),
+                    item_count,
+                    column_count,
+                    initial_selection,
+                    valid,
+                    "start target item-selection procedure"
+                );
+            }
+            (0x90, 0xa1) => {
+                let args = pop_args(stack, 6);
+                tracing::debug!(args = ?summarize_values(&args), "GraphDrawItemSelectionGrid");
+            }
+            (0x90, 0xa4) => {
+                let style_b = pop_int_value(stack).unwrap_or_default();
+                let style_a = pop_int_value(stack).unwrap_or_default();
+                self.graph_item_selection_highlight_styles = [style_a, style_b];
+                tracing::info!(style_a, style_b, "GraphSetItemSelectionHighlightStyles");
+            }
+            (0x90, 0xa5) => {
+                let input_mask = pop_int_value(stack).unwrap_or_default();
+                self.graph_item_selection_input_mask = input_mask;
+                tracing::info!(
+                    input_mask = format_args!("0x{input_mask:08X}"),
+                    "GraphSetItemSelectionInputMask"
+                );
+            }
+            (0x90, 0xa6) => {
+                let arg3 = pop_int_value(stack).unwrap_or_default();
+                let arg2 = pop_int_value(stack).unwrap_or_default();
+                let arg1 = pop_int_value(stack).unwrap_or_default();
+                let alternate_key_mode = pop_int_value(stack).unwrap_or_default();
+                self.graph_item_selection_navigation = [alternate_key_mode, arg1, arg2, arg3];
+                tracing::info!(
+                    alternate_key_mode,
+                    arg1,
+                    arg2,
+                    arg3,
+                    "GraphSetItemSelectionNavigationParameters"
+                );
             }
             (0x90, 0xaf) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                self.input_requires_focus = value != 0;
-                tracing::info!(
-                    requires_focus = self.input_requires_focus,
-                    "GraphSetForegroundInputGuard"
-                );
+                self.graph_interactive_procedure_poll_gate = value;
+                tracing::info!(value, "GraphSetInteractiveProcedurePollGate");
             }
-            (0x90, 0xb6) => {
-                let args = pop_args(stack, 2);
-                let descriptor = args.first().map(value_to_i32).unwrap_or_default();
-                let object = args.get(1).map(value_to_i32).unwrap_or_default();
-                if object != 0 {
-                    self.graph_object_input_tables.insert(object, descriptor);
-                }
-                tracing::debug!(object, descriptor, "GraphObjectBindInputTable");
-                trace_graph!(self, "object #{object} bind input table 0x{descriptor:08X}");
+            (0x90, 0xb0) | (0x90, 0xb1) => {
+                let args = pop_args(stack, 7);
+                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
+                let icon_count = values.get(5).copied().unwrap_or_default();
+                let input_mode = values.get(2).copied().unwrap_or_default();
+                tracing::info!(
+                    selector = format_args!("0x{id:02X}"),
+                    icon_count,
+                    input_mode,
+                    valid = (1..=64).contains(&icon_count) && (0..=3).contains(&input_mode),
+                    "start target icon-selection procedure"
+                );
             }
             (0x90, 0xb8) => {
                 let layer = pop_int_value(stack).unwrap_or_default();
                 let object = self.alloc_object();
                 self.graph_input_objects
                     .insert(object, RuntimeGraphInputObject::new(layer));
-                tracing::debug!(layer, object, "GraphObjectBeginInput");
+                tracing::debug!(layer, object, "GraphCreateIconInputProcessor");
                 trace_graph!(
                     self,
                     "create input object #{object} for graph object #{layer}"
                 );
                 return Ok(ethornell_vm::Value::Int(object));
             }
-            (0x90, 0xb7) => {
-                let state = stack.pop();
-                let surface = stack.pop();
-                tracing::info!(?surface, ?state, "GraphConfigureSurfaceControls");
-                return Ok(ethornell_vm::Value::Int(0));
-            }
             (0x90, 0xb9) => {
                 let object = stack.pop();
                 let object_id = object.as_ref().map(value_to_i32).unwrap_or_default();
-                let removed = self.graph_input_objects.remove(&object_id).is_some();
-                tracing::info!(?object, "GraphObjectFinalize");
-                return Ok(ethornell_vm::Value::Int(i32::from(removed)));
-            }
-            (0x90, 0xba) => {
-                let args = pop_args(stack, 2);
-                let descriptor = args.first().map(value_to_i32).unwrap_or_default();
-                let object = args.get(1).map(value_to_i32).unwrap_or_default();
-                if object > 0 {
-                    self.graph_object_input_tables.insert(object, descriptor);
+                let removed = self.graph_input_objects.remove(&object_id);
+                if let Some(input) = removed.as_ref() {
+                    self.remove_surface_control_layers(input.layer);
                 }
-                tracing::debug!(object, descriptor, "GraphObjectAttachInput");
-                trace_graph!(
-                    self,
-                    "object #{object} attach input descriptor=0x{descriptor:08X}"
-                );
+                tracing::info!(?object, "GraphReleaseIconInputProcessor");
+                return Ok(ethornell_vm::Value::Int(i32::from(removed.is_some())));
             }
             (0x90, 0xd0) => {
-                let target = stack.pop();
-                let target_id = target.as_ref().map(value_to_i32).unwrap_or_default();
-                let handle = self.alloc_object();
-                let (base_x, base_y) = self
-                    .graph_layers
-                    .get(&target_id)
-                    .map(|layer| (layer.x, layer.y))
-                    .unwrap_or_default();
-                self.graph_scroll_states
-                    .insert(handle, GraphScrollState::new(target_id, base_x, base_y));
-                tracing::debug!(?target, target_id, handle, "GraphCreateScrollState");
+                let target = pop_int_value(stack).unwrap_or_default();
+                let handle = if self.graph_handle_exists(target)
+                    && !self.graph_native_owners.contains_key(&target)
+                    && !self.graph_knob_target_owners.contains_key(&target)
+                {
+                    self.alloc_graph_knob_handle().map(|handle| {
+                        let (base_x, base_y) = self
+                            .graph_native_composite_position(target)
+                            .map(|(x, y)| (x as f32, y as f32))
+                            .unwrap_or_else(|| self.graph_object_position(target));
+                        self.graph_knob_states
+                            .insert(handle, GraphKnobState::new(target, base_x, base_y));
+                        self.graph_knob_target_owners.insert(target, handle);
+                        self.graph_native_owners.insert(target, handle);
+                        self.display_tree.register(handle, NativeDisplayKind::Knob);
+                        self.graph90_initialize_native_constructor_sort(
+                            handle,
+                            NativeDisplayKind::Knob,
+                        );
+                        handle
+                    })
+                } else {
+                    None
+                };
+                let handle = handle.unwrap_or_default();
+                tracing::debug!(target, handle, "GraphCreateKnobObject");
                 return Ok(ethornell_vm::Value::Int(handle));
             }
             (0x90, 0xd1) => {
-                let target = stack.pop();
-                let target_id = target.as_ref().map(value_to_i32).unwrap_or_default();
-                self.graph_scroll_states.remove(&target_id);
-                tracing::debug!(?target, target_id, "GraphReleaseScrollState");
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let removed = self.graph_knob_states.remove(&handle);
+                if let Some(state) = removed {
+                    self.graph_knob_target_owners.remove(&state.target);
+                    if self.graph_native_owners.get(&state.target) == Some(&handle) {
+                        self.graph_native_owners.remove(&state.target);
+                    }
+                    self.graph_knob_watches.remove(&handle);
+                    self.display_tree.remove(handle);
+                }
+                tracing::debug!(
+                    handle,
+                    released = removed.is_some(),
+                    "GraphReleaseKnobObject"
+                );
             }
             (0x90, 0xd4) => {
-                let args = pop_args(stack, 2);
-                let mode = args.first().map(value_to_i32).unwrap_or_default();
-                let handle = args.get(1).map(value_to_i32).unwrap_or_default();
-                if let Some(state) = self.graph_scroll_states.get_mut(&handle) {
-                    state.mode = mode;
+                let enabled = pop_int_value(stack).unwrap_or_default() != 0;
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let target = self.graph_knob_states.get_mut(&handle).map(|state| {
+                    state.enabled = enabled;
+                    state.target
+                });
+                if let Some(target) = target {
+                    self.graph_object_enabled.insert(target, enabled);
+                    self.display_tree.set_enabled(handle, enabled);
                 }
-                tracing::debug!(handle, mode, "GraphScrollSetMode");
+                tracing::debug!(
+                    handle,
+                    enabled,
+                    valid = target.is_some(),
+                    "GraphSetKnobEnabled"
+                );
             }
             (0x90, 0xd5) => {
-                let args = pop_args(stack, 3);
-                let handle = args.get(2).map(value_to_i32).unwrap_or_default();
-                tracing::debug!(?args, handle, "GraphScrollCommit");
+                let y = pop_int_value(stack).unwrap_or_default();
+                let x = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let updated = if let Some(state) = self.graph_knob_states.get_mut(&handle) {
+                    state.set_base_position(x, y);
+                    true
+                } else {
+                    false
+                };
+                if updated {
+                    self.apply_graph_knob_position(handle);
+                    self.display_tree
+                        .set_local_position(handle, x as f32, y as f32);
+                }
+                tracing::debug!(handle, x, y, updated, "GraphSetKnobBasePosition");
             }
             (0x90, 0xd6) => {
-                let args = pop_args(stack, 3);
-                let handle = args.get(2).map(value_to_i32).unwrap_or_default();
-                let x = args.get(1).map(value_to_i32).unwrap_or_default();
-                let y = args.first().map(value_to_i32).unwrap_or_default();
-                if let Some(state) = self.graph_scroll_states.get_mut(&handle) {
-                    state.x = x;
-                    state.y = y;
+                let y = pop_int_value(stack).unwrap_or_default();
+                let x = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let dimensions = self
+                    .graph_knob_states
+                    .get(&handle)
+                    .map(|state| self.graph_knob_target_dimensions(state.target))
+                    .unwrap_or((1.0, 1.0));
+                let accepted = self
+                    .graph_knob_states
+                    .get_mut(&handle)
+                    .map(|state| state.set_position(x, y, dimensions.0, dimensions.1))
+                    .unwrap_or(false);
+                if accepted {
+                    self.apply_graph_knob_position(handle);
                 }
-                self.apply_graph_scroll_position(handle);
-                tracing::debug!(?args, handle, x, y, "GraphScrollSetPosition");
+                tracing::debug!(handle, x, y, accepted, "GraphSetKnobPosition");
             }
             (0x90, 0xd7) => {
                 let handle = pop_int_value(stack).unwrap_or_default();
-                let state = self
-                    .graph_scroll_states
+                let (x, y) = self
+                    .graph_knob_states
                     .get(&handle)
-                    .copied()
-                    .unwrap_or_else(|| GraphScrollState::new(0, 0.0, 0.0));
-                stack.push(ethornell_vm::Value::Int(state.x));
-                stack.push(ethornell_vm::Value::Int(state.y));
-                tracing::debug!(
-                    handle,
-                    x = state.x,
-                    y = state.y,
-                    extent_x = state.extent_x,
-                    extent_y = state.extent_y,
-                    bounds_width = state.bounds_width,
-                    bounds_height = state.bounds_height,
-                    "GraphScrollGetPosition"
-                );
+                    .map(|state| (state.x, state.y))
+                    .unwrap_or_default();
+                stack.push(ethornell_vm::Value::Int(x));
+                stack.push(ethornell_vm::Value::Int(y));
+                tracing::debug!(handle, x, y, "GraphGetKnobPosition");
             }
             (0x90, 0xd8) => {
-                let args = pop_args(stack, 3);
-                let handle = args.get(2).map(value_to_i32).unwrap_or_default();
-                let width = args.get(1).map(value_to_i32).unwrap_or_default();
-                let height = args.first().map(value_to_i32).unwrap_or_default();
-                if let Some(state) = self.graph_scroll_states.get_mut(&handle) {
-                    state.extent_x = width;
-                    state.extent_y = height;
-                }
-                self.apply_graph_scroll_position(handle);
-                tracing::debug!(?args, handle, width, height, "GraphScrollSetExtent");
+                let precision_y = pop_int_value(stack).unwrap_or_default();
+                let precision_x = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let accepted = self
+                    .graph_knob_states
+                    .get_mut(&handle)
+                    .map(|state| state.set_extent(precision_x, precision_y))
+                    .unwrap_or(false);
+                tracing::debug!(
+                    handle,
+                    precision_x,
+                    precision_y,
+                    accepted,
+                    "GraphSetKnobMovementPrecision"
+                );
             }
             (0x90, 0xd9) => {
-                let args = pop_args(stack, 3);
-                let handle = args.get(2).map(value_to_i32).unwrap_or_default();
-                let width = args.get(1).map(value_to_i32).unwrap_or_default();
-                let height = args.first().map(value_to_i32).unwrap_or_default();
-                if let Some(state) = self.graph_scroll_states.get_mut(&handle) {
-                    state.bounds_width = width;
-                    state.bounds_height = height;
+                let range_height = pop_int_value(stack).unwrap_or_default();
+                let range_width = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let dimensions = self
+                    .graph_knob_states
+                    .get(&handle)
+                    .map(|state| self.graph_knob_target_dimensions(state.target))
+                    .unwrap_or((1.0, 1.0));
+                let accepted = self
+                    .graph_knob_states
+                    .get_mut(&handle)
+                    .map(|state| {
+                        state.set_bounds(range_width, range_height, dimensions.0, dimensions.1)
+                    })
+                    .unwrap_or(false);
+                if accepted {
+                    self.apply_graph_knob_position(handle);
                 }
-                self.apply_graph_scroll_position(handle);
-                tracing::debug!(?args, handle, width, height, "GraphScrollSetBounds");
+                tracing::debug!(
+                    handle,
+                    range_width,
+                    range_height,
+                    accepted,
+                    "GraphSetKnobMovementRange"
+                );
+            }
+            (0x90, 0xda) => {
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let value = self
+                    .graph_knob_states
+                    .get_mut(&handle)
+                    .map(GraphKnobState::take_vertical_event)
+                    .unwrap_or_default();
+                tracing::debug!(handle, value, "GraphTakeKnobVerticalEvent");
+                return Ok(ethornell_vm::Value::Int(value));
+            }
+            (0x90, 0xdb) => {
+                let mut changed_handle = 0;
+                for (&handle, state) in &mut self.graph_knob_states {
+                    if state.take_changed() {
+                        changed_handle = handle;
+                    }
+                }
+                tracing::debug!(changed_handle, "GraphTakeChangedKnobHandle");
+                return Ok(ethornell_vm::Value::Int(changed_handle));
+            }
+            (0x90, 0xdc) => {
+                let relative_mode = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let valid = self
+                    .graph_knob_states
+                    .get_mut(&handle)
+                    .map(|state| {
+                        state.relative_mode = relative_mode;
+                    })
+                    .is_some();
+                tracing::debug!(handle, relative_mode, valid, "GraphSetKnobRelativeMode");
             }
             (0x90, 0xdd) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                let previous = std::mem::replace(&mut self.graph_driver_mode, value);
-                tracing::info!(value, previous, "GraphSetDriverMode");
+                let previous = std::mem::replace(&mut self.graph_knob_input_mode, value);
+                tracing::info!(value, previous, "GraphSwapKnobInputMode");
                 return Ok(ethornell_vm::Value::Int(previous));
+            }
+            (0x90, 0xde) => {
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let watched = self.graph_knob_states.contains_key(&handle)
+                    && self.graph_knob_watches.insert(handle);
+                tracing::debug!(handle, watched, "GraphWatchKnobObject");
+            }
+            (0x90, 0xdf) => {
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let removed = self.graph_knob_watches.remove(&handle);
+                tracing::debug!(handle, removed, "GraphUnwatchKnobObject");
             }
             (0x90, 0xbc) => {
                 let object = stack.pop();
@@ -6541,182 +16726,247 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0xcc) => {
                 let args = pop_args(stack, 2);
-                tracing::debug!(args = ?summarize_values(&args), "GraphColorAdjustPrepare");
+                tracing::debug!(args = ?summarize_values(&args), "GraphRegisterColorLut");
                 trace_graph!(
                     self,
-                    "color adjust prepare raw={:?}",
+                    "color LUT fallback raw={:?}",
                     args.iter().map(value_to_i32).collect::<Vec<_>>()
                 );
             }
             (0x90, 0xcd) => {
                 let args = pop_args(stack, 8);
-                self.apply_graph_blit_rect(&args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphColorAdjustedBlit");
+                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
+                let source = values.get(7).copied().unwrap_or_default();
+                let destination = values.get(6).copied().unwrap_or_default();
+                let color_before = values.get(5).copied().unwrap_or(0x00ff_ffff);
+                let amount_before = values.get(4).copied().unwrap_or_default();
+                let lut_id = values.get(3).copied().unwrap_or_default();
+                let color_after = values.get(2).copied().unwrap_or(0x00ff_ffff);
+                let mode = values.get(1).copied().unwrap_or_default();
+                let amount_after = values.first().copied().unwrap_or_default();
+                let transformed = self
+                    .graph_bitmap_image(source)
+                    .zip(self.graph_color_luts.get(&lut_id))
+                    .map(|(source, lut)| {
+                        lut.apply(
+                            &source,
+                            color_before,
+                            amount_before,
+                            color_after,
+                            amount_after,
+                        )
+                    });
+                let applied = if let Some(image) = transformed {
+                    let width = image.width;
+                    let height = image.height;
+                    let key = format!("runtime:color-adjusted:{destination}");
+                    self.store_graph_image(key.clone(), image);
+                    self.graph_resources
+                        .insert(destination, RuntimeGraphResource::whole(key));
+                    self.bitmap_dimensions.insert(destination, (width, height));
+                    self.bitmap_formats.insert(destination, 2);
+                    self.graph_surfaces.insert(
+                        destination,
+                        RuntimeSurface::bitmap(destination, width as f32, height as f32),
+                    );
+                    true
+                } else {
+                    false
+                };
+                tracing::debug!(
+                    source,
+                    destination,
+                    lut_id,
+                    mode,
+                    applied,
+                    "GraphColorAdjustedBlit"
+                );
             }
             (0x90, 0xe0) => {
-                let handle = self.alloc_timeline();
-                self.timelines.create(handle);
-                tracing::info!(handle, "GraphCreateTimeline");
-                trace_graph!(self, "create timeline #{handle}");
+                let handle = self
+                    .alloc_graph_group_handle()
+                    .map(|handle| {
+                        self.graph_groups.insert(handle, GraphGroupState::default());
+                        self.display_tree.register(handle, NativeDisplayKind::Group);
+                        self.graph90_initialize_native_constructor_sort(
+                            handle,
+                            NativeDisplayKind::Group,
+                        );
+                        handle
+                    })
+                    .unwrap_or_default();
+                tracing::info!(handle, "GraphCreateGroupObject");
                 return Ok(ethornell_vm::Value::Int(handle));
             }
             (0x90, 0xe1) => {
-                let timeline = stack.pop();
-                let handle = timeline.as_ref().map(value_to_i32).unwrap_or_default();
-                let poll = self.timelines.poll(handle);
-                tracing::info!(?timeline, ?poll, "GraphTimelinePoll");
-                if self.debug_graph {
-                    trace_graph!(
-                        self,
-                        "timeline #{handle} poll active={} finished={} remaining={}",
-                        poll.active,
-                        poll.finished,
-                        poll.remaining
-                    );
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let removed = self.graph_groups.remove(&handle);
+                if let Some(group) = removed.as_ref() {
+                    for &object in group.members.keys() {
+                        if self.graph_native_owners.get(&object) == Some(&handle) {
+                            self.graph_native_owners.remove(&object);
+                        }
+                        let _ = self.graph_links.set_parent(object, 0, true, true);
+                        let _ = self.display_tree.set_parent(object, 0);
+                    }
+                    self.display_tree.remove(handle);
                 }
-                return Ok(ethornell_vm::Value::Int(i32::from(poll.finished)));
+                tracing::info!(
+                    handle,
+                    released = removed.is_some(),
+                    "GraphReleaseGroupObject"
+                );
             }
             (0x90, 0xe4) => {
-                let enabled = stack.pop();
-                let timeline = stack.pop();
-                let handle = timeline.as_ref().map(value_to_i32).unwrap_or_default();
-                let enabled_value = enabled.as_ref().map(value_to_i32).unwrap_or_default() != 0;
-                let event = self.timelines.set_enabled(handle, enabled_value);
-                tracing::info!(?timeline, ?enabled, ?event, "GraphTimelineSetEnabled");
-                self.trace_timeline_event(event);
+                let enabled = pop_int_value(stack).unwrap_or_default() != 0;
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let valid = self.graph_groups.get_mut(&handle).is_some_and(|group| {
+                    group.draw_enabled = enabled;
+                    true
+                });
+                if valid {
+                    // Current target sub_4426A0 calls group vtable+4;
+                    // CDspObj::sub_41AE00 writes +0x14 and recursively invokes
+                    // the same draw-enable setter on member records (+0x12C).
+                    for object in self.graph_native_descendants_inclusive(handle) {
+                        self.set_graph_object_draw_enabled(object, enabled);
+                    }
+                }
+                tracing::info!(
+                    handle,
+                    enabled,
+                    valid,
+                    "GraphSetGroupEnabled"
+                );
             }
             (0x90, 0xe5) => {
-                let args = pop_args(stack, 4);
-                let event = self.timelines.configure(&args);
-                tracing::info!(
-                    args = ?summarize_values(&args),
-                    ?event,
-                    "GraphTimelineConfigure"
-                );
-                if let Some(event) = event {
-                    self.trace_timeline_event(event);
+                // Current target sub_442710: vtable+0x2C SetPosition(x,y),
+                // followed by vtable+0x48 SetAlpha(alpha_parameter). The
+                // fourth ABI value is transparency, not display priority.
+                let alpha_parameter = pop_int_value(stack).unwrap_or_default();
+                let y = pop_int_value(stack).unwrap_or_default();
+                let x = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let valid = self.graph_groups.get_mut(&handle).is_some_and(|group| {
+                    group.x = x;
+                    group.y = y;
+                    group.alpha_parameter = alpha_parameter;
+                    true
+                });
+                if valid {
+                    self.display_tree
+                        .set_local_position(handle, x as f32, y as f32);
+                    self.graph90_set_position_recursive(handle, x, y);
+                    self.set_graph_object_alpha_recursive_raw(handle, alpha_parameter);
                 }
+                tracing::info!(
+                    handle,
+                    x,
+                    y,
+                    alpha_parameter,
+                    valid,
+                    "GraphConfigureGroupObject"
+                );
             }
             (0x90, 0xe8) => {
-                let args = pop_args(stack, 4);
-                let event = self.timelines.attach(&args);
-                tracing::info!(args = ?summarize_values(&args), ?event, "GraphTimelineAttach");
-                if let Some(event) = event {
-                    self.trace_timeline_event(event);
+                let local_y = pop_int_value(stack).unwrap_or_default();
+                let local_x = pop_int_value(stack).unwrap_or_default();
+                let object = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let valid = self.graph_groups.contains_key(&handle)
+                    && object != handle
+                    && self.graph_handle_exists(object)
+                    && !self.graph_native_owners.contains_key(&object);
+                if valid {
+                    // sub_41AB40 samples the parent's live composite
+                    // position (vtable+0x30/sub_41B260), not a constructor or
+                    // last-Graph90:E5 cache. This matters when the group has
+                    // already moved before a 1280x240 message-frame member is
+                    // attached at local_y=720.
+                    let (group_x, group_y) = self
+                        .graph_native_composite_position(handle)
+                        .or_else(|| self.graph_native_base_position(handle))
+                        .unwrap_or_default();
+                    self.graph_groups
+                        .get_mut(&handle)
+                        .expect("validated group")
+                        .members
+                        .insert(object, (local_x, local_y));
+                    self.graph_native_owners.insert(object, handle);
+                    let _ = self.graph_links.set_parent(object, handle, true, true);
+                    self.display_tree.register_inferred(object);
+                    let _ = self.display_tree.set_parent(object, handle);
+                    // Child vtable+0x28 is the normal CDspObj position setter
+                    // with member propagation enabled. Materialize that same
+                    // recursive update, then retain the member-local offset in
+                    // the portable hierarchy so renderer-time transforms do
+                    // not accidentally treat the absolute coordinate as local.
+                    self.graph90_set_position_recursive(
+                        object,
+                        group_x.wrapping_add(local_x),
+                        group_y.wrapping_add(local_y),
+                    );
+                    self.display_tree
+                        .set_local_position(object, local_x as f32, local_y as f32);
                 }
+                tracing::info!(
+                    handle,
+                    object,
+                    local_x,
+                    local_y,
+                    valid,
+                    "GraphAddObjectToGroup"
+                );
             }
             (0x90, 0xe9) => {
-                let value = stack.pop();
-                let timeline = stack.pop();
-                let handle = timeline.as_ref().map(value_to_i32).unwrap_or_default();
-                let target = value.as_ref().map(value_to_i32).unwrap_or_default();
-                let result = self.timelines.query(handle, target);
-                tracing::info!(?timeline, ?value, result, "GraphTimelineQuery");
-                return Ok(ethornell_vm::Value::Int(result));
-            }
-            (0x91, 0x0d) => {
-                let enabled = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(enabled, "GraphSetLayerEnabled");
-            }
-            (0x91, 0x0e) => {
-                let mut args = Vec::new();
-                for _ in 0..5 {
-                    args.push(stack.pop());
+                let object = pop_int_value(stack).unwrap_or_default();
+                let handle = pop_int_value(stack).unwrap_or_default();
+                let removed = self
+                    .graph_groups
+                    .get_mut(&handle)
+                    .map(|group| group.members.remove(&object).is_some())
+                    .unwrap_or(false);
+                if removed {
+                    if self.graph_native_owners.get(&object) == Some(&handle) {
+                        self.graph_native_owners.remove(&object);
+                    }
+                    let _ = self.graph_links.set_parent(object, 0, true, true);
+                    let _ = self.display_tree.set_parent(object, 0);
+                    if let Some((x, y)) = self.graph_native_base_position(object) {
+                        self.display_tree.set_local_position(object, x as f32, y as f32);
+                    }
                 }
-                tracing::info!(?args, "GraphConfigureLayer");
-            }
-            (0x91, 0x10) => {
-                let args = pop_args(stack, 5);
-                self.apply_graph_effect_config(0x10, &args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphEffectSetZoomRect");
-            }
-            (0x91, 0x11) => {
-                let args = pop_args(stack, 2);
-                self.apply_graph_effect_config(0x11, &args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphEffectSetDiffuse");
-            }
-            (0x91, 0x12) => {
-                let args = pop_args(stack, 6);
-                self.apply_graph_effect_config(0x12, &args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphEffectSetColorTone");
-            }
-            (0x91, 0x13) => {
-                let args = pop_args(stack, 5);
-                self.apply_graph_effect_config(0x13, &args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphEffectSetRotation");
-            }
-            (0x91, 0x15) => {
-                let args = pop_args(stack, 5);
-                self.apply_graph_effect_config(0x15, &args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphEffectSetWave");
-            }
-            (0x91, 0x16) => {
-                let args = pop_args(stack, 7);
-                self.apply_graph_effect_config(0x16, &args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphEffectSetClipRect");
-            }
-            (0x91, 0x06) => {
-                // sub_4806D0 -> sub_461E40 -> sub_442EC0 stores the two
-                // global CDspObj offsets. sub_41B260 adds them during final
-                // screen-coordinate resolution for objects using the native
-                // (default-enabled) global-offset flag.
-                let y = pop_int_value(stack).unwrap_or_default() as f32;
-                let x = pop_int_value(stack).unwrap_or_default() as f32;
-                self.graph_global_offset = (x, y);
-                tracing::debug!(x, y, "GraphSetGlobalDisplayOffset");
-                trace_graph!(self, "global display offset x={x:.1} y={y:.1}");
-            }
-            (0x91, 0x1e) => {
-                // funcs_504F00[0x1E] -> sub_4817F0 validates the first two
-                // script handles and copies their backing image state.
-                let args = pop_args(stack, 4);
-                let destination = args.get(2).map(value_to_i32).unwrap_or_default();
-                let source = args.get(3).map(value_to_i32).unwrap_or_default();
-                self.copy_graph_backing(source, destination);
-                tracing::debug!(source, destination, args = ?summarize_values(&args), "GraphCopyBackingState");
-            }
-            (0x91, 0x1f) => {
-                let source = pop_int_value(stack).unwrap_or_default();
-                let destination = pop_int_value(stack).unwrap_or_default();
-                if let Some(mut surface) = self.graph_surfaces.get(&source).cloned() {
-                    surface.id = destination;
-                    self.graph_surfaces.insert(destination, surface);
-                }
-                if let Some(key) = self.graph_resources.get(&source).cloned() {
-                    self.graph_resources.insert(destination, key);
-                }
-                tracing::debug!(source, destination, "GraphCloneBitmap");
+                tracing::info!(handle, object, removed, "GraphRemoveObjectFromGroup");
             }
             (0x91, 0x55) => {
+                // Normally intercepted by dispatch_system91_55_7f. Keep this
+                // fallback semantically identical: 91:55 is a Sprite-internal
+                // relation/dependency (sub_428CD0), not a display parent link.
                 let args = pop_args(stack, 2);
-                let target = args.first().map(value_to_i32).unwrap_or_default();
-                let source = args.get(1).map(value_to_i32).unwrap_or_default();
-                tracing::debug!(source, target, "GraphLayerLink");
-                trace_graph!(self, "layer link source=#{source} target=#{target}");
-                // sub_4824D0 pushes sub_462530's status. Zero is the native
-                // success result; 11 and 13..15 describe invalid link graphs.
-                return Ok(ethornell_vm::Value::Int(0));
+                let sprite = args.first().map(value_to_i32).unwrap_or_default();
+                let linked = args.get(1).map(value_to_i32).unwrap_or_default();
+                let status = self.graph91_set_sprite_relation(sprite, linked);
+                tracing::debug!(sprite, linked, status, "GraphSetSpriteRelation");
+                return Ok(ethornell_vm::Value::Int(status));
             }
             (0x91, 0x60) => {
-                let handle = pop_int_value(stack).unwrap_or_default();
-                if handle > 0 {
-                    self.graph_object_enabled.insert(handle, true);
-                }
+                let handle = self.alloc_object();
+                self.graph_object_enabled.insert(handle, true);
                 tracing::debug!(handle, "GraphTempLayerCreate");
                 trace_graph!(self, "temp layer create #{handle}");
+                return Ok(ethornell_vm::Value::Int(handle));
             }
             (0x91, 0x61) => {
                 let handle = pop_int_value(stack).unwrap_or_default();
-                if handle > 0 {
-                    self.remove_surface_control_layers(handle);
+                if handle != -1 {
                     self.graph_layers.remove(&handle);
-                    self.detach_graph_surface_relations(handle);
-                    self.graph_surfaces.remove(&handle);
-                    self.surface_text_states.remove(&handle);
-                    self.surface_text_buffers.remove(&handle);
-                    self.graph_object_layers.remove(&handle);
+                    self.graph_node_sources.remove(&handle);
+                    self.graph_node_masks.remove(&handle);
+                    self.graph_object_properties.remove(&handle);
                     self.graph_object_enabled.remove(&handle);
-                    self.layer_animations.clear_layers(std::iter::once(&handle));
+                    self.graph_links.unlink(handle);
+                    self.display_tree.remove(handle);
+                    self.remove_graph_surface(handle);
                 }
                 tracing::debug!(handle, "GraphTempLayerRelease");
                 trace_graph!(self, "temp layer release #{handle}");
@@ -6725,7 +16975,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let args = pop_args(stack, 2);
                 let enabled = args.first().map(value_to_i32).unwrap_or_default() != 0;
                 let target = args.get(1).map(value_to_i32).unwrap_or_default();
-                if target > 0 {
+                if target != -1 {
                     self.set_graph_object_enabled(target, enabled);
                     if let Some(layer) = self.graph_layers.get_mut(&target) {
                         layer.enabled = enabled;
@@ -6739,219 +16989,39 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x91, 0x65) => {
                 let args = pop_args(stack, 6);
+                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
+                let target = values.get(5).copied().unwrap_or_default();
+                let displacement = values.get(4).copied().unwrap_or_default();
+                let opacity = values
+                    .get(2)
+                    .copied()
+                    .map(|value| value as f32 / 256.0)
+                    .unwrap_or(1.0);
+                let z = values.first().copied().unwrap_or(1024);
+                let installed =
+                    self.install_temp_effect_layer(target, Some(displacement), opacity, z);
                 tracing::debug!(args = ?summarize_values(&args), "GraphTempLayerBlit");
                 trace_graph!(
                     self,
-                    "temp layer blit raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
+                    "temp layer blit target=#{target} displacement=#{displacement} installed={installed} raw={values:?}"
                 );
             }
             (0x91, 0x66) => {
                 let args = pop_args(stack, 4);
+                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
+                let target = values.get(3).copied().unwrap_or_default();
+                let opacity = values
+                    .get(1)
+                    .copied()
+                    .map(|value| value as f32 / 256.0)
+                    .unwrap_or(1.0);
+                let z = values.first().copied().unwrap_or(1024);
+                let installed = self.install_temp_effect_layer(target, None, opacity, z);
                 tracing::debug!(args = ?summarize_values(&args), "GraphTempLayerCopy");
                 trace_graph!(
                     self,
-                    "temp layer copy raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
+                    "temp layer copy target=#{target} installed={installed} raw={values:?}"
                 );
-            }
-            (0x91, 0x1d) => {
-                let args = pop_args(stack, 5);
-                self.apply_graph_layer_color_blend(&args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphLayerColorBlend");
-            }
-            (0x91, 0x33) => {
-                let args = pop_args(stack, 4);
-                let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                if ints.len() >= 4 {
-                    let object = ints[3];
-                    let x = fixed_16_to_f32(ints[2]);
-                    let y = fixed_16_to_f32(ints[1]);
-                    let layer_ids = self.graph_target_layers(object);
-                    for layer_id in &layer_ids {
-                        if let Some(layer) = self.graph_layers.get_mut(layer_id) {
-                            layer.x = x;
-                            layer.y = y;
-                        }
-                    }
-                    trace_graph!(self, "object #{object} fixed position x={x:.1} y={y:.1} snap={} layers={layer_ids:?}", ints[0]);
-                }
-                tracing::debug!(args = ?summarize_values(&args), "GraphObjectSetMotionPoint");
-            }
-            (0x91, 0x3e) => {
-                let args = pop_args(stack, 4);
-                let y = args.first().map(value_to_i32).unwrap_or_default() as f32;
-                let x = args.get(1).map(value_to_i32).unwrap_or_default() as f32;
-                let child = args.get(2).map(value_to_i32).unwrap_or_default();
-                let parent = args.get(3).map(value_to_i32).unwrap_or_default();
-                let attached = self.attach_graph_surface(parent, child, x, y);
-                let attached_kind = self
-                    .graph_surfaces
-                    .get(&child)
-                    .filter(|surface| surface.parent_surface == Some(parent))
-                    .map(|_| "surface")
-                    .or_else(|| {
-                        self.graph_layers
-                            .get(&child)
-                            .filter(|layer| layer.target_surface == Some(parent))
-                            .map(|_| "layer")
-                    })
-                    .or_else(|| {
-                        self.text_nodes
-                            .get(&child)
-                            .filter(|node| node.target_surface == Some(parent))
-                            .map(|_| "text")
-                    });
-                tracing::debug!(parent, child, x, y, attached, "GraphAttachSurface");
-                trace_graph!(
-                    self,
-                    "attach surface #{child} to #{parent} local=({x:.0},{y:.0}) attached={attached} kind={attached_kind:?}"
-                );
-                return Ok(ethornell_vm::Value::None);
-            }
-            (0x91, 0x3f) => {
-                let child = pop_int_value(stack).unwrap_or_default();
-                let parent = pop_int_value(stack).unwrap_or_default();
-                let detached = self.detach_graph_surface(parent, child);
-                if parent != 0 && child != 0 {
-                    self.graph_bindings.remove(&parent);
-                }
-                tracing::debug!(parent, child, detached, "GraphDetachSurface");
-                trace_graph!(
-                    self,
-                    "detach surface #{child} from #{parent} detached={detached}"
-                );
-            }
-            (0x91, 0x40) => {
-                let args = pop_args(stack, 9);
-                self.apply_graph_affine_transform(&args);
-                tracing::debug!(
-                    args = ?summarize_values(&args),
-                    "GraphLayerAffineTransform"
-                );
-            }
-            (0x91, 0x48) | (0x91, 0x49) | (0x91, 0x4a) => {
-                // sub_482310/sub_4823A0/sub_482430 configure one of eight
-                // native draw-context vector slots. They do not directly
-                // mutate a display object.
-                let argc = known_call_arg_count(group, id).unwrap_or_default();
-                let args = pop_args(stack, argc);
-                tracing::debug!(id, args = ?summarize_values(&args), "GraphConfigureDrawVector");
-                trace_graph!(
-                    self,
-                    "draw vector 0x{id:02X} raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
-                );
-            }
-            (0x91, 0x38) => {
-                let property = pop_int_value(stack).unwrap_or_default();
-                let object = pop_int_value(stack).unwrap_or_default();
-                let value = pop_int_value(stack).unwrap_or_default();
-                self.graph_object_properties
-                    .entry(object)
-                    .or_default()
-                    .set_property(property as u32, value, 0);
-                tracing::debug!(object, property, value, "GraphConfigureResourceProperty");
-            }
-            (0x91, 0x19) => {
-                let args = pop_args(stack, 11);
-                tracing::debug!(?args, "GraphLayerTransform");
-                let mut ints: Vec<i32> = args.iter().map(value_to_i32).collect();
-                if ints.len() >= 11 {
-                    ints.reverse();
-                    let id = ints[0];
-                    let tx = fixed_16_to_f32(ints[1]);
-                    let ty = fixed_16_to_f32(ints[2]);
-                    let resource_id = ints[3];
-                    let sx = fixed_16_to_f32(ints[7]);
-                    let sy = fixed_16_to_f32(ints[8]);
-                    let rotation = fixed_16_to_f32(ints[9]);
-                    let extra_x = fixed_16_to_f32(ints[6]);
-                    let duration_frames = self.animation_queue_remaining.max(1);
-                    let mut trace = None;
-                    let title_after_departure =
-                        self.resolve_resource_key(resource_id).is_some_and(|key| {
-                            self.title_ui_departed && key.starts_with("sysgrp.arc:SGTitle")
-                        });
-                    if !title_after_departure {
-                        self.ensure_transform_layer(id, resource_id);
-                    }
-                    if let Some(layer) = self.graph_layers.get_mut(&id) {
-                        let target_x = tx + extra_x;
-                        let target_y = ty;
-                        let scale_x = normalize_transform_scale(sx);
-                        let scale_y = normalize_transform_scale(sy);
-                        if duration_frames > 1 {
-                            self.layer_animations.move_x_to(
-                                id,
-                                layer.transform_x,
-                                target_x,
-                                duration_frames,
-                            );
-                            self.layer_animations.move_y_to(
-                                id,
-                                layer.transform_y,
-                                target_y,
-                                duration_frames,
-                            );
-                            self.layer_animations.scale_x_to(
-                                id,
-                                layer.scale_x,
-                                scale_x,
-                                duration_frames,
-                            );
-                            self.layer_animations.scale_y_to(
-                                id,
-                                layer.scale_y,
-                                scale_y,
-                                duration_frames,
-                            );
-                        } else {
-                            layer.transform_x = target_x;
-                            layer.transform_y = target_y;
-                            layer.scale_x = scale_x;
-                            layer.scale_y = scale_y;
-                        }
-                        layer.rotation_degrees = rotation;
-                        trace = Some(format!(
-                            "layer transform #{id} tx={target_x:.1} ty={target_y:.1} scale={scale_x:.2}x{scale_y:.2} rot={rotation:.2} raw={ints:?}"
-                        ));
-                    } else if self.debug_graph && !title_after_departure {
-                        trace = Some(format!("layer transform missing #{id} raw={ints:?}"));
-                    }
-                    if let Some(trace) = trace {
-                        self.trace_graph(trace);
-                    }
-                }
-            }
-            (0x91, 0x98) => {
-                let mode = pop_int_value(stack).unwrap_or_default();
-                let line_height = pop_int_value(stack).unwrap_or_default();
-                let font_size = pop_int_value(stack).unwrap_or_default();
-                let reserved = pop_int_value(stack).unwrap_or_default();
-                let extent_y = pop_int_value(stack).unwrap_or_default();
-                let extent_x = pop_int_value(stack).unwrap_or_default();
-                let args = [extent_x, extent_y, reserved, font_size, line_height, mode];
-                let result = self.graph_defaults.text_layout.configure(args);
-                if result.is_ok() {
-                    self.text_state.font_size = font_size as f32;
-                    if line_height > 0 {
-                        self.text_state.line_height = line_height as f32;
-                    }
-                }
-                tracing::info!(?args, ?result, "GraphConfigureTextLayoutDefaults");
-            }
-            (0x92, 0x97) => {
-                let value_6 = pop_int_value(stack).unwrap_or_default();
-                let value_5 = pop_int_value(stack).unwrap_or_default();
-                let value_4 = pop_int_value(stack).unwrap_or_default();
-                let value_3 = pop_int_value(stack).unwrap_or_default();
-                let value_2 = pop_int_value(stack).unwrap_or_default();
-                let value_1 = pop_int_value(stack).unwrap_or_default();
-                let reserved = pop_int_value(stack).unwrap_or_default();
-                let values = [value_1, value_2, value_3, value_4, value_5, value_6];
-                self.graph_defaults.configure_text_style(None, values);
-                tracing::info!(reserved, ?values, "GraphConfigureTextStyleDefaults");
             }
             (0x92, 0x88) => {
                 let value = pop_int_value(stack).unwrap_or_default();
@@ -6964,109 +17034,32 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::debug!(object, value, "GraphSetTextObjectValue");
             }
             (0x90, 0x0e) => {
-                let mut args = Vec::new();
-                for _ in 0..5 {
-                    args.push(stack.pop());
+                let font_id = pop_int_value(stack).unwrap_or_default();
+                let italic = pop_int_value(stack).unwrap_or_default() != 0;
+                let weight_percent = pop_int_value(stack).unwrap_or_default();
+                let height = pop_int_value(stack).unwrap_or_default();
+                let font_name_id = pop_int_value(stack).unwrap_or_default();
+                let registered =
+                    self.graph_config
+                        .register_font(graph_config::RuntimeFontRegistration {
+                            font_name_id,
+                            height,
+                            weight_percent,
+                            italic,
+                            font_id,
+                        });
+                if registered && (4..=200).contains(&height) {
+                    self.text_state.font_size = height as f32;
                 }
-                tracing::info!(?args, "GraphConfigureViewport");
-            }
-            (0x91, 0x9a) => {
-                let value = stack.pop();
-                let property = stack.pop();
-                tracing::info!(?property, ?value, "GraphSetLayerProperty");
-            }
-            (0x91, 0xb8) => {
-                let layer = pop_int_value(stack).unwrap_or_default();
-                let object = self.alloc_object();
-                self.graph_input_objects
-                    .insert(object, RuntimeGraphInputObject::new(layer));
-                tracing::debug!(layer, object, "GraphCreateSurfaceInputObject");
-                trace_graph!(self, "create input object #{object} for surface #{layer}");
-                return Ok(ethornell_vm::Value::Int(object));
-            }
-            (0x91, 0xba) => {
-                let _descriptor = stack.pop();
-                let _object = stack.pop();
-                return Ok(ethornell_vm::Value::Int(0));
-            }
-            (0x91, 0x88) => {
-                let args = pop_args(stack, 7);
-                self.text_state = infer_text_state(&args);
-                tracing::debug!(?args, inferred = ?self.text_state, "ConfigureFormatInfo");
-            }
-            (0x91, 0x89) => {
-                let value = stack.pop();
-                let target = stack.pop();
-                tracing::info!(?target, ?value, "GraphLayerFormatOption");
-            }
-            (0x91, 0x94) => {
-                let replacement = stack.pop().as_ref().and_then(value_to_optional_string);
-                let source = stack.pop().as_ref().and_then(value_to_optional_string);
-                self.graph_defaults
-                    .update_text_substitution(source.clone(), replacement.clone());
-                tracing::debug!(?source, ?replacement, "GraphUpdateRubySubstitution");
-            }
-            (0x91, 0x8b) => {
-                let writing_mode = pop_int_value(stack).unwrap_or_default();
-                let surface = pop_int_value(stack).unwrap_or_default();
-                if writing_mode <= 2 && self.graph_surfaces.contains_key(&surface) {
-                    self.surface_text_states
-                        .entry(surface)
-                        .or_default()
-                        .writing_mode = writing_mode;
-                }
-                tracing::info!(surface, writing_mode, "GraphTextSetWritingMode");
-            }
-            (0x91, 0x8c) => {
-                let y = pop_int_value(stack).unwrap_or_default();
-                let x = pop_int_value(stack).unwrap_or_default();
-                let surface = pop_int_value(stack).unwrap_or_default();
-                if self.graph_surfaces.contains_key(&surface) {
-                    let state = self.surface_text_states.entry(surface).or_default();
-                    state.cursor_x = x;
-                    state.cursor_y = y;
-                }
-                tracing::debug!(surface, x, y, "GraphTextSetCursorPosition");
-            }
-            (0x91, 0x8d) => {
-                let surface = pop_int_value(stack).unwrap_or_default();
-                let exists = self.graph_surfaces.contains_key(&surface);
-                let state = self
-                    .surface_text_states
-                    .get(&surface)
-                    .copied()
-                    .unwrap_or_default();
-                stack.push(ethornell_vm::Value::Int(i32::from(exists)));
-                stack.push(ethornell_vm::Value::Int(state.cursor_x));
-                tracing::debug!(surface, exists, ?state, "GraphTextGetCursorPosition");
-                return Ok(ethornell_vm::Value::Int(state.cursor_y));
-            }
-            (0x91, 0x8e) => {
-                let surface = pop_int_value(stack).unwrap_or_default();
-                let state = self
-                    .surface_text_states
-                    .get(&surface)
-                    .copied()
-                    .unwrap_or_default();
-                let reached = self.graph_surfaces.get(&surface).is_some_and(|target| {
-                    if state.writing_mode == 1 {
-                        state.cursor_y as f32 >= target.viewport_height
-                    } else {
-                        state.cursor_x as f32 >= target.viewport_width
-                    }
-                });
-                tracing::debug!(surface, ?state, reached, "GraphTextCursorReachedBoundary");
-                return Ok(ethornell_vm::Value::Int(i32::from(reached)));
-            }
-            (0x91, 0x96) => {
-                let records = stack
-                    .pop()
-                    .as_ref()
-                    .and_then(value_to_optional_string)
-                    .unwrap_or_default();
-                let parsed = self.graph_defaults.register_ruby_records(&records);
-                tracing::debug!(records, parsed, "GraphRegisterRubySubstitutions");
-                return Ok(ethornell_vm::Value::Int(i32::from(parsed)));
+                tracing::info!(
+                    font_name_id,
+                    height,
+                    weight_percent,
+                    italic,
+                    font_id,
+                    registered,
+                    "GraphRegisterFont"
+                );
             }
             (0x92, 0x91) => {
                 let args = pop_args(stack, 11);
@@ -7076,26 +17069,36 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 if inferred.width > 0.0 && inferred.height > 0.0 {
                     self.text_state = inferred;
                 }
-                if self.title_ui_departed && self.native_message_surface_target == Some(target) {
-                    if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
-                        let display_text = {
-                            let buffer = self.surface_text_buffers.entry(target).or_default();
-                            buffer.push_str(text);
-                            buffer.clone()
-                        };
-                        self.render_native_message_text(&display_text);
-                        let line_height = self.text_state.line_height.max(1.0) as i32;
-                        let glyph_advance = (self.text_state.font_size * 0.5).max(1.0) as i32;
-                        let state = self.surface_text_states.entry(target).or_default();
-                        for character in text.chars() {
-                            if character == '\n' {
-                                state.cursor_x = 0;
-                                state.cursor_y = state.cursor_y.saturating_add(line_height);
-                            } else {
-                                state.cursor_x = state.cursor_x.saturating_add(glyph_advance);
-                            }
-                        }
-                    }
+                if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
+                    // sub_486500 and the message procedure both enter
+                    // sub_42B710, so direct formatted draws must preserve the
+                    // same ruby spans and kinsoku wrapping as 92:90.
+                    let parsed = text::parse_and_wrap_styled_message(text, &self.text_state);
+                    let x = self.text_state.x;
+                    let y = self.text_state.y;
+                    self.store_bitmap_text_run(
+                        target,
+                        RuntimeTextNode {
+                            text: parsed.text.clone(),
+                            enabled: true,
+                            owner_object: Some(target),
+                            screen_attached: false,
+                            target_surface: Some(target),
+                            x,
+                            y,
+                            size: self.text_state.font_size,
+                            line_height: self.text_state.line_height,
+                            formatted_layout: true,
+                            color: self.text_state.color,
+                            z: target,
+                            ruby_spans: parsed.ruby_spans,
+                            style_spans: parsed.style_spans,
+                        },
+                    );
+                    self.surface_text_buffers
+                        .entry(target)
+                        .or_default()
+                        .push_str(&parsed.text);
                 }
                 tracing::debug!(
                     target,
@@ -7111,10 +17114,11 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
                 let work_surface = pop_int_value(stack).unwrap_or_default();
-                if self.resolve_resource_key(resource).is_some() {
-                    if let Some(surface) = self.graph_surfaces.get_mut(&work_surface) {
-                        surface.resource_id = Some(resource);
-                    }
+                let composited = self
+                    .composite_graph_bitmap(work_surface, resource, x, y, blend_mode, opacity)
+                    .is_some();
+                if composited {
+                    self.refresh_bitmap_nodes(work_surface);
                 }
                 let message_surface = work_surface.saturating_sub(1);
                 if self.graph_surfaces.contains_key(&message_surface) {
@@ -7127,6 +17131,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     resource,
                     opacity,
                     blend_mode,
+                    composited,
                     "GraphDrawResourceToSurface"
                 );
             }
@@ -7134,42 +17139,31 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let args = pop_args(stack, 15);
                 let text = args.get(13).and_then(value_to_string);
                 let target = args.get(14).map(value_to_i32).unwrap_or_default();
-                let inferred = infer_text_state(&args);
-                if inferred.width > 0.0 && inferred.height > 0.0 {
-                    self.text_state.x = inferred.x;
-                    self.text_state.y = inferred.y;
-                    self.text_state.width = inferred.width;
-                    self.text_state.height = inferred.height;
-                    self.text_state.font_size = inferred.font_size;
-                    self.text_state.line_height = inferred.line_height;
-                }
-                let is_message_surface = self.native_message_surface_target == Some(target);
-                if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
-                    let duration_ms = if self.title_ui_departed && is_message_surface {
-                        self.start_native_message(text.clone())
+                if let Some(text) = text.as_ref() {
+                    // sub_4863E0 always enters sub_491220 for a valid
+                    // CDspObjWindow. The target has no title-departure or
+                    // preselected-message-surface gate here.
+                    self.native_message_surface_target = Some(target);
+                    self.start_native_message(text.clone(), Some(target));
+                    let class = if self
+                        .graph_surfaces
+                        .get(&target)
+                        .is_some_and(|surface| surface.message_variant == 1)
+                    {
+                        ethornell_vm::NativeMessageProcedureClass::DspMsgExVE
                     } else {
-                        1
+                        ethornell_vm::NativeMessageProcedureClass::DspMsgEx
                     };
-                    self.pending_graph_procedure_schedule =
-                        Some(ethornell_vm::GraphProcedureSchedule {
-                            duration_ms,
-                            input_enabled: self.title_ui_departed && is_message_surface,
-                            input_descriptor: 0,
-                            wait_for_input: false,
-                            completion: ethornell_vm::GraphProcedureCompletion::MessageInterrupted,
-                        });
-                } else if self.title_ui_departed
-                    && is_message_surface
-                    && args.get(2).is_some_and(|value| value_to_i32(value) != 0)
-                {
-                    self.pending_graph_procedure_schedule =
-                        Some(ethornell_vm::GraphProcedureSchedule {
-                            duration_ms: 1,
-                            input_enabled: true,
-                            input_descriptor: 0,
-                            wait_for_input: true,
-                            completion: ethornell_vm::GraphProcedureCompletion::MessageInterrupted,
-                        });
+                    let mut config = self.native_message_procedure_config(class, target);
+                    // sub_4863E0 calls sub_491220 directly: pop4/pop3/
+                    // pop2/pop1 become +0x30/+0x38/+0x3c/+0x40.
+                    config.allow_high_bit_input =
+                        args.get(1).map(value_to_i32).unwrap_or_default() != 0;
+                    config.end_wait_policy = args.get(2).map(value_to_i32).unwrap_or_default();
+                    config.completion_control = args.get(3).map(value_to_i32).unwrap_or_default();
+                    config.allow_auxiliary_input =
+                        args.first().map(value_to_i32).unwrap_or_default() != 0;
+                    call.start_message_procedure(config);
                 }
                 trace_graph!(
                     self,
@@ -7182,7 +17176,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     state = ?self.text_state,
                     "GraphTextDrawStyled"
                 );
-                if text.as_deref().is_some_and(|text| !text.is_empty()) {
+                if text.is_some() {
                     tracing::info!(?text, args = ?summarize_values(&args), "GraphTextDrawStyledText");
                 }
             }
@@ -7208,98 +17202,17 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     .insert(0x8c, (enabled, 0));
                 tracing::debug!(object, enabled, "GraphSetObjectUpdateFlag");
             }
-            (0x92, 0x17) => {
-                // Native sub_485950 pops four values and calls sub_4025E0 to
-                // read a pixel into the converted destination buffer.
-                let args = pop_args(stack, 4);
-                tracing::debug!(args = ?summarize_values(&args), "GraphReadBitmapPixel");
-                return Ok(ethornell_vm::Value::Int(0));
-            }
-            (0x92, 0x18) => {
-                // funcs_486FEE[0x18] -> sub_4859A0 -> sub_408320 copies a
-                // type-1/2 image descriptor into a type-3 destination.
-                let destination = pop_int_value(stack).unwrap_or_default();
-                let source = pop_int_value(stack).unwrap_or_default();
-                self.copy_graph_backing(source, destination);
-                tracing::debug!(source, destination, "GraphCopyImageDescriptor");
-            }
-            (0x92, 0x14) => {
-                let args = pop_args(stack, 2);
-                let file = args.first().and_then(value_to_string).unwrap_or_default();
-                let archive = args.get(1).and_then(value_to_string).unwrap_or_default();
-                let loaded = !archive.is_empty()
-                    && !file.is_empty()
-                    && self.load_graph_image_resource(0, &archive, &file);
-                trace_graph!(self, "preload resource {archive}:{file} loaded={loaded}");
-                tracing::debug!(
-                    args = ?summarize_values(&args),
-                    archive,
-                    file,
-                    loaded,
-                    "GraphPreloadResource"
-                );
-            }
-            (0x92, 0x15) => {
-                tracing::debug!("GraphResourceFlushQueue");
-                self.trace_graph("resource flush queue");
-            }
-            (0x92, 0x16) => {
-                let resource = stack.pop();
-                let target = stack.pop();
-                let resource_id = resource.as_ref().map(value_to_i32).unwrap_or_default();
-                let found = self.resolve_resource_key(resource_id).is_some();
-                if let Some(key) = self.resolve_resource_key(resource_id) {
-                    if let Some(image) = self.graph_images.get(key) {
-                        trace_graph!(
-                            self,
-                            "resource info target={:?} resource=#{resource_id} {key} {}x{}",
-                            target,
-                            image.width,
-                            image.height
-                        );
-                    } else {
-                        trace_graph!(
-                            self,
-                            "resource info target={:?} resource=#{resource_id} {key}",
-                            target
-                        );
-                    }
-                } else {
-                    trace_graph!(
-                        self,
-                        "resource info target={:?} missing resource=#{resource_id}",
-                        target
-                    );
-                }
-                tracing::debug!(?target, ?resource, found, "GraphResourceQueryInfo");
-                return Ok(ethornell_vm::Value::Int(i32::from(
-                    found || resource_id != 0,
-                )));
-            }
-            (0x92, 0x19) => {
-                let target = stack.pop();
-                let target_id = target.as_ref().map(value_to_i32).unwrap_or_default();
-                if self.graph_handle_exists(target_id) {
-                    trace_graph!(self, "resource commit #{target_id}");
-                }
-                tracing::debug!(?target, target_id, "GraphResourceCommit");
-            }
-            (0x92, 0x1e) => {
-                let args = pop_args(stack, 9);
-                let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                tracing::debug!(?ints, "GraphTextFillRect");
-            }
             (0x92, 0x9c) => {
-                // funcs_486FEE[0x9c] -> sub_4867D0 pops 21 values. pop_args
-                // keeps that native top-to-bottom order, so the text pointer
-                // converted by sub_48DF50 is index 17.
+                // funcs_486FEE[0x9C] -> sub_4867D0 pops 21 values and
+                // converts native pop slots 14 and 17 through sub_48DF50.
+                // sub_435290 clears the 16-record fragment table before each
+                // render; sub_434BA0 publishes the final x/y pair globally.
                 let args = pop_args(stack, 21);
-                let text = args.get(17).and_then(|value| match value {
-                    ethornell_vm::Value::Str(text) => Some(text.as_str()),
-                    _ => None,
-                });
+                self.system92_text_fragment_records.clear();
+                let text = args.get(17).and_then(value_to_string);
+                let auxiliary_text = args.get(14).and_then(value_to_string);
                 if let Some(size) = args
-                    .get(11)
+                    .get(9)
                     .map(value_to_i32)
                     .filter(|size| (8..=96).contains(size))
                 {
@@ -7307,24 +17220,56 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     self.text_state.line_height = size as f32 + 6.0;
                 }
                 if let Some(color) = args
-                    .get(16)
+                    .get(4)
                     .and_then(|value| infer_text_color(std::slice::from_ref(value)))
                 {
                     self.text_state.color = color;
                 }
                 let color = self.text_state.color;
                 self.render_graph_text(&args);
-                if let Some(text) = text {
-                    tracing::info!(%text, state = ?self.text_state, ?color, ?args, "RenderText");
-                } else {
-                    tracing::debug!(state = ?self.text_state, ?color, ?args, "RenderText without inline string");
-                }
                 let x = args.get(19).map(value_to_i32).unwrap_or_default();
-                let advance = text
-                    .map(|text| text.chars().count() as i32)
-                    .unwrap_or_default()
-                    .saturating_mul(self.text_state.font_size as i32);
-                return Ok(ethornell_vm::Value::Int(x.saturating_add(advance)));
+                let y = args.get(18).map(value_to_i32).unwrap_or_default();
+                let normalized = text
+                    .as_deref()
+                    .map(text_anim::normalize_message_text)
+                    .unwrap_or_default();
+                if !normalized.is_empty() {
+                    self.system92_text_fragment_records.push(
+                        ethornell_vm::System92TextFragmentRecord {
+                            text: normalized.clone(),
+                            x,
+                            y,
+                        },
+                    );
+                }
+                let spacing = args.get(7).map(value_to_i32).unwrap_or_default();
+                let advance = snapshot::measure_text_advance(
+                    &normalized,
+                    self.text_state.font_size,
+                    spacing as f32,
+                );
+                let result = x.saturating_add(advance);
+                self.system92_text_output_pair = [result, y];
+                if let Some(text) = text {
+                    tracing::info!(
+                        %text,
+                        ?auxiliary_text,
+                        render_override = self.system92_text_render_override,
+                        output_pair = ?self.system92_text_output_pair,
+                        state = ?self.text_state,
+                        ?color,
+                        "RenderText"
+                    );
+                } else {
+                    tracing::debug!(
+                        ?auxiliary_text,
+                        output_pair = ?self.system92_text_output_pair,
+                        state = ?self.text_state,
+                        ?color,
+                        "RenderText without inline string"
+                    );
+                }
+                return Ok(ethornell_vm::Value::Int(result));
             }
             (0x91, 0x9c) => {
                 let args = pop_args(stack, 14);
@@ -7339,163 +17284,19 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 } else {
                     tracing::debug!(state = ?self.text_state, ?color, ?args, "GraphDrawTextEx without inline string");
                 }
+                return Ok(ethornell_vm::Value::Int(0));
             }
             (0x90, 0x31) => {
                 let args = pop_args(stack, 2);
                 let enabled = args.first().map(value_to_i32).unwrap_or_default() != 0;
                 let target = args.get(1).map(value_to_i32).unwrap_or_default();
-                self.graph_object_enabled.insert(target, enabled);
-                for layer_id in self.graph_target_layers(target) {
-                    if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                        layer.enabled = enabled;
-                    }
-                }
+                self.set_graph_object_enabled(target, enabled);
                 tracing::debug!(target, enabled, "GraphSetObjectEnabled");
-            }
-            (0x90, 0x33) => {
-                let args = pop_args(stack, 3);
-                if args.len() >= 3 {
-                    let target = value_to_i32(&args[2]);
-                    let y = value_to_i32(&args[0]) as f32;
-                    let x = value_to_i32(&args[1]) as f32;
-                    let mut changed = 0usize;
-                    let scroll_changed =
-                        if let Some(scroll) = self.graph_scroll_states.get_mut(&target) {
-                            scroll.base_x = x;
-                            scroll.base_y = y;
-                            true
-                        } else {
-                            false
-                        };
-                    if scroll_changed {
-                        self.apply_graph_scroll_position(target);
-                        changed += 1;
-                    } else if self.set_graph_surface_position(target, x, y) {
-                        changed += 1;
-                    } else {
-                        if let Some(layer) = self.graph_layers.get_mut(&target) {
-                            layer.x = x;
-                            layer.y = y;
-                            changed += 1;
-                        }
-                        if let Some(layers) = self.graph_object_layers.get(&target).cloned() {
-                            for layer_id in layers {
-                                if layer_id == target {
-                                    continue;
-                                }
-                                if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                                    layer.x = x;
-                                    layer.y = y;
-                                    changed += 1;
-                                }
-                            }
-                        }
-                    }
-                    trace_graph!(
-                        self,
-                        "display object #{target} position x={x} y={y} scroll={scroll_changed} changed={changed}"
-                    );
-                }
-                tracing::debug!(?args, "GraphSetObjectPosition");
-            }
-            (0x90, 0x34) => {
-                let args = pop_args(stack, 2);
-                let mask_alpha = args.first().map(value_to_i32).unwrap_or_default();
-                let target = args.get(1).map(value_to_i32).unwrap_or_default();
-                self.graph_object_properties
-                    .entry(target)
-                    .or_default()
-                    .mask_alpha = mask_alpha;
-                let opacity = self
-                    .graph_object_properties
-                    .get(&target)
-                    .map(RuntimeGraphObjectProperties::opacity)
-                    .unwrap_or(1.0);
-                tracing::debug!(target, mask_alpha, opacity, "GraphSetObjectMaskAlpha");
-            }
-            (0x90, 0x35) => {
-                let args = pop_args(stack, 2);
-                let raw_scale = args.first().map(value_to_i32).unwrap_or(65_536);
-                let target = args.get(1).map(value_to_i32).unwrap_or_default();
-                let scale = normalize_transform_scale(fixed_16_to_f32(raw_scale));
-                for layer_id in self.graph_target_layers(target) {
-                    if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                        layer.scale_x = scale;
-                    }
-                }
-                tracing::debug!(target, raw_scale, scale, "GraphSetObjectScaleX");
-            }
-            (0x90, 0x36) => {
-                let args = pop_args(stack, 3);
-                self.apply_graph_object_position(&args);
-                tracing::debug!(args = ?summarize_values(&args), "GraphObjectSetPosition");
-            }
-            (0x90, 0x37) => {
-                let args = pop_args(stack, 3);
-                let y = args.first().map(value_to_i32).unwrap_or_default() as f32;
-                let x = args.get(1).map(value_to_i32).unwrap_or_default() as f32;
-                let target = args.get(2).map(value_to_i32).unwrap_or_default();
-                for layer_id in self.graph_target_layers(target) {
-                    if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                        layer.x = x;
-                        layer.y = y;
-                    }
-                }
-                tracing::debug!(target, x, y, "GraphSetObjectOrigin");
             }
             (0x90, 0x38) => {
                 let args = pop_args(stack, 4);
-                self.apply_graph_object_property(&args);
+                self.apply_graph_object_property(&args)?;
                 tracing::debug!(?args, "GraphSetObjectProperty");
-            }
-            (0x90, 0x39) => {
-                let args = pop_args(stack, 2);
-                if args.len() >= 2 {
-                    let surface_id = value_to_i32(&args[1]);
-                    let visible = value_to_i32(&args[0]) != 0;
-                    let trace = if let Some(surface) = self.graph_surfaces.get_mut(&surface_id) {
-                        surface.enabled = visible;
-                        Some(format!("surface #{} sys39 enabled={visible}", surface.id))
-                    } else {
-                        None
-                    };
-                    if let Some(trace) = trace {
-                        self.trace_graph(trace);
-                    }
-                }
-                tracing::info!(?args, "GraphSys39");
-            }
-            (0x90, 0x3a) => {
-                let args = pop_args(stack, 2);
-                if args.len() >= 2 {
-                    let resource = value_to_i32(&args[0]);
-                    let target = value_to_i32(&args[1]);
-                    let key = self.resolve_resource_key(resource).map(str::to_string);
-                    let mut traces = Vec::new();
-                    if let Some(layer) = self.graph_layers.get_mut(&target) {
-                        if let Some(key) = key.as_deref() {
-                            layer.key = key.to_string();
-                        }
-                        layer.enabled = true;
-                        traces.push(format!(
-                            "layer #{target} set node resource={resource} key={:?}",
-                            key
-                        ));
-                    }
-                    if let Some(surface) = self.graph_surfaces.get_mut(&target) {
-                        if resource > 0 {
-                            surface.resource_id = Some(resource);
-                        }
-                        traces.push(format!(
-                            "surface #{target} set node resource={resource} key={:?}",
-                            key
-                        ));
-                    }
-                    for trace in traces {
-                        self.trace_graph(trace);
-                    }
-                }
-                tracing::info!(args = ?summarize_values(&args), "GraphSetNodeResource");
             }
             (0x90, 0x3c) => {
                 let args = pop_args(stack, 2);
@@ -7506,194 +17307,54 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     -1 => None,
                     value => Some(value),
                 };
-                tracing::debug!(target, format_resource, "GraphSetObjectFormat");
-                trace_graph!(self, "object #{target} format resource={format_resource}");
+                tracing::debug!(target, format_resource, "GraphSetObjectHitMaskBitmap");
+                trace_graph!(self, "object #{target} hit-mask bitmap={format_resource}");
             }
             (0x90, 0x3d) => {
-                let target = stack.pop();
-                let target_id = target.as_ref().map(value_to_i32).unwrap_or_default();
-                let exists = self.graph_handle_exists(target_id);
-                tracing::debug!(?target, target_id, exists, "GraphHandleExists");
-                if exists || self.debug_graph {
-                    trace_graph!(self, "handle exists #{target_id} -> {exists}");
-                }
-                return Ok(ethornell_vm::Value::Int(i32::from(exists)));
-            }
-            (0x90, 0x43) => {
-                let args = pop_args(stack, 9);
-                self.apply_graph_rect_transition(&args);
-                tracing::info!(
-                    args = ?summarize_values(&args),
-                    "GraphRectTransition"
-                );
-            }
-            (0x90, 0x57) => {
-                let args = pop_args(stack, 2);
-                let destination = args.first().map(value_to_i32).unwrap_or_default();
-                let object = args.get(1).map(value_to_i32).unwrap_or_default();
-                let rendered = self.render_graph_object_to_bitmap(object, destination);
-                tracing::debug!(object, destination, rendered, "GraphRenderObjectToTarget");
-            }
-            (0x90, 0x58) => {
-                let args = pop_args(stack, 9);
-                let values = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                if values.len() == 9 {
-                    // funcs_48065E[0x58] -> sub_47C470 -> sub_462390.
-                    // In reverse-pop order this is
-                    // (blend, flags, alpha, multiplier, secondary, primary,
-                    //  y, x, node).
-                    let node = values[8];
-                    let primary_resource = values[5];
-                    let secondary_resource = values[4];
-                    if node > 0
-                        && self.resolve_graph_resource(primary_resource).is_some()
-                        && self.resolve_graph_resource(secondary_resource).is_some()
-                    {
-                        let x = values[7] as f32;
-                        let y = values[6] as f32;
-                        self.graph_transition_nodes.insert(
-                            node,
-                            RuntimeGraphTransitionNode {
-                                primary_resource,
-                                secondary_resource,
-                                alpha_parameter: values[2].clamp(0, 256),
-                            },
-                        );
-                        let key = self.update_transition_node_image(node);
-                        if let Some(key) = key {
-                            let (width, height) = self
-                                .graph_images
-                                .get(&key)
-                                .map(|image| (image.width as f32, image.height as f32))
-                                .unwrap_or_default();
-                            self.text_nodes.remove(&node);
-                            self.graph_layers.insert(
-                                node,
-                                RuntimeGraphLayer {
-                                    hit_id: node,
-                                    owner_object: self.current_graph_object,
-                                    key,
-                                    target_surface: None,
-                                    x,
-                                    y,
-                                    width,
-                                    height,
-                                    src_x: 0.0,
-                                    src_y: 0.0,
-                                    opacity: 1.0,
-                                    // sub_47C470 forwards the second reverse-pop
-                                    // value as the display object's priority.
-                                    z: values.get(1).copied().unwrap_or(NATIVE_DISPLAY_Z),
-                                    enabled: true,
-                                    transform_x: 0.0,
-                                    transform_y: 0.0,
-                                    transform_z: 0,
-                                    scale_x: 1.0,
-                                    scale_y: 1.0,
-                                    rotation_degrees: 0.0,
-                                    clip: None,
-                                },
-                            );
-                            if let Some(owner) = self.current_graph_object {
-                                self.graph_object_layers
-                                    .entry(owner)
-                                    .or_default()
-                                    .insert(node);
-                            }
-                            trace_graph!(
-                                self,
-                                "configure transition node #{node} primary=#{primary_resource} secondary=#{secondary_resource} alpha={} pos=({x:.0},{y:.0})",
-                                values[2].clamp(0, 256)
-                            );
-                        }
-                    }
-                }
-                tracing::info!(
-                    args = ?summarize_values(&args),
-                    "GraphNodeConfigureTransform"
-                );
-            }
-            (0x90, 0x5a) => {
-                let args = pop_args(stack, 10);
-                let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let alpha = ints
-                    .iter()
-                    .copied()
-                    .find(|value| (0..=256).contains(value))
-                    .map(|value| (value as f32 / 256.0).clamp(0.0, 1.0));
-                let targets = ints
-                    .iter()
-                    .copied()
-                    .filter(|value| {
-                        self.graph_layers.contains_key(value)
-                            || self.graph_object_layers.contains_key(value)
-                    })
-                    .collect::<Vec<_>>();
-                let mut changed = 0usize;
-                for target in targets {
-                    if let Some(layer_ids) = self.graph_object_layers.get(&target).cloned() {
-                        for layer_id in layer_ids {
-                            if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                                if let Some(alpha) = alpha {
-                                    layer.opacity = alpha;
-                                }
-                                changed += 1;
-                            }
-                        }
-                    }
-                    if let Some(layer) = self.graph_layers.get_mut(&target) {
-                        if let Some(alpha) = alpha {
-                            layer.opacity = alpha;
-                        }
-                        changed += 1;
-                    }
-                }
-                tracing::debug!(args = ?summarize_values(&args), alpha, changed, "GraphNodeDrawStateEx");
-                trace_graph!(
-                    self,
-                    "node draw state ex alpha={alpha:?} changed={changed} raw={ints:?}"
-                );
+                let object = pop_int_value(stack).unwrap_or_default();
+                let result = self.graph_object_pointer_hit(object).unwrap_or_default();
+                tracing::debug!(object, result, mouse = ?self.mouse_pos, "GraphHitTestObjectAtPointer");
+                return Ok(ethornell_vm::Value::Int(result));
             }
             (0x90, 0x82) => {
-                let args = pop_args(stack, 2);
-                if args.len() >= 2 {
-                    let surface_id = value_to_i32(&args[1]);
-                    let visible = value_to_i32(&args[0]) != 0;
-                    let trace = if let Some(surface) = self.graph_surfaces.get_mut(&surface_id) {
-                        surface.enabled = visible;
-                        Some(format!("surface #{} sys82 enabled={visible}", surface.id))
-                    } else {
-                        None
-                    };
-                    if let Some(trace) = trace {
-                        self.trace_graph(trace);
-                    }
+                let mode = pop_int_value(stack).unwrap_or_default();
+                let window = pop_int_value(stack).unwrap_or_default();
+                let order = match mode {
+                    0 => Some([0, 1, 2]),
+                    1 => Some([0, 2, 1]),
+                    2 => Some([1, 0, 2]),
+                    3 => Some([1, 2, 0]),
+                    4 => Some([2, 0, 1]),
+                    5 => Some([2, 1, 0]),
+                    _ => None,
+                };
+                let updated = order.is_some_and(|order| {
+                    Self::is_window_surface_handle(window)
+                        && self.graph_surfaces.get_mut(&window).is_some_and(|surface| {
+                            surface.composition_order = order;
+                            true
+                        })
+                });
+                tracing::info!(
+                    window,
+                    mode,
+                    ?order,
+                    updated,
+                    "GraphSetWindowCompositionOrder"
+                );
+                if updated {
+                    trace_graph!(self, "window #{window} composition-order={order:?}");
                 }
-                tracing::info!(?args, "GraphSys82");
             }
             (0x90, 0x19) => {
-                let args = pop_args(stack, 2);
-                let ints: Vec<i32> = args.iter().map(value_to_i32).collect();
-                if ints.len() >= 2 {
-                    let target = ints[1];
-                    let value = ints[0];
-                    let mut traces = Vec::new();
-                    if let Some(surface) = self.graph_surfaces.get_mut(&target) {
-                        surface.enabled = value != 0;
-                        traces.push(format!(
-                            "surface #{} sys19 enabled={}",
-                            surface.id, surface.enabled
-                        ));
-                    }
-                    if let Some(layer) = self.graph_layers.get_mut(&target) {
-                        layer.enabled = value != 0;
-                        traces.push(format!("layer #{} sys19 enabled={}", target, layer.enabled));
-                    }
-                    for trace in traces {
-                        self.trace_graph(trace);
-                    }
-                }
-                tracing::info!(?args, "GraphSys19");
+                // sub_479DA0 pops seven arguments before sub_4027E0 performs
+                // the three-resource bitmap synthesis.
+                let args = pop_args(stack, 7);
+                self.apply_native_bitmap_operation(
+                    &args,
+                    native_graph::NativeBitmapOperation::Composite,
+                );
+                tracing::info!(?args, "GraphBitmapSynthesis");
             }
             (0x90, 0x1e) => {
                 let args = pop_args(stack, 8);
@@ -7704,46 +17365,92 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 );
             }
             (0x90, 0x22) => {
+                // Target selector 0x22 dispatches to sub_47A790 ->
+                // sub_491B40 -> sub_431D10.  The executable ABI descriptor
+                // records seven source arguments: object, alpha, duration,
+                // update_denominator, update_numerator, input_enabled,
+                // input_descriptor.
                 let args = pop_args(stack, 7);
-                self.apply_graph_node_transition(&args);
+                let control_id = self.apply_graph_node_transition(&args)?;
+                if let Some(object) = args.last().map(value_to_i32) {
+                    call.start_graph_control_procedure(object, control_id);
+                }
                 tracing::info!(
                     args = ?summarize_values(&args),
-                    "GraphNodeApplyTransition"
+                    "GraphObjectTransitionEx"
                 );
             }
             (0x90, 0x23) => {
+                // Target sub_47A9B0: object, x, y, position_curve, alpha,
+                // duration, update_denominator, update_numerator,
+                // input_enabled, input_descriptor.
                 let args = pop_args(stack, 10);
-                let duration = args
-                    .iter()
-                    .map(value_to_i32)
-                    .filter(|value| (1..=10_000).contains(value))
-                    .max()
-                    .unwrap_or_default();
-                if duration > 0 {
-                    self.animation_queue_remaining = self
-                        .animation_queue_remaining
-                        .max(duration.unsigned_abs().div_ceil(16).max(1));
-                }
-                tracing::debug!(args = ?summarize_values(&args), duration, "GraphNodeTransitionEx");
-                trace_graph!(
-                    self,
-                    "node transition ex duration={duration} raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
-                );
+                let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
+                let [input_descriptor, input_enabled, update_numerator, update_denominator, duration_ms, target_transparency, position_curve, target_y, target_x, object] =
+                    ints.as_slice()
+                else {
+                    return Err(ethornell_vm::VmError::Runtime(
+                        "Graph90:23 expected ten arguments".to_string(),
+                    ));
+                };
+                let control_id = self.schedule_native_cdspobj_control(
+                    *object,
+                    Some((*target_x, *target_y)),
+                    *position_curve,
+                    *target_transparency,
+                    0,
+                    None,
+                    *duration_ms,
+                    *update_denominator,
+                    *update_numerator,
+                    *input_enabled != 0,
+                    *input_descriptor,
+                    "Graph90:23",
+                )?;
+                call.start_graph_control_procedure(*object, control_id);
+                tracing::info!(args = ?summarize_values(&args), "GraphNodeTransitionEx");
             }
+
             (0x90, 0x28) => {
                 let args = pop_args(stack, 12);
-                self.apply_graph_object_effect(&args);
-                self.frame_yield_requested = true;
+                let procedure_object =
+                    animation::ScheduledObjectControl::from_popped_args(&args)
+                        .map(|schedule| schedule.target_object);
+                let control_id = self.apply_graph_object_effect(&args)?;
+                if let Some(object) = procedure_object {
+                    call.start_graph_control_procedure(object, control_id);
+                }
                 tracing::debug!(
                     args = ?summarize_values(&args),
                     "GraphScheduleObjectControl"
                 );
             }
+            (0x90, 0x29) => {
+                // Normal VM dispatch intercepts 90:29 before call_graph so it
+                // can decode the guest point array and invoke
+                // GraphApi::call_graph_spline_control. Reaching this fallback
+                // would lose the exact CProcCtrlDspObjBC procedure identity.
+                let args = pop_args(stack, 12);
+                return Err(ethornell_vm::VmError::Runtime(format!(
+                    "Graph90:29 reached fallback dispatch without decoded spline points: {:?}",
+                    summarize_values(&args)
+                )));
+            }
             (0x90, 0x98) => {
                 let resource_table = stack.pop();
                 let frame_count = pop_int_value(stack).unwrap_or_default();
-                tracing::info!(frame_count, ?resource_table, "GraphConfigureCaretFrames");
+                let resource_table_pointer = resource_table
+                    .as_ref()
+                    .map(value_to_i32)
+                    .unwrap_or_default();
+                self.graph_defaults.caret_frame_count = frame_count;
+                self.graph_defaults.caret_frame_table_pointer = resource_table_pointer;
+                self.graph_defaults.caret_frames.clear();
+                tracing::info!(
+                    frame_count,
+                    resource_table_pointer,
+                    "GraphConfigureMessageCaretFrames"
+                );
             }
             (0x90, 0x99) => {
                 let delay_ms = pop_int_value(stack).unwrap_or_default();
@@ -7765,95 +17472,94 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::info!(x, y, alpha, "GraphSetTextShadowParameters");
             }
             (0x90, 0xf6) => {
-                let args = pop_args(stack, 5);
-                let snapshot = self.graph_animations.evaluate(&args);
-                if let Some(snapshot) = &snapshot {
-                    self.animation_queue_remaining = self
-                        .animation_queue_remaining
-                        .max(snapshot.remaining_frames.max(u32::from(snapshot.active)));
-                    trace_graph!(self,
-                        "graph transition evaluate handle=#{} active={} remaining={} released={} raw={:?} record={:?}",
-                        snapshot.handle,
-                        snapshot.active,
-                        snapshot.remaining_frames,
-                        snapshot.released,
-                        args.iter().map(value_to_i32).collect::<Vec<_>>(),
-                        snapshot.args
-                    );
-                } else {
-                    trace_graph!(
-                        self,
-                        "graph transition evaluate raw={:?}",
-                        args.iter().map(value_to_i32).collect::<Vec<_>>()
-                    );
-                }
-                tracing::debug!(args = ?summarize_values(&args), ?snapshot, "GraphTransitionEvaluate");
-            }
-            (0x91, 0xf1) => {
-                let args = pop_args(stack, 2);
-                let handle = args.first().map(value_to_i32).unwrap_or_default();
-                let duration = args.get(1).map(value_to_i32).unwrap_or_default();
-                self.graph_animations.start(handle, duration, &args);
-                let frames = duration.unsigned_abs().div_ceil(16).max(1);
-                self.animation_queue_remaining = self.animation_queue_remaining.max(frames);
-                trace_graph!(self,
-                    "graph animation start handle=#{handle} duration={duration} frames={frames} raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
+                // Source ABI is [destination bitmap, BF_Movie handle, frame].
+                // pop_args therefore yields [frame, source, destination].
+                let args = pop_args(stack, 3);
+                let frame_index = args.first().map(value_to_i32).unwrap_or_default();
+                let source = args.get(1).map(value_to_i32).unwrap_or_default();
+                let destination = args.get(2).map(value_to_i32).unwrap_or_default();
+                let destination_info =
+                    self.bitmap_dimensions
+                        .get(&destination)
+                        .map(|&(width, height)| {
+                            let format = self
+                                .bitmap_formats
+                                .get(&destination)
+                                .copied()
+                                .unwrap_or_default();
+                            (width, height, format)
+                        });
+                let status =
+                    self.graph_buriko_movies
+                        .validate_decode(destination_info, source, frame_index);
+                tracing::debug!(
+                    destination,
+                    source,
+                    frame_index,
+                    status,
+                    "DecodeBurikoMovieFrame"
                 );
-                tracing::debug!(args = ?summarize_values(&args), handle, duration, "GraphAnimationStart");
-            }
-            (0x91, 0xf2) => {
-                let handle = pop_int_value(stack).unwrap_or_default();
-                self.graph_animations.cancel(handle);
-                trace_graph!(self, "graph animation cancel handle=#{handle}");
-                tracing::debug!(handle, "GraphAnimationCancel");
-            }
-            (0x91, 0xf6) => {
-                let handle = pop_int_value(stack).unwrap_or_default();
-                self.graph_animations.release(handle);
-                trace_graph!(self, "graph animation release handle=#{handle}");
-                tracing::debug!(handle, "GraphAnimationRelease");
+                if status == 6 {
+                    // The public contract is valid but the proprietary decoder
+                    // is not implemented. Preserve target status 6 at the
+                    // synchronous boundary, or through DCProcDecodeBMV when the
+                    // VM selected the target asynchronous branch.
+                    call.complete_procedure_with_output(
+                        ethornell_vm::native_call::NativeProcedureClass::DecodeBurikoMovie,
+                        status,
+                        status,
+                    );
+                    return Ok(ethornell_vm::Value::None);
+                }
+                return Ok(ethornell_vm::Value::Int(status));
             }
             (0x92, 0xf1) => {
-                let args = pop_args(stack, 5);
-                tracing::debug!(args = ?summarize_values(&args), "GraphTransitionLoad");
-                trace_graph!(
-                    self,
-                    "graph transition load raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
-                );
-                return Ok(ethornell_vm::Value::Int(0));
+                // The VM owns both output pointers and installs the recovered
+                // DCProcLoadBurikoMV/DCProcLoadBMVHeader procedure boundary.
+                unreachable!("0x92:F1 is handled by the VM BF_Movie pointer bridge");
             }
             (0x92, 0xf2) => {
-                // sub_486D30 pops exactly five arguments. In reverse-pop order
-                // these are (option2, option1, resource, archive, handle).
+                // Source ABI is [bitmap, archive, resource, looping, volume].
+                // pop_args therefore yields [volume, looping, resource, archive, bitmap].
                 let args = pop_args(stack, 5);
-                let handle = args.get(4).map(value_to_i32).unwrap_or_default();
+                let volume = args.first().map(value_to_i32).unwrap_or_default();
+                let looping = args.get(1).map(value_to_i32).unwrap_or_default() != 0;
                 let resource = args.get(2).and_then(value_to_string).unwrap_or_default();
                 let archive = args.get(3).and_then(value_to_string).unwrap_or_default();
-                let bytes = read_runtime_bytes(&self.manager, &archive, &resource);
-                let status = bytes.as_deref().map_or(4, |bytes| {
-                    self.graph_effects.configure_media(
-                        handle,
+                let bitmap = args.get(4).map(value_to_i32).unwrap_or_default();
+                let status = if !(0..0x4000).contains(&bitmap) {
+                    4
+                } else if !(0..=128).contains(&volume) {
+                    3
+                } else if let Some(bytes) = read_runtime_bytes(&self.manager, &archive, &resource) {
+                    let configured = self.graph_effects.configure_media(
+                        bitmap,
                         archive.clone(),
                         resource.clone(),
-                        bytes,
-                    )
-                });
-                let source = format!("{archive}:{resource}");
-                let duration = self.graph_effects.duration_ms(handle);
-                trace_graph!(
-                    self,
-                    "graph effect configure handle=#{handle} status={status} duration_ms={duration} source={source} raw={:?}",
-                    args.iter().map(value_to_i32).collect::<Vec<_>>()
-                );
+                        &bytes,
+                    );
+                    if configured == 0 {
+                        let options = self
+                            .graph_effects
+                            .set_movie_options(bitmap, looping, volume);
+                        if options == 0 {
+                            self.graph_process_handles.insert(bitmap);
+                        }
+                        options
+                    } else {
+                        configured
+                    }
+                } else {
+                    2
+                };
                 tracing::debug!(
-                    args = ?summarize_values(&args),
-                    handle,
-                    source,
-                    duration,
+                    bitmap,
+                    archive,
+                    resource,
+                    looping,
+                    volume,
                     status,
-                    "GraphEffectConfigureMedia"
+                    "Graph92OpenBitmapDirectShowMovie"
                 );
                 return Ok(ethornell_vm::Value::Int(status));
             }
@@ -7873,6 +17579,22 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     self,
                     "graph effect seek handle=#{handle} position_ms={position_ms} status={status} raw={:?}",
                     args.iter().map(value_to_i32).collect::<Vec<_>>()
+                );
+                return Ok(ethornell_vm::Value::Int(status));
+            }
+            (0x92, 0xf6) => {
+                // sub_486F10 -> sub_408650 forwards the movie bitmap and the
+                // native 0..=128 DirectShow volume.
+                let args = pop_args(stack, 2);
+                let volume = args.first().map(value_to_i32).unwrap_or_default();
+                let handle = args.get(1).map(value_to_i32).unwrap_or_default();
+                let status = self.graph_effects.set_volume(handle, volume);
+                tracing::debug!(
+                    args = ?summarize_values(&args),
+                    handle,
+                    volume,
+                    status,
+                    "MovieSetBitmapVolume"
                 );
                 return Ok(ethornell_vm::Value::Int(status));
             }
@@ -8072,232 +17794,317 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
 
     fn poll_object_state_record(&mut self, object: i32) -> [i32; 6] {
         if let Some(input) = self.graph_input_objects.get(&object) {
-            let hit = self
-                .mouse_pos
-                .and_then(|point| self.hit_test_graph_input_object(object, point))
-                .or_else(|| {
-                    self.pending_object_state
-                        .and_then(|point| self.hit_test_graph_input_object(object, point))
-                });
-            return input.state_record(hit);
+            // Graph90:BC is target sub_46CC00 -> sub_4484C0: a pure read of
+            // six fields.  It must never hit-test, consume a host input edge,
+            // mutate hover/current selection, or advance the processor.
+            let state = input.state_record();
+            tracing::debug!(
+                target: "graph_input",
+                object,
+                running = state[0],
+                group = state[1],
+                item = state[2],
+                action_state = state[3],
+                local_x = state[4],
+                local_y = state[5],
+                "Graph90:BC icon input state"
+            );
+            if state[0] == 0 || state[1] != -1 || state[2] != -1 || state[3] != 0 {
+                tracing::info!(
+                    target: "graph_input",
+                    object,
+                    running = state[0],
+                    group = state[1],
+                    item = state[2],
+                    action_state = state[3],
+                    local_x = state[4],
+                    local_y = state[5],
+                    "Graph90:BC non-idle activation state"
+                );
+            }
+            return state;
         }
         [self.poll_object_state(object), 0, 0, 0, 0, 0]
     }
 
     fn poll_object_event_record(&mut self, object: i32) -> [i32; 3] {
-        if let Some(event) = self
-            .graph_input_objects
-            .get_mut(&object)
-            .and_then(RuntimeGraphInputObject::pop_event)
-        {
-            self.observe_title_graph_event(event);
-            tracing::debug!(
-                target: "graph_input",
-                object,
-                code = format_args!("0x{:08X}", event[0]),
-                payload = format_args!("0x{:08X}", event[1]),
-                parameter = format_args!("0x{:08X}", event[2]),
-                "return queued graph input event"
-            );
-            tracing::info!(
-                object,
-                code = format_args!("0x{:08X}", event[0]),
-                payload = format_args!("0x{:08X}", event[1]),
-                parameter = format_args!("0x{:08X}", event[2]),
-                "poll queued graph input event"
-            );
-            return event;
-        }
-        if self
-            .graph_input_objects
-            .get(&object)
-            .is_some_and(|input| !input.descriptor.regions.is_empty())
-        {
-            let state_point = self.pending_object_state.or(self.mouse_pos);
-            let state_hit =
-                state_point.and_then(|point| self.hit_test_graph_input_object(object, point));
-            if self.pending_object_state.is_some() || self.pending_click.is_some() {
-                let input_layer = self
-                    .graph_input_objects
-                    .get(&object)
-                    .map(|input| input.layer);
-                let origin = input_layer
-                    .and_then(|layer| self.graph_surfaces.get(&layer))
-                    .map(|surface| (surface.x, surface.y));
-                tracing::debug!(
-                    target: "graph_input",
-                    object,
-                    ?input_layer,
-                    ?origin,
-                    ?state_point,
-                    hit = ?state_hit.as_ref().map(|(region, x, y)| (region.group, region.index, *x, *y)),
-                    pressed = self.mouse_pressed,
-                    pending_release = self.pending_click.is_some(),
-                    "poll graph input point"
-                );
-            }
-            let previous_hover = self
+        if self.graph_input_objects.contains_key(&object) {
+            // Graph90:BF is target sub_46CC70 -> sub_448560: copy one queue
+            // head and destructively remove it.  It never performs hit-tests,
+            // advances DCIPIcon, or synthesizes host press/release records.
+            let event = self
                 .graph_input_objects
-                .get(&object)
-                .and_then(|input| input.hovered);
-
-            if let Some((region, local_x, local_y)) = state_hit {
-                let key = (region.group, region.index);
-                if previous_hover != Some(key) || self.pending_object_state.is_some() {
-                    if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                        input.hovered = Some(key);
-                    }
-                    self.pending_object_state = None;
-                    self.last_hit_control = pack_words(region.group, region.index);
-                    self.last_hit_payload = region.index;
-                    let event = [
-                        0x1000_0007,
-                        pack_words(region.group, region.index),
-                        pack_words(local_y, local_x),
-                    ];
-                    if self.pending_click.is_some() {
-                        let release_payload = self.apply_title_graph_payload_override(event[1]);
-                        let release = [0x1000_0006, release_payload, 0];
-                        if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                            input.queue_event(release);
-                            input.complete(region, local_x, local_y);
-                        }
-                        self.pending_click = None;
-                        self.pending_click_age_frames = 0;
-                        self.pending_input_state = None;
-                        self.pending_input_descriptor = None;
-                        self.pending_input_consumed = false;
-                        self.mouse_pressed = false;
-                        self.auto_title_release_after_state = false;
-                    }
-                    tracing::info!(
-                        object,
-                        code = format_args!("0x{:08X}", event[0]),
-                        payload = format_args!("0x{:08X}", event[1]),
-                        parameter = format_args!("0x{:08X}", event[2]),
-                        "poll graph input event"
-                    );
-                    tracing::debug!(
-                        target: "graph_input",
-                        object,
-                        code = format_args!("0x{:08X}", event[0]),
-                        payload = format_args!("0x{:08X}", event[1]),
-                        parameter = format_args!("0x{:08X}", event[2]),
-                        "return graph input hover event"
-                    );
-                    return event;
-                }
-            } else if previous_hover.is_some() {
-                if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                    input.hovered = None;
-                }
-                let event = [0x1000_0006, -1, 0];
+                .get_mut(&object)
+                .and_then(RuntimeGraphInputObject::pop_event)
+                .unwrap_or([0; 3]);
+            if event != [0; 3] {
+                self.observe_title_graph_event(event);
                 tracing::debug!(
                     target: "graph_input",
                     object,
                     code = format_args!("0x{:08X}", event[0]),
-                    payload = event[1],
-                    "return graph input leave event"
+                    payload = format_args!("0x{:08X}", event[1]),
+                    parameter = format_args!("0x{:08X}", event[2]),
+                    "return queued graph input event"
                 );
-                return event;
+                tracing::info!(
+                    object,
+                    code = format_args!("0x{:08X}", event[0]),
+                    payload = format_args!("0x{:08X}", event[1]),
+                    parameter = format_args!("0x{:08X}", event[2]),
+                    "poll queued graph input event"
+                );
             }
-
-            if let Some(point) = self.pending_click {
-                let hit = self.hit_test_graph_input_object(object, point);
-                if let Some((region, local_x, local_y)) = hit {
-                    // Graph input objects are polled independently. A miss on
-                    // one object must not consume the host click before the
-                    // object under the pointer gets its turn.
-                    self.pending_click = None;
-                    self.pending_click_age_frames = 0;
-                    self.pending_object_state = None;
-                    self.pending_input_state = None;
-                    self.pending_input_descriptor = None;
-                    self.pending_input_consumed = false;
-                    self.mouse_pressed = false;
-                    self.auto_title_release_after_state = false;
-                    let packed = pack_words(region.group, region.index);
-                    self.last_hit_control = packed;
-                    self.last_hit_payload = region.index;
-                    if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                        input.complete(region, local_x, local_y);
-                    }
-                    let packed = self.apply_title_graph_payload_override(packed);
-                    let event = [0x1000_0006, packed, 0];
-                    self.observe_title_graph_event(event);
-                    tracing::debug!(
-                        target: "graph_input",
-                        object,
-                        code = format_args!("0x{:08X}", event[0]),
-                        payload = format_args!("0x{:08X}", event[1]),
-                        parameter = format_args!("0x{:08X}", event[2]),
-                        "return graph input click event"
-                    );
-                    tracing::info!(
-                        object,
-                        code = format_args!("0x{:08X}", event[0]),
-                        payload = format_args!("0x{:08X}", event[1]),
-                        parameter = format_args!("0x{:08X}", event[2]),
-                        "poll graph input event"
-                    );
-                    return event;
-                }
-            }
-            return [0; 3];
+            return event;
         }
         let (event, payload) = self.poll_object_event_payload(object);
         [event, payload, 0]
     }
+
+    fn graph_window_exists(&self, window: i32) -> bool {
+        Self::is_window_surface_handle(window) && self.graph_surfaces.contains_key(&window)
+    }
+
+    fn graph_input_object_exists(&self, object: i32) -> bool {
+        self.graph_input_objects.contains_key(&object)
+    }
+
+    fn graph_input_object_is_extended(&self, object: i32) -> bool {
+        self.graph_input_objects
+            .get(&object)
+            .map(|input| input.extended)
+            .unwrap_or(false)
+    }
+
+    fn set_graph_input_item_state(
+        &mut self,
+        object: i32,
+        group: i32,
+        index: i32,
+        state: i32,
+    ) -> i32 {
+        let Some(input) = self.graph_input_objects.get_mut(&object) else {
+            return 1;
+        };
+        match input.set_item_state(group, index, state) {
+            Ok(()) => 0,
+            Err(status) => status,
+        }
+    }
+
+    fn set_graph_key_assignment(&mut self, assignment: i32, values: [i32; 24]) -> bool {
+        let Ok(index) = usize::try_from(assignment.saturating_sub(4)) else {
+            return false;
+        };
+        let Some(slot) = self.graph_key_assignments.get_mut(index) else {
+            return false;
+        };
+        *slot = Some(values);
+        true
+    }
+
+    fn graph_input_registered_state(&self, object: i32) -> Option<i32> {
+        self.graph_input_objects
+            .get(&object)
+            .map(|input| input.registered_state)
+    }
+
+    fn graph_input_region_values(&self, object: i32) -> Option<Vec<i32>> {
+        self.graph_input_objects
+            .get(&object)
+            .map(RuntimeGraphInputObject::selected_region_values)
+    }
 }
 
 impl ethornell_vm::SoundApi for RuntimeTraceApi {
+    fn register_memory_sound(
+        &mut self,
+        channel: i32,
+        block: &[u8],
+        native_start_parameter: i32,
+        decode_gain: f64,
+        playback_rate: f64,
+    ) -> bool {
+        self.register_native_sound_memory(
+            channel,
+            block,
+            native_start_parameter,
+            decode_gain,
+            playback_rate,
+        )
+    }
+
+    fn query_bgm_state(&self, channel: i32) -> Option<(i32, i32)> {
+        Some((self.bgm_status(channel), self.bgm_position(channel)))
+    }
+
+    fn query_cd_audio_mode(&self) -> Option<i32> {
+        self.query_native_cd_audio_mode()
+    }
+
     fn current_user_text(&self) -> String {
         self.native_user.text.clone()
     }
 
-    fn configure_user_polygon(&mut self, handle: i32, mode: i32, points: &[[i32; 3]]) -> i32 {
-        self.native_effect.polygons.insert(
-            handle,
-            native_effect::NativePolygon {
-                mode,
-                points: points.to_vec(),
-            },
-        );
-        0
+    fn show_user_dialog(
+        &mut self,
+        request: ethornell_vm::UserDialogRequest,
+    ) -> Option<ethornell_vm::UserDialogResponse> {
+        use ethornell_vm::{UserDialogRequest, UserDialogResponse};
+        use host_dialog::TextInputConstraint;
+
+        match request {
+            UserDialogRequest::Input {
+                title,
+                initial,
+                max_bytes,
+                numeric,
+            } => host_dialog::prompt_text(
+                &title,
+                &title,
+                &initial,
+                max_bytes,
+                if numeric {
+                    TextInputConstraint::SignedDecimal
+                } else {
+                    TextInputConstraint::Any
+                },
+            )
+            .map(UserDialogResponse::Input),
+            UserDialogRequest::TwoField {
+                title,
+                first_label,
+                first_initial,
+                first_max_bytes,
+                first_numeric,
+                second_label,
+                second_initial,
+                second_max_bytes,
+                second_numeric,
+            } => host_dialog::prompt_two_fields(
+                &title,
+                &first_label,
+                &first_initial,
+                first_max_bytes,
+                if first_numeric {
+                    TextInputConstraint::SignedDecimal
+                } else {
+                    TextInputConstraint::Any
+                },
+                &second_label,
+                &second_initial,
+                second_max_bytes,
+                if second_numeric {
+                    TextInputConstraint::SignedDecimal
+                } else {
+                    TextInputConstraint::Any
+                },
+            )
+            .map(UserDialogResponse::TwoField),
+            UserDialogRequest::Segmented {
+                title,
+                prompt,
+                segment_count,
+                max_bytes_per_segment,
+                numeric,
+            } => host_dialog::prompt_segmented(
+                &title,
+                &prompt,
+                segment_count,
+                max_bytes_per_segment,
+                if numeric {
+                    TextInputConstraint::SignedDecimal
+                } else {
+                    TextInputConstraint::Alphanumeric
+                },
+            )
+            .map(UserDialogResponse::Segmented),
+            UserDialogRequest::Selection {
+                title,
+                prompt,
+                options,
+            } => host_dialog::choose_item(&title, &prompt, &options)
+                .map(UserDialogResponse::Selection),
+            UserDialogRequest::DateFields {
+                fields,
+                month_index,
+                day_index,
+            } => host_dialog::prompt_date_fields("Date", fields, month_index, day_index).map(
+                |(fields, month_index, day_index)| UserDialogResponse::DateFields {
+                    fields,
+                    month_index,
+                    day_index,
+                },
+            ),
+        }
     }
 
-    fn query_user_polygon(&self, handle: i32, index: i32) -> Option<[i32; 3]> {
-        let polygon = self.native_effect.polygons.get(&handle)?;
-        let _mode = polygon.mode;
-        polygon.points.get(usize::try_from(index).ok()?).copied()
+    fn configure_particle_frame_tables(
+        &mut self,
+        handle: i32,
+        first: &[i32],
+        second: &[i32],
+    ) -> bool {
+        self.native_effect
+            .configure_particle_frame_tables(handle, first, second)
     }
 
-    fn observe_user(&mut self, group: u8, id: u16, stack: &[ethornell_vm::Value]) {
-        self.observe_user_control(group, id, stack);
-        self.observe_user_message(group, id, stack);
+    fn user_spline_exists(&self, handle: i32) -> bool {
+        self.native_effect.spline_exists(handle)
+    }
+
+    fn configure_user_spline(&mut self, handle: i32, duration: i32, points: &[[i32; 3]]) -> i32 {
+        self.native_effect
+            .configure_spline(handle, duration, points)
+    }
+
+    fn sample_user_spline(&self, handle: i32, time: i32) -> std::result::Result<[i32; 3], i32> {
+        self.native_effect.sample_spline(handle, time)
+    }
+
+    fn create_user_modeless_dialog(&mut self, initial: [i32; 9]) -> Option<i32> {
+        RuntimeTraceApi::create_user_modeless_dialog(self, initial)
+    }
+
+    fn close_user_modeless_dialog(&mut self, handle: i32) -> bool {
+        RuntimeTraceApi::close_user_modeless_dialog(self, handle)
+    }
+
+    fn set_user_modeless_dialog_visible(&mut self, handle: i32, visible: bool) -> bool {
+        RuntimeTraceApi::set_user_modeless_dialog_visible(self, handle, visible)
+    }
+
+    fn poll_user_modeless_dialog(
+        &mut self,
+        handle: i32,
+    ) -> std::result::Result<Option<[i32; 2]>, ()> {
+        RuntimeTraceApi::poll_user_modeless_dialog(self, handle)
+    }
+
+    fn observe_user(&mut self, call: &ethornell_vm::NativeCallFrame) {
+        self.observe_user_control(call.group(), call.id(), call.args());
+        self.observe_user_message(call.group(), call.id(), call.args());
     }
 
     fn call_user(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<Option<ethornell_vm::Value>> {
-        if let Some(result) = self.dispatch_native_user(group, id, stack) {
+        if let Some(result) = self.dispatch_native_user(call) {
             return result.map(Some);
         }
-        self.call_user_control(group, id, stack)
+        self.call_user_control(call)
     }
 
     fn call_sound(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
-        if let Some(result) = self.dispatch_native_sound(group, id, stack) {
+        if let Some(result) = self.dispatch_native_sound(call) {
             return result;
         }
+        let (group, id) = (call.group(), call.id());
+        let stack = call.args_mut();
         let consumed_args = consume_fallback_args(group, id, stack);
         self.runtime_stubbed = true;
         tracing::warn!(
@@ -8491,7 +18298,11 @@ fn is_title_base_layer(key: &str) -> bool {
 }
 
 fn is_boot_suppressed_layer(key: &str) -> bool {
-    key.starts_with("sysgrp.arc:SGMsgWnd") || key == "sysgrp.arc:caret"
+    // SGMsgWnd resources are ordinary native CDspObj/Window resources.  The
+    // old bring-up renderer suppressed the whole prefix before scenario boot,
+    // which can erase the real message chrome while sysprg is already building
+    // it.  Synthetic message layers have dedicated ids and their own gates.
+    key == "sysgrp.arc:caret"
 }
 
 fn is_scene_transition_resource(key: &str) -> bool {
@@ -8506,12 +18317,6 @@ fn is_primary_title_control(control: &RuntimeUserControl) -> bool {
     control.title_only
 }
 
-fn is_default_hidden_object_state(key: &str) -> bool {
-    key.starts_with("sysgrp.arc:SGMsgWnd000001")
-        || key.starts_with("sysgrp.arc:SGMsgWnd000002")
-        || key.starts_with("sysgrp.arc:SGMsgWnd000003")
-}
-
 fn find_runtime_resource(
     manager: &ResourceManager,
     archive: &str,
@@ -8519,7 +18324,14 @@ fn find_runtime_resource(
 ) -> Option<ethornell_archive::ResourceEntry> {
     let archive = archive.trim();
     if is_empty_archive_arg(archive) {
-        manager.find(file)
+        (!file.trim().is_empty())
+            .then(|| manager.find(file))
+            .flatten()
+    } else if file.trim().is_empty() {
+        // Target sub_406AF0 accepts an empty entry name and resolves the first
+        // entry in the named archive. Small data archives such as
+        // data10000.arc rely on this to expose their sole SDC payload.
+        manager.first_in_archive(archive)
     } else {
         manager
             .find_in_archive(archive, file)
@@ -8532,22 +18344,14 @@ fn find_wildcard_archive_resource(
     archive: &str,
     file: &str,
 ) -> Option<ethornell_archive::ResourceEntry> {
-    if !archive.contains("xxx") {
+    if !archive.to_ascii_lowercase().contains("xxx") {
         return None;
     }
-    let (prefix, suffix) = archive.split_once("xxx")?;
-    manager.list().into_iter().find(|entry| {
-        entry.entry_name.eq_ignore_ascii_case(file)
-            && entry
-                .archive_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| {
-                    let name = name.to_ascii_lowercase();
-                    name.starts_with(&prefix.to_ascii_lowercase())
-                        && name.ends_with(&suffix.to_ascii_lowercase())
-                })
-                .unwrap_or(false)
+    manager.archives().archives.iter().find_map(|candidate| {
+        let name = candidate.path.file_name()?.to_str()?;
+        bgi_xxx_pattern_matches(archive, name)
+            .then(|| manager.find_in_archive(name, file))
+            .flatten()
     })
 }
 
@@ -8833,31 +18637,69 @@ fn run_headless(
         .filter(|value| *value > 0)
         .unwrap_or(600);
     tracing::info!(
-        vm_slices_per_frame = frame_pacing.vm_slices_per_frame,
-        bootstrap_vm_slices_per_frame = frame_pacing.bootstrap_vm_slices_per_frame,
-        continue_after_yield = frame_pacing.continue_after_yield,
+        scheduler_passes_per_native_tick = 1,
         realtime,
         max_frames,
-        "headless frame pacing configured"
+        "headless cooperative scheduler configured"
     );
     let mut input_script = HeadlessInputScript::from_env();
+    let mut pending_input_events = VecDeque::new();
     if input_script.is_some() {
         tracing::info!("headless input script loaded");
     }
 
-    let frame_interval = Duration::from_millis(16);
+    let frame_interval = Duration::from_millis(NATIVE_TICK_MS);
+    let snapshot_path = std::env::var_os("ETHORNELL_HEADLESS_SNAPSHOT").map(PathBuf::from);
+    let snapshot_frame = std::env::var("ETHORNELL_HEADLESS_SNAPSHOT_FRAME")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let mut frame_snapshot_written = false;
+    let mut latest_framebuffer = None;
+    let mut previous_native_calls = runtime
+        .as_ref()
+        .map(|runtime| runtime.api.total_native_calls)
+        .unwrap_or_default();
     let mut next_frame = Instant::now();
     let mut runtime_failure = None;
     for frame in 0..max_frames {
         if let Some(runtime) = runtime.as_mut() {
-            if let Some(script) = input_script.as_mut() {
-                if let Some(event) = script.tick() {
-                    apply_headless_input_event(&mut runtime.api, event);
+            let frame_report = runtime_frontend::drive_runtime_frame(
+                runtime,
+                &mut pending_input_events,
+                &mut input_script,
+                frame_pacing,
+                NATIVE_TICK_MS,
+                NATIVE_TICK_MS,
+                audio.as_mut(),
+                "headless",
+            );
+            let last_report = frame_report.last_report;
+            let frame_native_calls = runtime
+                .api
+                .total_native_calls
+                .wrapping_sub(previous_native_calls);
+            previous_native_calls = runtime.api.total_native_calls;
+            // Headless differs from the window frontend only at final
+            // presentation: every logical frame still traverses the shared
+            // render tree and produces a complete offscreen framebuffer.
+            let frame_composition =
+                snapshot::compose_runtime_frame_with_diagnostics(&runtime.api, true);
+            if snapshot_frame == Some(frame) {
+                if let Some(path) = snapshot_path.as_ref() {
+                    snapshot::write_composed_runtime_snapshot(
+                        &runtime.api,
+                        &frame_composition.framebuffer,
+                        path,
+                    )?;
+                    frame_snapshot_written = true;
+                    tracing::info!(
+                        frame,
+                        path = %path.display(),
+                        "headless frame snapshot written"
+                    );
                 }
             }
-            let frame_report = runtime.run_frame(frame_pacing, 16);
-            let last_report = frame_report.last_report;
-            if runtime.api.debug_graph || frame % 60 == 0 {
+            if runtime.api.debug_graph || runtime.api.trace_render_tree || frame % 60 == 0 {
                 let report = last_report.as_ref();
                 tracing::info!(
                     frame,
@@ -8866,16 +18708,22 @@ fn run_headless(
                     pc = report.map(|report| report.pc),
                     offset = ?report.and_then(|report| report.offset),
                     reason = ?report.map(|report| &report.stop_reason),
-                    slices_this_frame = frame_report.slices_this_frame,
-                    continue_setup_yield = frame_report.continue_setup_yield,
-                    continue_input_yield = frame_report.continue_input_yield,
+                    scheduler_passes = frame_report.scheduler_passes,
+                    native_calls = frame_native_calls,
+                    last_native_call = runtime
+                        .api
+                        .last_native_call
+                        .map(ethornell_vm::native_display_name),
                     yield_blockers = ?runtime.api.vm_after_yield_blockers(),
                     stack = runtime.vm.stack.len(),
-                    draw_items = runtime.api.graph_draw_items().len(),
+                    render_tree_nodes = frame_composition.render_tree_nodes,
+                    framebuffer_hash = format_args!(
+                        "{:016x}",
+                        frame_composition.framebuffer_hash
+                    ),
                     text_nodes = runtime.api.text_nodes.len(),
                     graph_images = runtime.api.graph_images.len(),
                     animations = runtime.api.layer_animations.active_count(),
-                    animation_queue_remaining = runtime.api.animation_queue_remaining,
                     audio_pending = runtime.api.audio_requests.len(),
                     scenario_code_base = format_args!(
                         "0x{:08X}",
@@ -8889,7 +18737,7 @@ fn run_headless(
                 );
                 runtime.api.trace_render_snapshot(frame, report);
                 if let Some(report) = report {
-                    if report.stop_reason == ethornell_vm::VmStopReason::Error {
+                    if report.stop_reason.is_fatal() {
                         tracing::warn!(
                             recent_trace = ?report.recent_trace,
                             "headless runtime VM halted with error"
@@ -8897,10 +18745,11 @@ fn run_headless(
                     }
                 }
             }
+            latest_framebuffer = Some(frame_composition.framebuffer);
             if runtime.options.fail_on_stub
                 && last_report
                     .as_ref()
-                    .is_some_and(|report| report.stop_reason == ethornell_vm::VmStopReason::Error)
+                    .is_some_and(|report| report.stop_reason.is_fatal())
             {
                 let report = last_report.as_ref().expect("checked above");
                 runtime_failure = Some(format!(
@@ -8911,9 +18760,6 @@ fn run_headless(
             if runtime.api.quit_requested {
                 tracing::info!(frame, "headless quit event received");
                 break;
-            }
-            while let Some(request) = runtime.api.audio_requests.pop_front() {
-                execute_audio_command(audio.as_mut(), request, "headless");
             }
             if runtime.vm.halted {
                 tracing::info!(
@@ -8937,12 +18783,15 @@ fn run_headless(
             }
         }
     }
-    if let (Some(path), Some(runtime)) = (
-        std::env::var_os("ETHORNELL_HEADLESS_SNAPSHOT").map(PathBuf::from),
-        runtime.as_ref(),
-    ) {
-        snapshot::write_runtime_snapshot(&runtime.api, &path)?;
-        tracing::info!(path = %path.display(), "headless snapshot written");
+    if !frame_snapshot_written {
+        if let (Some(path), Some(runtime)) = (snapshot_path, runtime.as_ref()) {
+            if let Some(framebuffer) = latest_framebuffer.as_ref() {
+                snapshot::write_composed_runtime_snapshot(&runtime.api, framebuffer, &path)?;
+            } else {
+                snapshot::write_runtime_snapshot(&runtime.api, &path)?;
+            }
+            tracing::info!(path = %path.display(), "headless snapshot written");
+        }
     }
     if let Some(runtime) = runtime.as_ref() {
         runtime.api.write_call_coverage_if_requested();
@@ -8971,6 +18820,9 @@ fn run_window(
     let window: &'static winit::window::Window = Box::leak(Box::new(window));
 
     let mut renderer = pollster::block_on(Renderer::new(window))?;
+    if let Some(runtime) = runtime.as_mut() {
+        runtime.api.graphics_memory_metric = renderer.graphics_memory_metric();
+    }
     let mut _audio = AudioSystem::new()?;
     if runtime.is_none() {
         if let Some(bgm) = bgm {
@@ -8987,22 +18839,24 @@ fn run_window(
     let mut graph_textures: BTreeMap<String, CachedGraphTexture> = BTreeMap::new();
     let image_size = image.as_ref().map(|image| (image.width, image.height));
     let mut cursor_surface_pos: Option<(f32, f32)> = None;
+    let mut pending_input_events = VecDeque::new();
     if let Some(text) = &text {
         tracing::info!(%text, "text overlay requested");
     }
 
-    let frame_interval = Duration::from_millis(16);
+    let frame_interval = Duration::from_millis(NATIVE_TICK_MS);
     let frame_pacing = RuntimeFramePacing::from_env();
     tracing::info!(
-        vm_slices_per_frame = frame_pacing.vm_slices_per_frame,
-        bootstrap_vm_slices_per_frame = frame_pacing.bootstrap_vm_slices_per_frame,
-        continue_after_yield = frame_pacing.continue_after_yield,
-        "runtime frame pacing configured"
+        scheduler_passes_per_native_tick = 1,
+        "runtime cooperative scheduler configured"
     );
     let mut next_frame = Instant::now();
-    let mut last_frame_at = next_frame
-        .checked_sub(frame_interval)
-        .unwrap_or(next_frame);
+    // Derive deltas from an absolute millisecond clock. Converting every
+    // individual 16.67 ms frame with `Duration::as_millis()` drops the
+    // fractional remainder forever and makes a 60 Hz frontend run ~4% slow.
+    let host_clock_origin = Instant::now();
+    let mut last_engine_clock_ms = 0u64;
+    let mut last_audio_clock_ms = 0u64;
     let mut frame_index = 0usize;
     let mut input_script = HeadlessInputScript::from_env();
     if input_script.is_some() {
@@ -9013,25 +18867,47 @@ fn run_window(
     event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame));
     let event_result = event_loop.run(move |event, target| match event {
         Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
-            WindowEvent::CloseRequested => target.exit(),
-            WindowEvent::Resized(size) => renderer.resize(size.width, size.height),
+            WindowEvent::CloseRequested => {
+                let allow_native_close = runtime
+                    .as_ref()
+                    .map_or(true, |runtime| runtime.api.native_system.native_close_mode != 0);
+                if allow_native_close {
+                    target.exit();
+                } else if let Some(runtime) = runtime.as_mut() {
+                    runtime.api.queued_system_events.push_back([2, 0, 0]);
+                    tracing::info!("WM_CLOSE intercepted into native event code 2");
+                }
+            }
+            WindowEvent::Resized(size) => {
+                renderer.resize(size.width, size.height);
+                if let Some(runtime) = runtime.as_mut() {
+                    runtime.api.window_surface_width = size.width.min(i32::MAX as u32) as i32;
+                    runtime.api.window_surface_height = size.height.min(i32::MAX as u32) as i32;
+                }
+            }
             WindowEvent::Focused(focused) => {
                 if let Some(runtime) = runtime.as_mut() {
                     runtime.api.window_focused = focused;
                     if !focused && runtime.api.input_requires_focus {
+                        pending_input_events.clear();
                         runtime.api.pending_input_state = None;
                         runtime.api.pending_input_descriptor = None;
                         runtime.api.pending_click = None;
                         runtime.api.pending_object_state = None;
+                        runtime.api.input_down_descriptors.clear();
+                        runtime.api.input_down_reported.clear();
                     }
                 }
             }
             WindowEvent::DroppedFile(path) => {
                 if let Some(runtime) = runtime.as_mut() {
-                    runtime
-                        .api
-                        .dropped_files
-                        .push_back(path.to_string_lossy().into_owned());
+                    if runtime.api.native_system.drag_drop_enabled {
+                        runtime.api.dropped_files.clear();
+                        runtime
+                            .api
+                            .dropped_files
+                            .push_back(path.to_string_lossy().into_owned());
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
@@ -9047,10 +18923,10 @@ fn run_window(
                 cursor_surface_pos = Some((position.x as f32, position.y as f32));
                 let cursor_game_pos =
                     renderer.surface_to_game_point(position.x as f32, position.y as f32);
-                if let Some(runtime) = runtime.as_mut() {
+                if runtime.is_some() {
                     if let Some((x, y)) = cursor_game_pos {
-                        apply_runtime_input_event(
-                            &mut runtime.api,
+                        queue_runtime_input_event(
+                            &mut pending_input_events,
                             RuntimeInputEvent::MouseMove { x, y },
                         );
                     }
@@ -9061,18 +18937,61 @@ fn run_window(
                     KeyEvent {
                         physical_key: PhysicalKey::Code(code),
                         state: ElementState::Pressed,
+                        text,
+                        ..
+                    },
+                ..
+            } => {
+                let modeless_consumed = runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.api.has_visible_user_modeless_dialog());
+                let edit_consumed = runtime.as_mut().is_some_and(|runtime| {
+                    runtime.api.handle_native_edit_key(code)
+                        || text
+                            .as_deref()
+                            .is_some_and(|text| runtime.api.append_native_edit_text(text))
+                });
+                if !edit_consumed && !modeless_consumed {
+                    if let Some(descriptor) = input_descriptor_for_keycode(code) {
+                        if let Some(runtime) = runtime.as_mut() {
+                            if runtime.api.native_system.fullscreen_hotkeys_enabled
+                                && runtime
+                                    .api
+                                    .native_system
+                                    .fullscreen_hotkeys
+                                    .contains(&descriptor)
+                            {
+                                let fullscreen = runtime.api.window_mode == 0;
+                                runtime.api.window_mode = i32::from(fullscreen);
+                                runtime.api.pending_fullscreen = Some(fullscreen);
+                            }
+                            queue_runtime_input_event(
+                                &mut pending_input_events,
+                                RuntimeInputEvent::KeyPress { descriptor },
+                            );
+                        }
+                        tracing::info!(descriptor, "keyboard advance");
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Released,
                         ..
                     },
                 ..
             } => {
                 if let Some(descriptor) = input_descriptor_for_keycode(code) {
                     if let Some(runtime) = runtime.as_mut() {
-                        apply_runtime_input_event(
-                            &mut runtime.api,
-                            RuntimeInputEvent::KeyPress { descriptor },
-                        );
+                        if !runtime.api.has_visible_user_modeless_dialog() {
+                            queue_runtime_input_event(
+                                &mut pending_input_events,
+                                RuntimeInputEvent::KeyRelease { descriptor },
+                            );
+                        }
                     }
-                    tracing::info!(descriptor, "keyboard advance");
                 }
             }
             WindowEvent::MouseInput {
@@ -9080,14 +18999,16 @@ fn run_window(
                 button: MouseButton::Left,
                 ..
             } => {
-                let cursor_game_pos = cursor_surface_pos
-                    .and_then(|(x, y)| renderer.surface_to_game_point(x, y));
+                let cursor_game_pos =
+                    cursor_surface_pos.and_then(|(x, y)| renderer.surface_to_game_point(x, y));
                 if let Some(runtime) = runtime.as_mut() {
                     if let Some((x, y)) = cursor_game_pos.or(runtime.api.mouse_pos) {
-                        apply_runtime_input_event(
-                            &mut runtime.api,
-                            RuntimeInputEvent::MousePress { x, y },
-                        );
+                        if !runtime.api.handle_user_modeless_pointer(x, y, true) {
+                            queue_runtime_input_event(
+                                &mut pending_input_events,
+                                RuntimeInputEvent::MousePress { x, y },
+                            );
+                        }
                     } else {
                         tracing::warn!("mouse press ignored before a cursor position was observed");
                     }
@@ -9099,14 +19020,16 @@ fn run_window(
                 button: MouseButton::Left,
                 ..
             } => {
-                let cursor_game_pos = cursor_surface_pos
-                    .and_then(|(x, y)| renderer.surface_to_game_point(x, y));
+                let cursor_game_pos =
+                    cursor_surface_pos.and_then(|(x, y)| renderer.surface_to_game_point(x, y));
                 if let Some(runtime) = runtime.as_mut() {
                     if let Some((x, y)) = cursor_game_pos.or(runtime.api.mouse_pos) {
-                        apply_runtime_input_event(
-                            &mut runtime.api,
-                            RuntimeInputEvent::MouseRelease { x, y },
-                        );
+                        if !runtime.api.handle_user_modeless_pointer(x, y, false) {
+                            queue_runtime_input_event(
+                                &mut pending_input_events,
+                                RuntimeInputEvent::MouseRelease { x, y },
+                            );
+                        }
                     } else {
                         tracing::warn!(
                             "mouse release ignored before a cursor position was observed"
@@ -9116,20 +19039,32 @@ fn run_window(
             }
             WindowEvent::RedrawRequested => {
                 frame_index = frame_index.saturating_add(1);
+                // Advance the pause-adjusted engine clock by the real elapsed
+                // milliseconds, but execute exactly one cooperative scheduler
+                // pass for this host main-loop iteration. Presentation remains
+                // paced at roughly 16 ms; it is not the VM time quantum.
                 let frame_now = Instant::now();
-                let elapsed_ms = frame_now
-                    .saturating_duration_since(last_frame_at)
+                let host_clock_ms = frame_now
+                    .saturating_duration_since(host_clock_origin)
                     .as_millis()
-                    .clamp(1, 250) as u64;
-                last_frame_at = frame_now;
+                    .min(u128::from(u64::MAX)) as u64;
+                let raw_elapsed_ms = host_clock_ms.saturating_sub(last_engine_clock_ms);
+                last_engine_clock_ms = host_clock_ms;
+                let elapsed_ms = normalize_engine_elapsed_ms(raw_elapsed_ms);
+                let audio_elapsed_ms = host_clock_ms.saturating_sub(last_audio_clock_ms);
+                last_audio_clock_ms = host_clock_ms;
                 let mut frame_draw_items = Vec::new();
                 if let Some(runtime) = runtime.as_mut() {
-                    if let Some(script) = input_script.as_mut() {
-                        if let Some(event) = script.tick() {
-                            apply_headless_input_event(&mut runtime.api, event);
-                        }
-                    }
-                    let frame_report = runtime.run_frame(frame_pacing, elapsed_ms);
+                    let frame_report = runtime_frontend::drive_runtime_frame(
+                        runtime,
+                        &mut pending_input_events,
+                        &mut input_script,
+                        frame_pacing,
+                        elapsed_ms,
+                        audio_elapsed_ms,
+                        Some(&mut _audio),
+                        "window",
+                    );
                     if runtime.api.screen_width > 0 && runtime.api.screen_height > 0 {
                         renderer.set_virtual_size(
                             runtime.api.screen_width as f32,
@@ -9139,6 +19074,9 @@ fn run_window(
                     let last_report = frame_report.last_report;
                     if let Some(title) = runtime.api.pending_window_title.take() {
                         window.set_title(&title);
+                    }
+                    if let Some((x, y)) = runtime.api.pending_window_position.take() {
+                        window.set_outer_position(PhysicalPosition::new(x as f64, y as f64));
                     }
                     if let Some(fullscreen) = runtime.api.pending_fullscreen.take() {
                         window.set_fullscreen(
@@ -9151,25 +19089,36 @@ fn run_window(
                     if std::mem::take(&mut runtime.api.pending_window_minimize) {
                         window.set_minimized(true);
                     }
+                    if let Some(visible) = runtime.api.pending_cursor_visible.take() {
+                        window.set_cursor_visible(visible);
+                    }
+                    if let Some((x, y)) = runtime.api.pending_cursor_position.take() {
+                        let (surface_x, surface_y, _, _) =
+                            renderer.game_to_surface_rect(x, y, 0.0, 0.0);
+                        let position = PhysicalPosition::new(surface_x as f64, surface_y as f64);
+                        if let Err(error) = window.set_cursor_position(position) {
+                            tracing::warn!(%error, x, y, "failed to apply target cursor motion to host cursor");
+                        } else {
+                            cursor_surface_pos = Some((surface_x, surface_y));
+                        }
+                    }
                     if runtime.api.debug_graph {
                         let report = last_report.as_ref();
                         tracing::info!(
                             steps = frame_report.total_steps,
-                            slices = frame_pacing.vm_slices_per_frame,
+                            scheduler_passes_per_native_tick = 1,
                             program = report.map(|report| report.program.as_str()),
                             pc = report.map(|report| report.pc),
                             offset = ?report.and_then(|report| report.offset),
                             reason = ?report.map(|report| &report.stop_reason),
-                            slices_this_frame = frame_report.slices_this_frame,
-                            continue_setup_yield = frame_report.continue_setup_yield,
-                            continue_input_yield = frame_report.continue_input_yield,
+                            scheduler_passes = frame_report.scheduler_passes,
                             yield_blockers = ?runtime.api.vm_after_yield_blockers(),
                             stack = runtime.vm.stack.len(),
                             "runtime frame VM tick"
                         );
                         if let Some(report) = report {
                             runtime.api.trace_render_snapshot(frame_index, Some(report));
-                            if report.stop_reason == ethornell_vm::VmStopReason::Error {
+                            if report.stop_reason.is_fatal() {
                                 tracing::warn!(
                                     recent_trace = ?report.recent_trace,
                                     "runtime VM halted with error"
@@ -9178,9 +19127,9 @@ fn run_window(
                         }
                     }
                     if runtime.options.fail_on_stub
-                        && last_report.as_ref().is_some_and(|report| {
-                            report.stop_reason == ethornell_vm::VmStopReason::Error
-                        })
+                        && last_report
+                            .as_ref()
+                            .is_some_and(|report| report.stop_reason.is_fatal())
                     {
                         let report = last_report.as_ref().expect("checked above");
                         let failure = format!(
@@ -9199,10 +19148,7 @@ fn run_window(
                         target.exit();
                         return;
                     }
-                    while let Some(request) = runtime.api.audio_requests.pop_front() {
-                        execute_audio_command(Some(&mut _audio), request, "window");
-                    }
-                    frame_draw_items = runtime.api.graph_draw_items();
+                    frame_draw_items = runtime.api.graph_output_draw_items();
                     for key in frame_draw_items
                         .iter()
                         .map(|item| item.key.as_str())
@@ -9253,8 +19199,16 @@ fn run_window(
                 let mut commands = vec![RenderCommand::Clear {
                     color: [0.0, 0.0, 0.0, 1.0],
                 }];
-                if let (Some(texture), Some((image_width, image_height))) = (&texture, image_size) {
-                    push_fit_texture_command(&mut commands, texture, image_width, image_height);
+                // The decoded standalone image is only a startup fallback for
+                // games whose runtime script could not be created. A running
+                // BP runtime must render exclusively from its graph draw list.
+                let draw_static_fallback = runtime.is_none();
+                if draw_static_fallback {
+                    if let (Some(texture), Some((image_width, image_height))) =
+                        (&texture, image_size)
+                    {
+                        push_fit_texture_command(&mut commands, texture, image_width, image_height);
+                    }
                 }
                 if let Some(text) = &text {
                     commands.push(RenderCommand::DrawText {
@@ -9263,6 +19217,8 @@ fn run_window(
                         y: 38.0,
                         color: [0.0, 0.0, 0.0, 0.75],
                         size: 28.0,
+                        styles: Vec::new(),
+                        clip: None,
                         z: 9,
                     });
                     commands.push(RenderCommand::DrawText {
@@ -9271,13 +19227,37 @@ fn run_window(
                         y: 36.0,
                         color: [1.0, 1.0, 1.0, 1.0],
                         size: 28.0,
+                        styles: Vec::new(),
+                        clip: None,
                         z: 10,
                     });
                 }
+                // `graph_output_draw_items()` preserves ordinary raw-priority
+                // order and performs only the recovered BackF exception for
+                // projected Sprite modes 5/6.  The renderer performs a stable
+                // sort by z, so a projected sprite deliberately moved after a
+                // higher-priority BackF must inherit the preceding renderer z;
+                // otherwise the sort would put it behind BackF again.  Normal
+                // backgrounds and transition images remain monotonic and keep
+                // their raw z, allowing BackF to cover/fade them as in the
+                // target compositor.
+                let mut flattened_graph_z = i32::MIN;
                 for item in frame_draw_items {
                     let Some(cached) = graph_textures.get(&item.key) else {
                         continue;
                     };
+                    let raw_graph_z = item.z;
+                    let render_graph_z = raw_graph_z.max(flattened_graph_z);
+                    if render_graph_z != raw_graph_z {
+                        tracing::debug!(
+                            owner = ?item.owner_object,
+                            key = item.key,
+                            raw_graph_z,
+                            render_graph_z,
+                            "promoted graph render z to preserve flattened native display order"
+                        );
+                    }
+                    flattened_graph_z = render_graph_z;
                     let texture = &cached.handle;
                     commands.push(RenderCommand::DrawTexture {
                         texture: texture.id,
@@ -9290,88 +19270,155 @@ fn run_window(
                         src_width: item.src_width / texture.width as f32,
                         src_height: item.src_height / texture.height as f32,
                         opacity: item.opacity,
+                        blend_mode: item.blend_mode,
                         rotation_degrees: item.rotation_degrees,
                         clip: item
                             .clip
                             .map(|clip| [clip.x, clip.y, clip.width, clip.height]),
-                        z: 2 + item.z,
+                        z: 2 + render_graph_z,
                     });
                 }
                 if let Some(runtime) = runtime.as_ref() {
-                    for (index, node) in runtime
+                    for node in runtime
                         .api
                         .text_nodes
                         .values()
                         .filter(|node| runtime.api.should_draw_text_node(node))
-                        .enumerate()
                     {
-                        let parent_origin = node
+                        let parent = node
                             .target_surface
-                            .and_then(|surface| runtime.api.graph_surfaces.get(&surface))
-                            .map(|surface| (surface.x, surface.y))
-                            .unwrap_or_default();
-                        let screen_x = parent_origin.0 + node.x;
-                        let screen_y = parent_origin.1 + node.y;
-                        let x = if screen_x == 0.0 { 760.0 } else { screen_x };
-                        let y = if screen_y == 0.0 {
-                            330.0 + index as f32 * 40.0
-                        } else {
-                            screen_y
-                        };
-                        let size = node.size.max(20.0);
+                            .filter(|surface| runtime.api.graph_surfaces.contains_key(surface))
+                            .map(|surface| {
+                                let (x, y) = runtime.api.surface_world_position(surface);
+                                (x, y, runtime.api.surface_display_opacity(surface))
+                            })
+                            .unwrap_or((0.0, 0.0, 1.0));
+                        let layout = runtime.api.formatted_text_layout(node);
+                        let x = parent.0 + node.x;
+                        let cursor_y = parent.1 + node.y;
+                        let y = cursor_y + layout.body_y_offset;
+                        let clip = node
+                            .target_surface
+                            .and_then(|surface| runtime.api.surface_chain_clip(surface))
+                            .map(|clip| [clip.x, clip.y, clip.width, clip.height]);
+                        let size = node.size.max(12.0);
+                        let mut color = node.color;
+                        color[3] *= parent.2;
+                        let styles = node
+                            .style_spans
+                            .iter()
+                            .map(|span| TextStyleSpan {
+                                start_char: span.start_char,
+                                end_char: span.end_char,
+                                packed_rgb: span.style.packed_rgb,
+                                bold: span.style.bold,
+                                italic: span.style.italic,
+                            })
+                            .collect::<Vec<_>>();
+                        let shadow_styles = styles
+                            .iter()
+                            .map(|span| TextStyleSpan {
+                                packed_rgb: None,
+                                ..*span
+                            })
+                            .collect::<Vec<_>>();
                         if let Some((shadow_x, shadow_y, shadow_alpha)) =
-                            runtime.api.graph_defaults.shadow()
+                            runtime.api.graph_defaults.shadow_for_height(size)
                         {
                             commands.push(RenderCommand::DrawText {
                                 text: node.text.clone(),
                                 x: x + shadow_x as f32,
                                 y: y + shadow_y as f32,
-                                color: [0.0, 0.0, 0.0, node.color[3] * shadow_alpha],
+                                color: [0.0, 0.0, 0.0, color[3] * shadow_alpha],
                                 size,
-                                z: node.z + index as i32 - 1,
+                                styles: shadow_styles,
+                                clip,
+                                z: node.z - 1,
                             });
                         }
                         commands.push(RenderCommand::DrawText {
                             text: node.text.clone(),
                             x,
                             y,
-                            color: node.color,
+                            color,
                             size,
-                            z: node.z + index as i32,
+                            styles,
+                            clip,
+                            z: node.z,
                         });
                         let mut positioned_node = node.clone();
                         positioned_node.x = x;
-                        positioned_node.y = y;
+                        positioned_node.y = cursor_y;
                         for (ruby, ruby_x, ruby_y, ruby_size) in
-                            text::ruby_draw_runs(&positioned_node)
+                            text::ruby_draw_runs(&positioned_node, layout)
                         {
                             if let Some((shadow_x, shadow_y, shadow_alpha)) =
-                                runtime.api.graph_defaults.shadow()
+                                runtime.api.graph_defaults.shadow_for_height(ruby_size)
                             {
                                 commands.push(RenderCommand::DrawText {
                                     text: ruby.clone(),
                                     x: ruby_x + shadow_x as f32,
                                     y: ruby_y + shadow_y as f32,
-                                    color: [0.0, 0.0, 0.0, node.color[3] * shadow_alpha],
+                                    color: [0.0, 0.0, 0.0, color[3] * shadow_alpha],
                                     size: ruby_size,
-                                    z: node.z + index as i32,
+                                    styles: Vec::new(),
+                                    clip,
+                                    z: node.z,
                                 });
                             }
                             commands.push(RenderCommand::DrawText {
                                 text: ruby,
                                 x: ruby_x,
                                 y: ruby_y,
-                                color: node.color,
+                                color,
                                 size: ruby_size,
-                                z: node.z + index as i32 + 1,
+                                styles: Vec::new(),
+                                clip,
+                                z: node.z + 1,
                             });
                         }
                     }
                 }
+                if let Some(runtime) = runtime.as_ref() {
+                    for (line, x, y, size) in runtime.api.user_modeless_dialog_text_lines() {
+                        commands.push(RenderCommand::DrawText {
+                            text: line.clone(),
+                            x: x + 2.0,
+                            y: y + 2.0,
+                            color: [0.0, 0.0, 0.0, 0.9],
+                            size,
+                            styles: Vec::new(),
+                            clip: None,
+                            z: 29_999,
+                        });
+                        commands.push(RenderCommand::DrawText {
+                            text: line,
+                            x,
+                            y,
+                            color: [0.95, 0.95, 0.95, 1.0],
+                            size,
+                            styles: Vec::new(),
+                            clip: None,
+                            z: 30_000,
+                        });
+                    }
+                }
                 renderer.submit(&commands);
-                if let Err(err) = renderer.render() {
-                    tracing::error!(%err, "render failed");
-                    target.exit();
+                let present_started = Instant::now();
+                match renderer.render() {
+                    Ok(()) => {
+                        if let Some(runtime) = runtime.as_mut() {
+                            runtime.api.performance_profile.record_present(present_started.elapsed());
+                            runtime.api.presentation_state = runtime
+                                .api
+                                .engine_time_ms
+                                .min(i32::MAX as u64) as i32;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(%err, "render failed");
+                        target.exit();
+                    }
                 }
             }
             _ => {}
@@ -9398,7 +19445,12 @@ fn run_window(
             let now = Instant::now();
             if now >= next_frame {
                 window.request_redraw();
-                next_frame = now + frame_interval;
+                // Keep the engine clock on its 16 ms phase. Scheduling from
+                // `now` accumulates render-time drift and makes animation
+                // durations depend on GPU/OS latency.
+                while next_frame <= now {
+                    next_frame += frame_interval;
+                }
             }
             target.set_control_flow(ControlFlow::WaitUntil(next_frame));
         }
@@ -9439,6 +19491,7 @@ fn push_fit_texture_command(
         src_width: 1.0,
         src_height: 1.0,
         opacity: 1.0,
+        blend_mode: 128,
         rotation_degrees: 0.0,
         clip: None,
         z: 0,

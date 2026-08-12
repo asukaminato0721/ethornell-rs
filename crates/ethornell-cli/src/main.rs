@@ -10,8 +10,9 @@ use ethornell_image::{decode_cbg_to_png, decode_image, probe_image, write_rgba_p
 use ethornell_script::{
     bcs::{parse_bcs, BcsCommand, BcsValue},
     calls::{
-        infer_program_call_arg_counts, instruction_call_key, scan_program_calls,
-        summarize_call_sites, summarize_inferred_arg_counts, CallSite,
+        infer_program_call_arg_counts, instruction_call_key, registered_call_summary,
+        scan_program_calls, summarize_call_sites, summarize_inferred_arg_counts, CallKey, CallSite,
+        DISPATCH_GROUPS,
     },
     decompile::{decompile_bcs, decompile_bp, DecompileOptions},
     detect_script_format, disassemble_bp, disassemble_file, parse_bp_program, BpInstruction,
@@ -69,6 +70,10 @@ enum Command {
         #[arg(long)]
         unknown_only: bool,
         #[arg(long)]
+        all_registered: bool,
+        #[arg(long)]
+        generic_only: bool,
+        #[arg(long)]
         limit_scripts: Option<usize>,
     },
     CallSites {
@@ -96,7 +101,10 @@ enum Command {
         game: PathBuf,
         #[arg(long)]
         trace: bool,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Abort when a native selector is explicitly Stub or has not passed selector-by-selector target audit"
+        )]
         fail_on_stub: bool,
         #[arg(long)]
         force_text_test: bool,
@@ -213,7 +221,10 @@ enum Command {
         script: String,
         #[arg(long, default_value_t = 10000)]
         max_steps: usize,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Abort when a native selector is explicitly Stub or has not passed selector-by-selector target audit"
+        )]
         fail_on_stub: bool,
         #[arg(long)]
         quiet_trace: bool,
@@ -334,8 +345,17 @@ fn main() -> anyhow::Result<()> {
             game,
             json,
             unknown_only,
+            all_registered,
+            generic_only,
             limit_scripts,
-        } => run_call_catalog(game, json, unknown_only, limit_scripts)?,
+        } => run_call_catalog(
+            game,
+            json,
+            unknown_only,
+            all_registered,
+            generic_only,
+            limit_scripts,
+        )?,
         Command::CallSites {
             game,
             archive,
@@ -1081,6 +1101,7 @@ fn run_vm_trace(
     println!("pc={}", report.pc);
     println!("offset={:?}", report.offset);
     println!("stop_reason={:?}", report.stop_reason);
+    println!("thread={:#?}", report.thread);
     println!("stack={}", vm.stack.len());
     println!("calls={:#?}", report.calls);
     println!("stubs={:#?}", report.stubs);
@@ -1101,10 +1122,10 @@ struct VmTraceApi {
 impl ethornell_vm::SysApi for VmTraceApi {
     fn call_sys(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
+        let (group, id) = (call.group(), call.id());
+        let stack = call.args_mut();
         match (group, id) {
             (0x80, 0x40) => {
                 let file = pop_vm_string(stack).unwrap_or_else(|| "<unknown>".into());
@@ -1152,29 +1173,25 @@ impl ethornell_vm::SysApi for VmTraceApi {
             }
             _ => {}
         }
-        self.fallback.call_sys(group, id, stack)
+        self.fallback.call_sys(call)
     }
 }
 
 impl ethornell_vm::GraphApi for VmTraceApi {
     fn call_graph(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
-        self.fallback.call_graph(group, id, stack)
+        self.fallback.call_graph(call)
     }
 }
 
 impl ethornell_vm::SoundApi for VmTraceApi {
     fn call_sound(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<ethornell_vm::Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<ethornell_vm::Value> {
-        self.fallback.call_sound(group, id, stack)
+        self.fallback.call_sound(call)
     }
 }
 
@@ -1309,6 +1326,8 @@ fn run_call_catalog(
     game: PathBuf,
     json: bool,
     unknown_only: bool,
+    all_registered: bool,
+    generic_only: bool,
     limit_scripts: Option<usize>,
 ) -> anyhow::Result<()> {
     let manager = ResourceManager::open_game(&game)?;
@@ -1362,6 +1381,23 @@ fn run_call_catalog(
     for item in &mut summary {
         item.inferred_arg_counts = inferred_by_key.get(&item.key).cloned().unwrap_or_default();
     }
+    if all_registered {
+        let existing = summary.iter().map(|item| item.key).collect::<BTreeSet<_>>();
+        for group in DISPATCH_GROUPS {
+            for id in 0..=u8::MAX {
+                let key = CallKey {
+                    group,
+                    id: u16::from(id),
+                };
+                if existing.contains(&key) {
+                    continue;
+                }
+                if let Some(item) = registered_call_summary(key) {
+                    summary.push(item);
+                }
+            }
+        }
+    }
     summary.sort_by(|left, right| {
         right
             .count
@@ -1372,12 +1408,23 @@ fn run_call_catalog(
     if unknown_only {
         summary.retain(|item| !item.known);
     }
+    if generic_only {
+        summary.retain(|item| item.generic);
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        println!("scripts_scanned={script_count} calls={}", summary.len());
-        println!("domain,group,id,name,count,argc,inferred_argc,known,scripts");
+        let used = summary.iter().filter(|item| item.used).count();
+        let registered = summary.iter().filter(|item| item.registered).count();
+        let generic = summary.iter().filter(|item| item.generic).count();
+        println!(
+            "scripts_scanned={script_count} calls={} used={used} registered={registered} generic={generic}",
+            summary.len()
+        );
+        println!(
+            "domain,group,id,name,count,argc,inferred_argc,known,registered,generic,used,scripts"
+        );
         for item in summary {
             let domain = item
                 .domain
@@ -1397,8 +1444,15 @@ fn run_call_catalog(
                 .join("|");
             let scripts = item.scripts.join(" | ");
             println!(
-                "{domain},0x{:02X},0x{:02X},{name},{},{argc},{inferred_argc},{},{}",
-                item.key.group, item.key.id, item.count, item.known, scripts
+                "{domain},0x{:02X},0x{:02X},{name},{},{argc},{inferred_argc},{},{},{},{},{}",
+                item.key.group,
+                item.key.id,
+                item.count,
+                item.known,
+                item.registered,
+                item.generic,
+                item.used,
+                scripts
             );
         }
     }

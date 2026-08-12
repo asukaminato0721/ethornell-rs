@@ -38,8 +38,7 @@ impl RuntimeTraceApi {
                         && (object == 0
                             || object == control.id
                             || object == control.owner_id
-                            || object == control.payload
-                            || control.title_only)
+                            || object == control.payload)
                 });
         }
         self.user_controls
@@ -87,6 +86,29 @@ impl RuntimeTraceApi {
         }
     }
 
+    pub(crate) fn observe_running_program_for_title(&mut self, program: &str) {
+        if !self.title_ui_active {
+            return;
+        }
+        if is_scenario_driver_program_report(program) {
+            self.depart_title_ui_for_scenario(program);
+            return;
+        }
+        if !self.title_child_program_active {
+            return;
+        }
+        if !is_title_program_report(program) {
+            return;
+        }
+        let child = self.title_child_program.take();
+        self.title_child_program_active = false;
+        self.user_controls.retain(|_, control| control.title_only);
+        self.trace_graph(format!(
+            "title child program returned child={}",
+            child.as_deref().unwrap_or("<unknown>")
+        ));
+    }
+
     fn depart_title_ui_after_script(&mut self, file: &str) {
         self.depart_title_ui_for_scenario(file);
     }
@@ -103,9 +125,14 @@ impl RuntimeTraceApi {
         self.title_scenario_requested = false;
         self.user_controls
             .retain(|_, control| control.owner_id == crate::text::MESSAGE_CONTROL_OWNER_ID);
-        self.text_nodes.retain(|id, _| *id < 50_000);
+        let cleared_text_nodes = self.clear_transient_screen_text_nodes();
         self.clear_title_graph_layers();
-        tracing::info!(control = self.last_hit_control, file, "title ui departed");
+        tracing::info!(
+            control = self.last_hit_control,
+            file,
+            cleared_text_nodes,
+            "title ui departed"
+        );
         self.trace_graph(format!(
             "title ui departed after control #{} loaded {file}",
             self.last_hit_control
@@ -168,6 +195,25 @@ impl RuntimeTraceApi {
         if !self.title_ui_active || self.has_title_child_render_context() {
             return;
         }
+        // These RuntimeUserControl entries predate the native DCIPIcon path.
+        // Once a real Graph90/91 input descriptor exists they would create a
+        // second title hit-test/event system beside DCIPIcon. In particular,
+        // generic poll_object_state/event can then consume the same mouse edge
+        // independently of Graph90:BC/BF. Keep this code only as an explicit
+        // legacy fallback for bring-up/debugging; target execution uses the
+        // descriptor through graph_input_objects and surface control layers.
+        if std::env::var("ETHORNELL_LEGACY_TITLE_CONTROLS")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            self.user_controls.retain(|_, control| !control.title_only);
+            self.trace_graph(format!(
+                "native title input object=#{owner_id} owns {} regions; legacy title controls suppressed",
+                descriptor.regions.len()
+            ));
+            return;
+        }
         self.user_controls.retain(|_, control| !control.title_only);
         for region in descriptor
             .regions
@@ -188,18 +234,27 @@ impl RuntimeTraceApi {
                     width: region.width as f32,
                     height: region.height as f32,
                     normal_resource: region.normal_resource,
-                    selected_resource: region.selected_resource,
+                    // RuntimeUserControl::selected_resource is the compatibility
+                    // renderer's hover bitmap.  The compact DCIPIcon descriptor
+                    // keeps pointer-hover at item+0x14, not item+0x10 (the
+                    // per-group current/selected bitmap).
+                    selected_resource: if region.hover_resource >= 0 {
+                        region.hover_resource
+                    } else {
+                        region.selected_resource
+                    },
                     enabled: true,
                     title_only: true,
                 },
             );
             self.trace_graph(format!(
-                "title input object=#{owner_id} control=#{id} payload={payload} x={} y={} w={} h={} normal=#{} selected=#{}",
+                "title input object=#{owner_id} control=#{id} payload={payload} x={} y={} w={} h={} normal=#{} hover=#{} selected=#{}",
                 region.x,
                 region.y,
                 region.width,
                 region.height,
                 region.normal_resource,
+                region.hover_resource,
                 region.selected_resource
             ));
         }
@@ -219,13 +274,13 @@ impl RuntimeTraceApi {
 
     pub(crate) fn call_user_control(
         &mut self,
-        group: u8,
-        id: u16,
-        stack: &mut Vec<Value>,
+        call: &mut ethornell_vm::NativeCallFrame,
     ) -> ethornell_vm::VmResult<Option<Value>> {
-        if let Some(result) = self.dispatch_native_effect(group, id, stack) {
+        if let Some(result) = self.dispatch_native_effect(call) {
             return result.map(Some);
         }
+        let (group, id) = (call.group(), call.id());
+        let stack = call.args_mut();
         if group == 0xb0 {
             match id {
                 0x02 => {
@@ -311,6 +366,7 @@ impl RuntimeTraceApi {
             let width = args.get(1).map(value_to_i32).unwrap_or(1280).max(1);
             self.screen_width = width;
             self.screen_height = height;
+            self.graph90_refresh_background_screen_layout();
             let handle = self.alloc_object();
             self.set_current_graph_object(handle);
             self.trace_graph(format!(
@@ -515,6 +571,7 @@ impl RuntimeTraceApi {
         self.pending_title_payload_override = self.auto_title_payload_override;
         self.pending_input_state = Some(0x1000_0002);
         self.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
+        self.pending_input_consumed = false;
         self.auto_title_click_done = true;
         self.auto_title_release_after_state = true;
         tracing::info!(
@@ -581,6 +638,27 @@ fn is_primary_title_control(control: &RuntimeUserControl) -> bool {
     control.title_only
 }
 
+fn is_title_program_report(program: &str) -> bool {
+    program_file_name(program).eq_ignore_ascii_case("title._bp")
+}
+
+fn is_scenario_driver_program_report(program: &str) -> bool {
+    matches!(
+        program_file_name(program).to_ascii_lowercase().as_str(),
+        "scrdrv._bp" | "scrdrv2._bp"
+    )
+}
+
+fn program_file_name(program: &str) -> &str {
+    program
+        .split('#')
+        .next()
+        .unwrap_or(program)
+        .rsplit_once(':')
+        .map(|(_, file)| file)
+        .unwrap_or(program)
+}
+
 fn avg_control_bounds(slot: i32) -> Option<(f32, f32, f32, f32)> {
     match slot {
         8 => Some((48.0, 528.0, 104.0, 50.0)),
@@ -624,7 +702,10 @@ fn pop_user_args(stack: &mut Vec<Value>, count: usize) -> ethornell_vm::VmResult
 
 #[cfg(test)]
 mod tests {
-    use super::{title_object_for_control_text, title_payload_for_control_text};
+    use super::{
+        is_scenario_driver_program_report, is_title_program_report, title_object_for_control_text,
+        title_payload_for_control_text,
+    };
 
     #[test]
     fn title_text_uses_native_descriptor_callback_order() {
@@ -641,5 +722,25 @@ mod tests {
             assert_eq!(title_payload_for_control_text(text), Some(payload));
             assert_eq!(title_object_for_control_text(text), Some(object));
         }
+    }
+
+    #[test]
+    fn running_title_program_is_recognized_after_a_child_returns() {
+        assert!(is_title_program_report("sysprg.arc:title._bp#instance=8"));
+        assert!(is_title_program_report("TITLE._BP"));
+        assert!(!is_title_program_report(
+            "sysprg.arc:cnfgwnd._bp#instance=64"
+        ));
+    }
+
+    #[test]
+    fn scenario_drivers_are_recognized_after_loading_save_data() {
+        assert!(is_scenario_driver_program_report(
+            "sysprg.arc:scrdrv._bp#instance=75"
+        ));
+        assert!(is_scenario_driver_program_report("SCRDRV2._BP"));
+        assert!(!is_scenario_driver_program_report(
+            "sysprg.arc:usdtwnd._bp#instance=64"
+        ));
     }
 }
