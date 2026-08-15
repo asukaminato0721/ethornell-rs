@@ -13,7 +13,7 @@ pub(crate) struct GraphGroupState {
 impl Default for GraphGroupState {
     fn default() -> Self {
         Self {
-            draw_enabled: true,
+            draw_enabled: false,
             x: 0,
             y: 0,
             alpha_parameter: 0,

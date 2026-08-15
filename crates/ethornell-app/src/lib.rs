@@ -1,7 +1,7 @@
 use ethornell_archive::{detect_magic, scan_game_root, MagicKind, ResourceManager};
 use ethornell_audio::AudioSystem;
 use ethornell_core::{EthornellError, GameRoot, Result};
-use ethornell_image::{decode_image, DecodedImage};
+use ethornell_image::{decode_image, parse_cbg_metadata, DecodedImage};
 use ethornell_render::{RenderCommand, Renderer, TextStyleSpan, TextureHandle};
 use ethornell_script::calls::known_call_arg_count;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -66,11 +66,12 @@ use character_image::decode_scenario_resource_image;
 use display_tree::{NativeDisplayKind, NativeDisplayTree};
 use graph::{
     apply_alpha_mask, backf_mask_weight, blit_decoded_image,
-    blit_decoded_image_format2_source_over, blit_decoded_image_parameter,
+    blit_decoded_image_format1_to_format2, blit_decoded_image_format2_source_over,
+    blit_decoded_image_parameter,
     blit_decoded_image_raw_copy, crop_decoded_image, crossfade_decoded_images,
     crossfade_decoded_images_straight_alpha, fit_decoded_image_canvas, fixed_16_to_f32,
     native_draw_order, scale_decoded_image_fixed, NativeMode5DynamicState, NativeMode5NodeArgs, RuntimeClipRect,
-    RuntimeGraphDrawItem, RuntimeGraphLayer, RuntimeGraphObjectProperties, RuntimeGraphResource,
+    RuntimeGraphDrawItem, RuntimeMode5RenderState, RuntimeGraphLayer, RuntimeGraphObjectProperties, RuntimeGraphResource,
     RuntimeGraphTransitionNode, RuntimeSurface, RuntimeUserControl,
     NATIVE_DISPLAY_Z, NATIVE_SCREEN_BITMAP,
 };
@@ -91,7 +92,7 @@ use scene::{
     place_scenario_sprite_with_hints, scenario_layer_ids_for_slot, sprite_fade_frames,
     sprite_target_opacity, SCENARIO_OVERLAY_LAYER_ID,
 };
-use surface_controls::SurfaceControlRegistry;
+use surface_controls::{SurfaceControlOwner, SurfaceControlRegistry};
 use text::{RuntimeTextNode, TextState, MESSAGE_NAME_TEXT_Z, MESSAGE_TEXT_Z};
 use text_anim::TextRuntime;
 use timeline::{TimelineEvent, TimelineSystem};
@@ -102,7 +103,7 @@ use user_files::{
     runtime_file_exists_from_root, runtime_file_path, runtime_file_path_from_root,
 };
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, WindowBuilder};
@@ -122,6 +123,8 @@ const INPUT_DESCRIPTOR_RIGHT: i32 = 39;
 const INPUT_DESCRIPTOR_DOWN: i32 = 40;
 const INPUT_DESCRIPTOR_MOUSE_LEFT: i32 = 1;
 const INPUT_DESCRIPTOR_ENTER: i32 = 13;
+const INPUT_DESCRIPTOR_MOUSE_WHEEL_UP: i32 = 14;
+const INPUT_DESCRIPTOR_MOUSE_WHEEL_DOWN: i32 = 15;
 
 pub struct AppConfig {
     pub game_root: GameRoot,
@@ -445,6 +448,17 @@ struct RuntimeTraceApi {
     trace_render_tree: bool,
     graph_trace: VecDeque<String>,
     graph_images: BTreeMap<String, DecodedImage>,
+    /// Native bitmap format associated with decoded resource images. Resource
+    /// pixels are cached independently of concrete bitmap handles, so the
+    /// target format selected from the CBG header must be cached with them;
+    /// otherwise a Graph92:14 preload followed by a real load silently falls
+    /// back to format 2.
+    graph_image_formats: BTreeMap<String, i32>,
+    /// Resource-keyed copy of target bitmap-registry DWORDs +0x28/+0x2C
+    /// recovered from CBG embedded-point metadata. This must survive
+    /// Graph92:14 preloading so a later real bitmap load receives the same
+    /// descriptor metadata even when the decoded pixels are already cached.
+    graph_image_auxiliary_pairs: BTreeMap<String, [i32; 2]>,
     graph_image_revisions: BTreeMap<String, u64>,
     next_graph_image_revision: u64,
     graphic_resource_keys: BTreeMap<(i32, i32), String>,
@@ -466,6 +480,10 @@ struct RuntimeTraceApi {
     /// distinct from the recursively propagated CDspObj+0x04 enable flag.
     graph_object_draw_enabled: BTreeMap<i32, bool>,
     graph_object_properties: BTreeMap<i32, RuntimeGraphObjectProperties>,
+    /// Renderer-only state recovered from the native mode-5 inverse affine
+    /// rasterizer. The raster bbox remains in RuntimeGraphLayer; this map keeps
+    /// the actual source-image footprint and interpolation selector separate.
+    graph_mode5_render_states: BTreeMap<i32, RuntimeMode5RenderState>,
     /// Per-concrete-CDspObj constructor counters passed in ECX to the
     /// recovered base constructor and stored at +0x20. These counters are
     /// monotonic per class and are independent of reusable public handle slots.
@@ -483,8 +501,9 @@ struct RuntimeTraceApi {
     primary_bitmap: Option<i32>,
     bitmap_dimensions: BTreeMap<i32, (u32, u32)>,
     bitmap_formats: BTreeMap<i32, i32>,
-    /// Target bitmap descriptor +0x28/+0x2c auxiliary pair. These fields are
-    /// independent of width/height and are initialized to (-1, -1).
+    /// Target bitmap descriptor +0x28/+0x2C embedded reference point. These
+    /// fields are independent of width/height, initialize to (-1, -1), and
+    /// are populated from CBG +0x1C/+0x1E when the +0x1A flag is 1.
     bitmap_auxiliary_pairs: BTreeMap<i32, [i32; 2]>,
     graph_surfaces: BTreeMap<i32, RuntimeSurface>,
     /// Graph90:9E horizontal glyph strip registration state.
@@ -495,8 +514,13 @@ struct RuntimeTraceApi {
     surface_text_buffers: BTreeMap<i32, String>,
     /// Target CDspObjKnob registry: 32 slots, handles 0xF0000000 | slot.
     graph_knob_states: BTreeMap<i32, GraphKnobState>,
-    graph_knob_target_owners: BTreeMap<i32, i32>,
-    graph_knob_watches: BTreeSet<i32>,
+    /// Knob→target is a control pointer, not a CDspObj member/parent edge.
+    /// Target sub_420EC0 stores only CDspObjKnob+0x134 = target*. Multiple
+    /// knobs may reference the same target and the target may independently
+    /// belong to a Window/Group member chain.
+    /// Target dword_565FD0 is a prepend-only linked watch list. Duplicate
+    /// registrations are permitted and 90:DF removes the first matching node.
+    graph_knob_watches: VecDeque<i32>,
     graph_knob_input_mode: i32,
     /// Target CDspObjGroup registry: 8 slots, handles 0xF1000000 | slot.
     graph_groups: BTreeMap<i32, GraphGroupState>,
@@ -551,6 +575,10 @@ struct RuntimeTraceApi {
     /// Target System91:70-7F CDspObjLandscape registry: 4 tagged slots.
     graph91_landscapes: BTreeMap<i32, native_graph_sys91::Graph91LandscapeState>,
     queued_system_events: VecDeque<[i32; 3]>,
+    /// Host-side equivalent of target Sys80:69 -> PostMessageA(WM_CLOSE).
+    /// The request is consumed only after the current BP scheduler pass, just
+    /// like a posted Win32 message, and then follows the normal WM_CLOSE path.
+    pending_window_close_request: bool,
     dropped_files: VecDeque<String>,
     quit_requested: bool,
     graph_animations: GraphAnimationRegistry,
@@ -596,6 +624,11 @@ struct RuntimeTraceApi {
     title_ui_resources_loaded: bool,
     title_ui_active: bool,
     title_ui_departed: bool,
+    /// Old bring-up renderer which draws SGTitle resources immediately after
+    /// load, before the target BP script has created/configured its CDspObj
+    /// scene. The target never presents resources merely because they were
+    /// loaded, so this must remain disabled in normal target-strict runtime.
+    title_compatibility_render_fallback: bool,
     title_child_program_active: bool,
     title_child_program: Option<String>,
     title_scenario_requested: bool,
@@ -749,6 +782,8 @@ impl RuntimeTraceApi {
             trace_render_tree: std::env::var_os("TRACE_RENDER_TREE").is_some(),
             graph_trace: VecDeque::new(),
             graph_images: BTreeMap::new(),
+            graph_image_formats: BTreeMap::new(),
+            graph_image_auxiliary_pairs: BTreeMap::new(),
             graph_image_revisions: BTreeMap::new(),
             next_graph_image_revision: 1,
             graphic_resource_keys: BTreeMap::new(),
@@ -768,6 +803,7 @@ impl RuntimeTraceApi {
             graph_object_enabled: BTreeMap::new(),
             graph_object_draw_enabled: BTreeMap::new(),
             graph_object_properties: BTreeMap::new(),
+            graph_mode5_render_states: BTreeMap::new(),
             graph_native_constructor_serials: BTreeMap::new(),
             graph_object_input_tables: BTreeMap::new(),
             graph_input_objects: BTreeMap::new(),
@@ -790,8 +826,7 @@ impl RuntimeTraceApi {
             surface_text_states: BTreeMap::new(),
             surface_text_buffers: BTreeMap::new(),
             graph_knob_states: BTreeMap::new(),
-            graph_knob_target_owners: BTreeMap::new(),
-            graph_knob_watches: BTreeSet::new(),
+            graph_knob_watches: VecDeque::new(),
             graph_knob_input_mode: 0,
             graph_groups: BTreeMap::new(),
             graph_native_owners: BTreeMap::new(),
@@ -829,6 +864,7 @@ impl RuntimeTraceApi {
             graph91_effectors: BTreeMap::new(),
             graph91_landscapes: BTreeMap::new(),
             queued_system_events: VecDeque::new(),
+            pending_window_close_request: false,
             dropped_files: VecDeque::new(),
             quit_requested: false,
             graph_animations: GraphAnimationRegistry::default(),
@@ -864,6 +900,10 @@ impl RuntimeTraceApi {
             title_ui_resources_loaded: false,
             title_ui_active: false,
             title_ui_departed: false,
+            title_compatibility_render_fallback: std::env::var_os(
+                "ETHORNELL_LEGACY_TITLE_RENDER_FALLBACK",
+            )
+            .is_some(),
             title_child_program_active: false,
             title_child_program: None,
             title_scenario_requested: false,
@@ -999,6 +1039,22 @@ impl RuntimeTraceApi {
         self.graph_image_revisions.insert(key, revision);
     }
 
+    /// Reset target bitmap-registry DWORDs +0x28/+0x2C to the state produced
+    /// by sub_407CF0/sub_407DA0 for a newly allocated or released slot.
+    fn reset_bitmap_auxiliary_pair(&mut self, bitmap: i32) {
+        self.bitmap_auxiliary_pairs.remove(&bitmap);
+    }
+
+    /// Apply resource metadata to a concrete bitmap slot. Missing metadata is
+    /// significant: the native allocator leaves the pair at -1/-1 rather than
+    /// retaining values from an earlier use of the same handle.
+    fn apply_resource_bitmap_auxiliary_pair(&mut self, bitmap: i32, key: &str) {
+        self.reset_bitmap_auxiliary_pair(bitmap);
+        if let Some(pair) = self.graph_image_auxiliary_pairs.get(key).copied() {
+            self.bitmap_auxiliary_pairs.insert(bitmap, pair);
+        }
+    }
+
     fn store_movie_frame(&mut self, update: graph_effect::MovieFrameUpdate) {
         let bitmap = update.bitmap;
         let width = update.image.width;
@@ -1061,6 +1117,7 @@ impl RuntimeTraceApi {
         self.effects.remove_bitmap(bitmap);
         self.graph_resources.remove(&bitmap);
         self.graph_bindings.remove(&bitmap);
+        self.reset_bitmap_auxiliary_pair(bitmap);
         self.bitmap_dimensions.insert(bitmap, (width, height));
         self.bitmap_formats.insert(bitmap, 2);
         self.graph_surfaces.insert(
@@ -1197,6 +1254,104 @@ impl RuntimeTraceApi {
             })
     }
 
+    fn graph_bitmap_pixel_stats(
+        &self,
+        bitmap: i32,
+    ) -> Option<(usize, u8, [u8; 3], [u8; 3])> {
+        let image = self.graph_bitmap_image(bitmap)?;
+        let mut nonzero_alpha = 0usize;
+        let mut max_alpha = 0u8;
+        let mut rgb_min = [u8::MAX; 3];
+        let mut rgb_max = [0u8; 3];
+        for pixel in image.rgba.chunks_exact(4) {
+            if pixel[3] != 0 {
+                nonzero_alpha += 1;
+                for channel in 0..3 {
+                    rgb_min[channel] = rgb_min[channel].min(pixel[channel]);
+                    rgb_max[channel] = rgb_max[channel].max(pixel[channel]);
+                }
+            }
+            max_alpha = max_alpha.max(pixel[3]);
+        }
+        if nonzero_alpha == 0 {
+            rgb_min = [0; 3];
+        }
+        Some((nonzero_alpha, max_alpha, rgb_min, rgb_max))
+    }
+
+    /// Replace the writable pixel contents represented by a bitmap handle
+    /// without converting the operation into a detached text overlay.
+    /// Graph92:9C ultimately writes through the target bitmap descriptor; if
+    /// the portable handle is an atlas subregion, copy the modified region
+    /// back into that backing image rather than replacing the atlas.
+    fn replace_graph_bitmap_pixels(&mut self, bitmap: i32, image: DecodedImage) -> bool {
+        if let Some(resource) = self.resolve_graph_resource(bitmap).cloned() {
+            if let Some(rect) = resource.source_rect {
+                let Some(mut backing) = self.graph_images.get(&resource.key).cloned() else {
+                    return false;
+                };
+                let dst_x = rect.x.round().max(0.0) as u32;
+                let dst_y = rect.y.round().max(0.0) as u32;
+                let copy_width = image.width.min(backing.width.saturating_sub(dst_x));
+                let copy_height = image.height.min(backing.height.saturating_sub(dst_y));
+                for row in 0..copy_height {
+                    let src = (row * image.width * 4) as usize;
+                    let dst = (((dst_y + row) * backing.width + dst_x) * 4) as usize;
+                    let bytes = (copy_width * 4) as usize;
+                    backing.rgba[dst..dst + bytes]
+                        .copy_from_slice(&image.rgba[src..src + bytes]);
+                }
+                self.store_graph_image(resource.key, backing);
+            } else {
+                self.store_graph_image(resource.key, image);
+            }
+            self.refresh_bitmap_nodes(bitmap);
+            return true;
+        }
+
+        if bitmap > 0 {
+            let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
+            self.store_runtime_bitmap(bitmap, image, format);
+            return true;
+        }
+        false
+    }
+
+    fn rasterize_graph_bitmap_text(
+        &mut self,
+        bitmap: i32,
+        text: &str,
+        x: i32,
+        y: i32,
+        size: f32,
+        spacing: f32,
+        horizontal_scale_percent: f32,
+        color: [f32; 4],
+    ) -> Option<(i32, i32)> {
+        if bitmap <= 0 {
+            return None;
+        }
+        let mut image = self.graph_bitmap_image(bitmap)?;
+        let result = snapshot::rasterize_bitmap_text(
+            &mut image,
+            text,
+            x,
+            y,
+            size,
+            spacing,
+            horizontal_scale_percent,
+            color,
+        );
+        if !self.replace_graph_bitmap_pixels(bitmap, image) {
+            return None;
+        }
+        // Earlier bring-up represented bitmap text as a separate runtime text
+        // node. Once pixels have been committed, retaining that overlay would
+        // draw every glyph twice and would break later bitmap composition.
+        self.clear_bitmap_text(bitmap);
+        Some(result)
+    }
+
     fn convert_bitmap_to_alpha_mask(&mut self, source: i32, destination: i32) -> i32 {
         let Some(source_format @ (1 | 2)) = self.bitmap_formats.get(&source).copied() else {
             return 9;
@@ -1232,6 +1387,7 @@ impl RuntimeTraceApi {
         self.graph_resources
             .insert(destination, RuntimeGraphResource::whole(key));
         self.graph_bindings.remove(&destination);
+        self.reset_bitmap_auxiliary_pair(destination);
         self.bitmap_dimensions.insert(destination, (width, height));
         self.bitmap_formats.insert(destination, 3);
         self.clear_bitmap_text(destination);
@@ -1416,7 +1572,11 @@ impl RuntimeTraceApi {
                 self.graph_resources
                     .insert(target_id, RuntimeGraphResource::whole(key.clone()));
                 self.bitmap_dimensions.insert(target_id, dimensions);
-                self.bitmap_formats.insert(target_id, 2);
+                self.bitmap_formats.insert(
+                    target_id,
+                    self.graph_image_formats.get(&key).copied().unwrap_or(2),
+                );
+                self.apply_resource_bitmap_auxiliary_pair(target_id, &key);
                 let mut surface =
                     RuntimeSurface::bitmap(target_id, dimensions.0 as f32, dimensions.1 as f32);
                 surface.resource_id = Some(target_id);
@@ -1428,21 +1588,78 @@ impl RuntimeTraceApi {
         let Some(entry) = find_runtime_resource(&self.manager, archive_name, resource_name) else {
             return false;
         };
-        let Some(image) = self
-            .manager
-            .read_by_entry_decoded(&entry)
-            .ok()
-            .and_then(|bytes| decode_image(&bytes).ok())
-        else {
+        let Ok(bytes) = self.manager.read_by_entry_decoded(&entry) else {
+            return false;
+        };
+
+        // Target sub_469EE0 copies CBG +0x10..+0x1F into the internal image
+        // header. sub_401EF0 accepts embedded-point flags 0/1 and, for flag 1,
+        // copies +0x1C/+0x1E into bitmap-registry DWORDs +0x28/+0x2C.
+        let (native_bitmap_format, auxiliary_pair, cbg_format_trace) =
+            if bytes.starts_with(b"CompressedBG___") {
+                let Ok(metadata) = parse_cbg_metadata(&bytes) else {
+                    return false;
+                };
+                if metadata.embedded_point_flag > 1 {
+                    tracing::warn!(
+                        archive = archive_name,
+                        resource = resource_name,
+                        flag = metadata.embedded_point_flag,
+                        "rejecting CBG with invalid embedded-point flag"
+                    );
+                    return false;
+                }
+                let Some(native_format) = metadata.native_bitmap_format() else {
+                    tracing::warn!(
+                        archive = archive_name,
+                        resource = resource_name,
+                        bpp = metadata.bpp,
+                        subtype = metadata.image_subtype,
+                        "rejecting CBG with unsupported native bitmap format"
+                    );
+                    return false;
+                };
+                (
+                    native_format,
+                    metadata.embedded_point(),
+                    Some((metadata.bpp, metadata.image_subtype)),
+                )
+            } else {
+                // Portable PNG/JPEG/raw-image compatibility resources have no
+                // target CBG subtype to recover. Keep the historical RGBA
+                // format-2 interpretation for those non-CBG paths.
+                (2, None, None)
+            };
+
+        let Ok(image) = decode_image(&bytes) else {
             trace_graph!(
                 self,
                 "load resource {archive_name}:{resource_name} (not image)"
             );
             return false;
         };
+        self.graph_image_formats
+            .insert(key.clone(), native_bitmap_format);
+        if let Some(pair) = auxiliary_pair {
+            self.graph_image_auxiliary_pairs.insert(key.clone(), pair);
+        } else {
+            self.graph_image_auxiliary_pairs.remove(&key);
+        }
+        tracing::info!(
+            target = target_id,
+            archive = archive_name,
+            resource = resource_name,
+            width = image.width,
+            height = image.height,
+            native_bitmap_format,
+            cbg_bpp = cbg_format_trace.map(|value| value.0),
+            cbg_subtype = cbg_format_trace.map(|value| value.1),
+            auxiliary_pair = ?auxiliary_pair,
+            "GraphImageNativeFormat"
+        );
         trace_graph!(
             self,
-            "load image #{target_id} {key} -> {}x{}",
+            "load image #{target_id} {key} -> {}x{} format={native_bitmap_format} cbg={cbg_format_trace:?} aux={auxiliary_pair:?}",
             image.width,
             image.height
         );
@@ -1451,7 +1668,8 @@ impl RuntimeTraceApi {
                 .insert(target_id, RuntimeGraphResource::whole(key.clone()));
             self.bitmap_dimensions
                 .insert(target_id, (image.width, image.height));
-            self.bitmap_formats.insert(target_id, 2);
+            self.bitmap_formats.insert(target_id, native_bitmap_format);
+            self.apply_resource_bitmap_auxiliary_pair(target_id, &key);
             let mut surface =
                 RuntimeSurface::bitmap(target_id, image.width as f32, image.height as f32);
             surface.resource_id = Some(target_id);
@@ -1834,11 +2052,26 @@ impl RuntimeTraceApi {
             }
             self.display_tree
                 .register(handle, NativeDisplayKind::Window);
+            self.graph_object_enabled.insert(handle, true);
+            // Target CDspObjWindow constructor sub_42AE20 explicitly calls
+            // sub_41B600(window, 1): a newly created Window starts drawable.
+            // yesnownd._bp relies on this constructor state and does not issue
+            // Graph90:84 before binding/fading in its confirmation Window.
+            self.graph_object_draw_enabled.insert(handle, true);
             self.graph90_initialize_native_constructor_sort(handle, NativeDisplayKind::Window);
-            self.graph_surfaces.insert(
-                handle,
-                RuntimeSurface::display(handle, width as f32, height as f32),
-            );
+            {
+                let native = &mut self
+                    .graph_object_properties
+                    .entry(handle)
+                    .or_default()
+                    .native;
+                native.enabled = 1;
+                native.draw_enabled = 1;
+            }
+            let mut surface = RuntimeSurface::display(handle, width as f32, height as f32);
+            // Renderer mirror of the target constructor's CDspObj draw gate.
+            surface.enabled = true;
+            self.graph_surfaces.insert(handle, surface);
             return Some(handle);
         }
         None
@@ -2164,7 +2397,7 @@ impl RuntimeTraceApi {
         );
     }
 
-    fn set_graph_object_draw_enabled(&mut self, object: i32, enabled: bool) {
+    fn set_graph_object_draw_enabled_raw(&mut self, object: i32, enabled: bool) {
         if object == -1 {
             return;
         }
@@ -2175,17 +2408,73 @@ impl RuntimeTraceApi {
             .or_default()
             .native
             .draw_enabled = if enabled { 1 } else { 0 };
+        if let Some(surface) = self
+            .graph_surfaces
+            .get_mut(&object)
+            .filter(|surface| surface.display_attached)
+        {
+            // Renderer mirror only. CDspObj+0x14 / graph_object_draw_enabled
+            // remains the authoritative Window visibility state.
+            surface.enabled = enabled;
+        }
+    }
+
+    fn set_graph_object_draw_enabled(&mut self, object: i32, enabled: bool) {
+        if object == -1 {
+            return;
+        }
+        // CDspObj::vtable+4 (sub_41AE00) recursively visits the real member
+        // list. CDspObjKnob::sub_4210E0 performs that base propagation first
+        // and then dispatches the same virtual to its raw controlled target.
+        // The target pointer is deliberately not a parent/member edge.
+        let mut pending = vec![object];
+        let mut visited = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            self.set_graph_object_draw_enabled_raw(current, enabled);
+            let knob_target = self.graph_knob_states.get_mut(&current).map(|state| {
+                state.enabled = enabled;
+                state.target
+            });
+            if !enabled && self.graph_active_input_handle == current {
+                self.graph_active_input_handle = 0;
+            }
+            let children = self.graph_native_member_children(current);
+            // sub_4210E0 forwards to the controlled target after the base
+            // member walk. Stack order is immaterial for the final bool, but
+            // push target first so children are processed before it.
+            if let Some(target) = knob_target {
+                pending.push(target);
+            }
+            pending.extend(children.into_iter().rev());
+        }
+
         trace_graph!(
             self,
-            "object #{object} draw_enabled={enabled} layers={}",
+            "object #{object} draw_enabled={enabled} layers={} knob_target={:?}",
             self.graph_object_layers
                 .get(&object)
                 .map(BTreeSet::len)
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            self.graph_knob_states.get(&object).map(|state| state.target)
         );
     }
 
     fn graph_object_pointer_hit(&self, object: i32) -> Option<i32> {
+        // CDspObjKnob vtable+100 is sub_4215C0 and delegates the complete hit
+        // query to the controlled target. Keep the relation as virtual
+        // forwarding, not ownership, and guard pathological control cycles.
+        let mut resolved = object;
+        let mut visited = BTreeSet::new();
+        while let Some(target) = self.graph_knob_states.get(&resolved).map(|state| state.target) {
+            if !visited.insert(resolved) || target == resolved {
+                return Some(0);
+            }
+            resolved = target;
+        }
+        let object = resolved;
         let (mouse_x, mouse_y) = self.mouse_pos?;
         let layers = self.graph_object_layers.get(&object)?;
         for layer_id in layers.iter().rev() {
@@ -2255,6 +2544,7 @@ impl RuntimeTraceApi {
             .retain(|sprite, linked| *sprite != object && *linked != object);
         removed |= self.graph_input_objects.remove(&object).is_some();
         removed |= self.graph_object_properties.remove(&object).is_some();
+        removed |= self.graph_mode5_render_states.remove(&object).is_some();
         removed |= self.graph_object_input_tables.remove(&object).is_some();
         self.user_controls
             .retain(|_, control| control.title_only || control.owner_id != object);
@@ -2478,18 +2768,14 @@ impl RuntimeTraceApi {
             .map(|surface| (surface.x.round() as i32, surface.y.round() as i32))
     }
 
-    /// Children represented by the native CDspObj member list (+0x12C). The
-    /// knob compatibility owner is deliberately excluded: a knob controls its
-    /// target but is not a CDspObj member parent whose transform/alpha setters
-    /// recurse into the target.
+    /// Children represented by the native CDspObj member list (+0x12C).
+    /// CDspObjKnob's controlled target is deliberately *not* represented in
+    /// `graph_native_owners`: target sub_420EC0 stores that relation only in
+    /// Knob+0x134 and all forwarding happens through Knob virtual overrides.
     fn graph_native_member_children(&self, parent: i32) -> Vec<i32> {
         self.graph_native_owners
             .iter()
-            .filter_map(|(&child, &owner)| {
-                (owner == parent
-                    && self.graph_knob_target_owners.get(&child) != Some(&owner))
-                    .then_some(child)
-            })
+            .filter_map(|(&child, &owner)| (owner == parent).then_some(child))
             .collect()
     }
 
@@ -2502,6 +2788,27 @@ impl RuntimeTraceApi {
                 continue;
             }
             result.push(object);
+            let children = self.graph_native_member_children(object);
+            pending.extend(children.into_iter().rev());
+        }
+        result
+    }
+
+    /// Walk the display-object propagation graph for virtual setters whose
+    /// Knob override explicitly forwards to the controlled target after the
+    /// ordinary CDspObj member recursion (e.g. vtable+4 and vtable+72).
+    fn graph_native_virtual_descendants_inclusive(&self, root: i32) -> Vec<i32> {
+        let mut result = Vec::new();
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(object) = pending.pop() {
+            if !visited.insert(object) {
+                continue;
+            }
+            result.push(object);
+            if let Some(target) = self.graph_knob_states.get(&object).map(|state| state.target) {
+                pending.push(target);
+            }
             let children = self.graph_native_member_children(object);
             pending.extend(children.into_iter().rev());
         }
@@ -2547,6 +2854,18 @@ impl RuntimeTraceApi {
         };
         if knob_changed {
             self.apply_graph_knob_position(object);
+            let state_after = self.graph_knob_states.get(&object).copied();
+            let target_position = state_after
+                .and_then(|state| self.graph_native_base_position(state.target));
+            tracing::info!(
+                handle = object,
+                base_x = x,
+                base_y = y,
+                target = state_after.map(|state| state.target).unwrap_or_default(),
+                ?target_position,
+                target_owner = ?state_after.and_then(|state| self.graph_native_owners.get(&state.target).copied()),
+                "GraphKnobBaseMovedViaObjectPosition"
+            );
             moved = true;
         } else {
             if let Some(layer) = self.graph_layers.get_mut(&object) {
@@ -2711,24 +3030,22 @@ impl RuntimeTraceApi {
         };
         let dimensions = self.graph_knob_target_dimensions(state.target);
         let (x, y) = state.display_position(dimensions.0, dimensions.1);
-        let mut moved = 0usize;
-        if let Some(layer) = self.graph_layers.get_mut(&state.target) {
-            layer.x = x;
-            layer.y = y;
-            moved = 1;
-        } else if let Some(layers) = self.graph_object_layers.get(&state.target).cloned() {
-            for layer_id in layers {
-                if let Some(layer) = self.graph_layers.get_mut(&layer_id) {
-                    layer.x = x;
-                    layer.y = y;
-                    moved += 1;
-                }
-            }
-        }
+
+        // CDspObjKnob never owns its controlled target as a member child.
+        // sub_421120/sub_421430 explicitly dispatch a position virtual on the
+        // target. Reuse the native position path so the target's own subclass
+        // behavior, member propagation, surface bookkeeping and raster-origin
+        // semantics remain intact instead of writing renderer layer.x/y only.
+        self.graph90_set_position_recursive(
+            state.target,
+            x.round() as i32,
+            y.round() as i32,
+        );
+
         let (max_x, max_y) = state.logical_limits(dimensions.0, dimensions.1);
         trace_graph!(
             self,
-            "scroll #{handle} target=#{} logical=({}, {}) limits=({max_x}, {max_y}) display=({x:.0}, {y:.0}) target={}x{} bounds={}x{} extent={}x{} moved={moved}",
+            "scroll #{handle} target=#{} logical=({}, {}) limits=({max_x}, {max_y}) display=({x:.0}, {y:.0}) target={}x{} bounds={}x{} extent={}x{}",
             state.target,
             state.x,
             state.y,
@@ -2753,19 +3070,234 @@ impl RuntimeTraceApi {
                     .map(|layer| (layer.width, layer.height))
             })
             .or_else(|| {
-                let resource = self
-                    .graph_object_properties
-                    .get(&target)
-                    .and_then(|properties| properties.format_resource)?;
-                self.resource_image_region(resource)
-                    .map(|(_, region)| (region.width, region.height))
-                    .or_else(|| {
-                        self.bitmap_dimensions
-                            .get(&resource)
-                            .map(|&(width, height)| (width as f32, height as f32))
-                    })
+                let properties = self.graph_object_properties.get(&target)?;
+                // The target Knob asks the controlled object's virtual bounds,
+                // not a specific bitmap slot. Prefer the rendered primary; for
+                // an otherwise geometry-only control keep the host's existing
+                // mask/aux descriptor fallback so separating those resource
+                // slots does not collapse a preconfigured Knob range.
+                [
+                    properties.format_resource,
+                    properties.hit_mask_resource,
+                    properties.aux_resource,
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(|resource| {
+                    self.resource_image_region(resource)
+                        .map(|(_, region)| (region.width, region.height))
+                        .or_else(|| {
+                            self.bitmap_dimensions
+                                .get(&resource)
+                                .map(|&(width, height)| (width as f32, height as f32))
+                        })
+                })
             })
             .unwrap_or((1.0, 1.0))
+    }
+
+    fn graph_knob_target_screen_rect(&self, target: i32) -> Option<(f32, f32, f32, f32)> {
+        if !self.graph_object_enabled.get(&target).copied().unwrap_or(true)
+            || !self
+                .graph_object_draw_enabled
+                .get(&target)
+                .copied()
+                .unwrap_or(true)
+        {
+            return None;
+        }
+
+        let resolve = |layer_id: i32, layer: &RuntimeGraphLayer| {
+            if !layer.enabled {
+                return None;
+            }
+            let (x, y, _) = self.layer_world_transform(layer_id, layer);
+            let width = layer.width.max(1.0) * layer.scale_x.abs().max(f32::EPSILON);
+            let height = layer.height.max(1.0) * layer.scale_y.abs().max(f32::EPSILON);
+            Some((x, y, width, height))
+        };
+
+        if let Some(layer) = self.graph_layers.get(&target) {
+            if let Some(rect) = resolve(target, layer) {
+                return Some(rect);
+            }
+        }
+        if let Some(layers) = self.graph_object_layers.get(&target) {
+            for layer_id in layers.iter().rev() {
+                if let Some(layer) = self.graph_layers.get(layer_id) {
+                    if let Some(rect) = resolve(*layer_id, layer) {
+                        return Some(rect);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the topmost live CDspObjKnob under the pointer. Target
+    /// sub_463780 walks the knob manager's native-sort-ordered list and then
+    /// asks the pointer-scope system to validate the controlled object's
+    /// rectangle. The portable manager keeps the same sort key through the
+    /// target Sprite, so choose the largest active key among accepted rects.
+    fn graph_knob_at_point(&self, point: (f32, f32)) -> Option<i32> {
+        self.graph_knob_states
+            .iter()
+            .filter_map(|(&handle, state)| {
+                if !state.enabled {
+                    return None;
+                }
+                let (x, y, width, height) = self.graph_knob_target_screen_rect(state.target)?;
+                if point.0 < x || point.1 < y || point.0 >= x + width || point.1 >= y + height {
+                    return None;
+                }
+                Some((self.graph90_native_sort_key(handle).unwrap_or_default(), handle))
+            })
+            .max()
+            .map(|(_, handle)| handle)
+    }
+
+    /// WM_LBUTTONDOWN knob capture: target sub_463780/sub_4637C0 selects one
+    /// knob before generic left-button input is generated, then sub_4212A0
+    /// captures the mouse-to-thumb offset.
+    fn process_graph_knob_mouse_press(&mut self, point: (f32, f32)) -> bool {
+        let Some(handle) = self.graph_knob_at_point(point) else {
+            return false;
+        };
+        let Some(state) = self.graph_knob_states.get(&handle).copied() else {
+            return false;
+        };
+        let Some((target_x, target_y, _, _)) = self.graph_knob_target_screen_rect(state.target)
+        else {
+            return false;
+        };
+        if let Some(state) = self.graph_knob_states.get_mut(&handle) {
+            state.begin_drag(point.0, point.1, target_x, target_y);
+        }
+        self.graph_active_input_handle = handle;
+        tracing::info!(
+            handle,
+            target = state.target,
+            mouse_x = point.0,
+            mouse_y = point.1,
+            target_x,
+            target_y,
+            relative_mode = state.relative_mode,
+            "GraphKnobBeginDrag"
+        );
+        true
+    }
+
+    /// Per-mouse-move equivalent of sub_4639C0 -> sub_421300. The origin is
+    /// reconstructed from the current target position minus its current
+    /// logical offset, which keeps parent/window placement out of the knob's
+    /// local 0..range coordinate system.
+    fn process_graph_knob_pointer_motion(&mut self, point: (f32, f32)) -> bool {
+        let handle = self.graph_active_input_handle;
+        if handle == 0 {
+            return false;
+        }
+        let Some(state_before) = self.graph_knob_states.get(&handle).copied() else {
+            self.graph_active_input_handle = 0;
+            return false;
+        };
+        if !state_before.enabled {
+            self.graph_active_input_handle = 0;
+            return false;
+        }
+        let Some((target_x, target_y, _, _)) =
+            self.graph_knob_target_screen_rect(state_before.target)
+        else {
+            return true;
+        };
+        let (target_width, target_height) = self.graph_knob_target_dimensions(state_before.target);
+        let (local_display_x, local_display_y) =
+            state_before.display_position(target_width, target_height);
+        let offset_x = local_display_x - state_before.base_x;
+        let offset_y = local_display_y - state_before.base_y;
+        let origin_x = target_x - offset_x;
+        let origin_y = target_y - offset_y;
+        let changed = self
+            .graph_knob_states
+            .get_mut(&handle)
+            .map(|state| {
+                state.drag_to(
+                    point.0,
+                    point.1,
+                    origin_x,
+                    origin_y,
+                    target_width,
+                    target_height,
+                )
+            })
+            .unwrap_or(false);
+        if changed {
+            self.apply_graph_knob_position(handle);
+            if let Some(state) = self.graph_knob_states.get(&handle) {
+                tracing::info!(
+                    handle,
+                    target = state.target,
+                    x = state.x,
+                    y = state.y,
+                    "GraphKnobDragChanged"
+                );
+            }
+        }
+        true
+    }
+
+    /// WM_LBUTTONUP ends the active native knob gesture before the generic
+    /// message/icon input system sees a release. Target WndProc keeps a
+    /// separate knob-capture flag for exactly this reason.
+    fn process_graph_knob_mouse_release(&mut self, point: (f32, f32)) -> bool {
+        let handle = self.graph_active_input_handle;
+        if handle == 0 {
+            return false;
+        }
+        let _ = self.process_graph_knob_pointer_motion(point);
+        self.graph_active_input_handle = 0;
+        tracing::info!(handle, mouse_x = point.0, mouse_y = point.1, "GraphKnobEndDrag");
+        true
+    }
+
+    /// WM_MOUSEWHEEL equivalent of sub_463880/sub_463920. The native watch
+    /// list is independent of hover/capture: its first node consumes the wheel
+    /// and changes the watched Knob's logical Y coordinate by exactly one.
+    fn process_graph_knob_mouse_wheel(&mut self, delta_y: f32) -> bool {
+        let Some(&handle) = self.graph_knob_watches.front() else {
+            return false;
+        };
+        let Some(state_before) = self.graph_knob_states.get(&handle).copied() else {
+            // A destroyed knob cannot remain a live target list node in the
+            // native manager. Drop stale portable nodes defensively.
+            self.graph_knob_watches.pop_front();
+            return false;
+        };
+        if delta_y == 0.0 {
+            return true;
+        }
+        // WndProc passes (wheel_delta < 0) to sub_463920. sub_421520 then
+        // converts false -> -1 and true -> +1.
+        let logical_delta = if delta_y < 0.0 { 1 } else { -1 };
+        let dimensions = self.graph_knob_target_dimensions(state_before.target);
+        let accepted = self
+            .graph_knob_states
+            .get_mut(&handle)
+            .is_some_and(|state| state.wheel_step(logical_delta, dimensions.0, dimensions.1));
+        if accepted {
+            self.apply_graph_knob_position(handle);
+        }
+        let state = self.graph_knob_states.get(&handle).copied().unwrap_or(state_before);
+        tracing::info!(
+            handle,
+            target = state.target,
+            wheel_delta = delta_y,
+            logical_delta,
+            accepted,
+            x = state.x,
+            y = state.y,
+            "GraphKnobWheel"
+        );
+        true
     }
 
     fn apply_graph_layer_property(&mut self, args: &[ethornell_vm::Value]) {
@@ -3061,6 +3593,7 @@ impl RuntimeTraceApi {
         self.surface_text_buffers.remove(&surface);
         self.graph_object_layers.remove(&surface);
         self.graph_object_enabled.remove(&surface);
+        self.graph_object_draw_enabled.remove(&surface);
         self.graph_object_properties.remove(&surface);
         self.graph_object_input_tables.remove(&surface);
         self.graph_input_objects.remove(&surface);
@@ -3091,49 +3624,93 @@ impl RuntimeTraceApi {
         }
     }
 
+    /// Target DCIPIcon/DCIPIconEx materialization installs item mask_resource
+    /// through sub_41BC70 on the CDspObjVirtual hit wrapper.  The generated
+    /// 1-bit mask uses native-format-specific nonzero tests rather than the
+    /// visual Sprite's alpha.  A missing resource (and the target sentinel -2)
+    /// leaves the Virtual rectangle unmasked.
+    fn graph_input_item_mask_accepts(
+        &self,
+        region: ethornell_vm::GraphInputRegion,
+        local_x: i32,
+        local_y: i32,
+    ) -> bool {
+        if region.mask_resource == -2 {
+            return true;
+        }
+        let Some(image) = self.graph_bitmap_image(region.mask_resource) else {
+            return true;
+        };
+        if local_x < 0
+            || local_y < 0
+            || local_x as u32 >= image.width
+            || local_y as u32 >= image.height
+        {
+            return false;
+        }
+        let offset = ((local_y as u32 * image.width + local_x as u32) * 4) as usize;
+        let pixel = &image.rgba[offset..offset + 4];
+        match self
+            .bitmap_formats
+            .get(&region.mask_resource)
+            .copied()
+            .unwrap_or(2)
+        {
+            // sub_41BC70 format 0 tests the native 16-bit word and format 1
+            // tests packed RGB24. Decoding expands both into RGB channels.
+            0 | 1 => pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0,
+            // Native format 2 tests the high alpha byte.
+            2 => pixel[3] != 0,
+            // Native format 3 is a one-byte coverage image; decoding expands
+            // that byte to the first color channel.
+            3 => pixel[0] != 0,
+            _ => true,
+        }
+    }
+
     fn hit_test_graph_input_object(
         &self,
         object: i32,
         screen_point: (f32, f32),
     ) -> Option<(ethornell_vm::GraphInputRegion, i32, i32)> {
         let input = self.graph_input_objects.get(&object)?;
-        // DCIPIcon owns a CDspObjWindow and sub_44A900 attaches every icon
-        // Sprite to that Window with sub_41AB40. CDspObjVirtual::IsEnabled
-        // (sub_42AD30) delegates to the parent, so a disabled/hidden Window
-        // cannot receive pointer hits through one of its configured children.
+        // DCIPIcon owns a CDspObjWindow and its live item children inherit the
+        // Window enable state. A disabled/hidden Window cannot receive a hit.
         if self.graph_surfaces.get(&input.layer).is_some_and(|surface| {
             !self.surface_display_chain_visible(input.layer, surface)
         }) {
             return None;
         }
-        // Extended root+0x20 disables DCIPIcon pointer processing. Target
-        // sub_4495C0 returns -1 before hit-testing when DCIPIcon+0x88 is zero.
+        // Extended root+0x20 disables pointer processing before item lookup.
         if !input.descriptor.pointer_processing_enabled {
             return None;
         }
 
-        // Target sub_447C10/sub_44A900 creates one child CDspObjSprite for
-        // every live icon item and attaches it to the input Window with
-        // sub_41AB40. sub_4495C0 then asks that *actual child Sprite* for its
-        // final screen rectangle (vtable+0x24) before testing the cursor. The
-        // compact descriptor coordinates are construction-time local offsets;
-        // using them directly after the Window/Group moves separates the
-        // clickable rectangle from the button that the GUI actually draws.
+        // Target sub_4495C0 does NOT hit-test the renderer bitmap Sprite. Each
+        // DCIPIcon/DCIPIconEx item owns a CDspObjVirtual wrapper. sub_44A900
+        // sizes that Virtual through sub_41AB10 from the configure-time bitmap
+        // descriptor returned by sub_407F20, then sub_41AB40 attaches it at the
+        // item x/y. CDspObjVirtual::vtable+0x24 (sub_41B160) returns that final
+        // screen rectangle. Descriptor w/h and renderer clipping are not part
+        // of the hit rectangle.
         //
-        // surface_controls is the portable mirror of those child Sprites, so
-        // prefer its renderer-facing world rectangle. Fall back to the compact
-        // descriptor path only when no native visual child was materialized
-        // (e.g. a hand-built test descriptor without bitmap resources).
-        let mut has_materialized_visual = false;
+        // Also keep item children isolated by processor. Multiple processors
+        // can reference the same Window simultaneously; target processors have
+        // independent child arrays, so one processor must never hit another
+        // processor's materialized layers.
+        let owner = SurfaceControlOwner::InputObject(object);
+        let mut has_materialized_virtual = false;
         let mut visual_hit: Option<(ethornell_vm::GraphInputRegion, i32, i32, i32)> = None;
         for (&layer_id, layer) in &self.graph_layers {
             if layer.target_surface != Some(input.layer)
-                || !self.surface_controls.contains_layer(layer_id)
+                || !self
+                    .surface_controls
+                    .contains_layer_for_owner(owner, layer_id)
                 || !layer.enabled
             {
                 continue;
             }
-            has_materialized_visual = true;
+            has_materialized_virtual = true;
             let Ok(ordinal) = usize::try_from(layer.hit_id) else {
                 continue;
             };
@@ -3143,11 +3720,35 @@ impl RuntimeTraceApi {
             if region.enabled_depth == 0 {
                 continue;
             }
+            if !input.pointer_hit_eligible(region) {
+                tracing::debug!(
+                    target: "graph_input",
+                    object,
+                    group = region.group,
+                    item = region.index,
+                    item_enabled = input.item_enabled(region.group, region.index),
+                    current_selection = input.is_current_selection(region.group, region.index),
+                    current_selection_hit_excluded = region.current_selection_hit_excluded,
+                    "skip target-ineligible icon input item"
+                );
+                continue;
+            }
+
+            let configure_resource = native_surface_control_configure_resource(&region);
+            let (hit_width, hit_height) = self
+                .resource_image_region(configure_resource)
+                .map(|(_, source)| (source.width, source.height))
+                // A live layer normally implies the configure bitmap resolved.
+                // Keep a conservative fallback only for restored/synthetic
+                // runtime state where the resource cache was discarded.
+                .unwrap_or((layer.width.max(0.0), layer.height.max(0.0)));
+            if hit_width <= 0.0 || hit_height <= 0.0 {
+                continue;
+            }
+
             let (left, top, _) = self.layer_world_transform(layer_id, layer);
-            let width = (layer.width * layer.scale_x.abs()).max(0.0);
-            let height = (layer.height * layer.scale_y.abs()).max(0.0);
-            let right = left + width;
-            let bottom = top + height;
+            let right = left + hit_width;
+            let bottom = top + hit_height;
             if screen_point.0 < left
                 || screen_point.0 >= right
                 || screen_point.1 < top
@@ -3155,14 +3756,12 @@ impl RuntimeTraceApi {
             {
                 continue;
             }
-            if self.layer_display_clip(layer).is_some_and(|clip| {
-                screen_point.0 < clip.x
-                    || screen_point.0 >= clip.x + clip.width
-                    || screen_point.1 < clip.y
-                    || screen_point.1 >= clip.y + clip.height
-            }) {
-                continue;
-            }
+
+            // sub_4495C0 uses the Virtual's vtable+0x24 rectangle directly.
+            // It does not additionally intersect the item with the renderer's
+            // Window clip here. Adding layer_display_clip() made edge controls
+            // visible but unclickable whenever their logical Window viewport
+            // differed from the private CObjectManager composition.
             let native_depth = if region.flags & 0x10 != 0 {
                 region.enabled_depth
             } else if region.flags & 0x02 != 0 {
@@ -3170,8 +3769,21 @@ impl RuntimeTraceApi {
             } else {
                 region.ordinal
             };
-            let local_x = (screen_point.0 - left).round() as i32;
-            let local_y = (screen_point.1 - top).round() as i32;
+            let local_x = (screen_point.0 - left).floor() as i32;
+            let local_y = (screen_point.1 - top).floor() as i32;
+            if !self.graph_input_item_mask_accepts(region, local_x, local_y) {
+                tracing::debug!(
+                    target: "graph_input",
+                    object,
+                    group = region.group,
+                    item = region.index,
+                    mask_resource = region.mask_resource,
+                    local_x,
+                    local_y,
+                    "skip icon input item outside target hit mask"
+                );
+                continue;
+            }
             if visual_hit
                 .as_ref()
                 .is_none_or(|(_, _, _, depth)| native_depth >= *depth)
@@ -3182,16 +3794,30 @@ impl RuntimeTraceApi {
         if let Some((region, local_x, local_y, _)) = visual_hit {
             return Some((region, local_x, local_y));
         }
-        if has_materialized_visual {
+        if has_materialized_virtual {
             return None;
         }
 
+        // Descriptor-only fallback exists for synthetic/tests where no target
+        // child could be materialized at all. A real live target item always
+        // uses the Virtual path above.
         let origin = if self.graph_surfaces.contains_key(&input.layer) {
             self.surface_world_position(input.layer)
         } else {
             (0.0, 0.0)
         };
-        input.hit_test((screen_point.0 - origin.0, screen_point.1 - origin.1))
+        let valid_origin = if input.descriptor.compact_uses_valid_region_origin {
+            self.graph_surfaces
+                .get(&input.layer)
+                .map(|record| (record.valid_left as f32, record.valid_top as f32))
+                .unwrap_or_default()
+        } else {
+            (0.0, 0.0)
+        };
+        input.hit_test((
+            screen_point.0 - origin.0 - valid_origin.0,
+            screen_point.1 - origin.1 - valid_origin.1,
+        ))
     }
 
     fn graph_input_object_local_point(&self, object: i32, screen_point: (f32, f32)) -> (i32, i32) {
@@ -4640,6 +5266,13 @@ impl RuntimeTraceApi {
         if let Some(format) = self.bitmap_formats.get(&source).copied() {
             self.bitmap_formats.insert(destination, format);
         }
+        // Target sub_403450 copies bitmap-registry DWORDs +0x28/+0x2C
+        // after allocating the destination. Missing source metadata means the
+        // freshly allocated destination remains at the allocator default -1/-1.
+        self.reset_bitmap_auxiliary_pair(destination);
+        if let Some(pair) = self.bitmap_auxiliary_pairs.get(&source).copied() {
+            self.bitmap_auxiliary_pairs.insert(destination, pair);
+        }
         let mut surface =
             RuntimeSurface::bitmap(destination, dimensions.0 as f32, dimensions.1 as f32);
         if let Some(source_surface) = self.graph_surfaces.get(&source) {
@@ -4746,15 +5379,78 @@ impl RuntimeTraceApi {
         ))
     }
 
-    fn replace_surface_control_layers(
+    fn surface_control_region_position(
+        &self,
+        surface: i32,
+        descriptor: &ethornell_vm::GraphInputDescriptor,
+        region: &ethornell_vm::GraphInputRegion,
+    ) -> (i32, i32) {
+        // Compact DCIPIcon constructor sub_447C10 obtains the owning
+        // CDspObjWindow valid rectangle through sub_42C2A0 and adds its
+        // left/top to every descriptor item offset. DCIPIconEx sub_44A900
+        // uses the extended descriptor item coordinates directly. Keep this
+        // one coordinate rule shared by construction, visual-state refresh,
+        // and descriptor-only fallback hit testing so hover/selection cannot
+        // move a compact button away from its native child-Sprite rectangle.
+        let (origin_x, origin_y) = if descriptor.compact_uses_valid_region_origin {
+            self.graph_surfaces
+                .get(&surface)
+                .map(|record| (record.valid_left, record.valid_top))
+                .unwrap_or_default()
+        } else {
+            (0, 0)
+        };
+        (
+            region.x.saturating_add(origin_x),
+            region.y.saturating_add(origin_y),
+        )
+    }
+
+    fn replace_surface_control_layers_for_owner(
         &mut self,
+        owner: SurfaceControlOwner,
         surface: i32,
         descriptor: &ethornell_vm::GraphInputDescriptor,
     ) -> usize {
-        if self.surface_controls.is_unchanged(surface, descriptor) {
-            return self.surface_controls.layer_count(surface);
+        // A descriptor can be installed before every referenced bitmap has
+        // become materializable in the portable resource cache. Target
+        // sub_447C10/sub_44A900 keeps the logical item records even when one
+        // child Sprite cannot be constructed; it does not permanently erase
+        // the item. Therefore descriptor equality alone is not enough to skip
+        // rebuilding: retry whenever the set of currently resolvable items is
+        // different from the set of materialized child layers.
+        let desired_ordinals = descriptor
+            .regions
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, region)| {
+                if region.enabled_depth == 0 {
+                    return None;
+                }
+                let resource_id = native_surface_control_configure_resource(region);
+                self.resource_image_region(resource_id).map(|_| ordinal)
+            })
+            .collect::<BTreeSet<_>>();
+        let materialized_ordinals = self
+            .graph_layers
+            .iter()
+            .filter_map(|(&layer_id, layer)| {
+                (layer.target_surface == Some(surface)
+                    && self
+                        .surface_controls
+                        .contains_layer_for_owner(owner, layer_id))
+                    .then(|| usize::try_from(layer.hit_id).ok())
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        if self
+            .surface_controls
+            .is_unchanged(owner, surface, descriptor)
+            && desired_ordinals == materialized_ordinals
+        {
+            return materialized_ordinals.len();
         }
-        for layer in self.surface_controls.remove(surface) {
+        for layer in self.surface_controls.remove_owner(owner) {
             self.graph_layers.remove(&layer);
             self.release_screen_text_node(layer);
         }
@@ -4763,6 +5459,14 @@ impl RuntimeTraceApi {
         // window's private CObjectManager. Their depth is local to that
         // manager; the tagged window handle is not a render priority.
         let base_z: i32 = 0;
+        let item_states = match owner {
+            SurfaceControlOwner::InputObject(object) => self
+                .graph_input_objects
+                .get(&object)
+                .map(|input| input.item_states.clone())
+                .unwrap_or_default(),
+            SurfaceControlOwner::Surface(_) => BTreeMap::new(),
+        };
         let controls = descriptor
             .regions
             .iter()
@@ -4771,30 +5475,15 @@ impl RuntimeTraceApi {
                 if region.enabled_depth == 0 {
                     return None;
                 }
-                let selected = region.selected && region.selected_resource >= 0;
-                let preferred = if selected {
-                    region.selected_resource
-                } else {
-                    region.normal_resource
-                };
-                let resource_id = self
-                    .resource_image_region(preferred)
-                    .map(|_| preferred)
-                    .or_else(|| {
-                        self.resource_image_region(region.normal_resource)
-                            .map(|_| region.normal_resource)
-                    })?;
+                let resource_id = native_surface_control_configure_resource(region);
                 let (key, source) = self.resource_image_region(resource_id)?;
-                let width = if region.width > 0 {
-                    region.width as f32
-                } else {
-                    source.width
-                };
-                let height = if region.height > 0 {
-                    region.height as f32
-                } else {
-                    source.height
-                };
+                // Extended item+0x10/+0x14 are mode-5 transform/origin
+                // parameters. sub_44A900 passes them to sub_42BED0 while the
+                // child Sprite keeps the configure bitmap's intrinsic raster
+                // dimensions. Treating those fields as width/height scaled or
+                // collapsed Log controls, including the scroll arrows.
+                let width = source.width;
+                let height = source.height;
                 Some((
                     ordinal,
                     resource_id,
@@ -4807,10 +5496,18 @@ impl RuntimeTraceApi {
             })
             .collect::<Vec<_>>();
 
+        let valid_origin = self
+            .graph_surfaces
+            .get(&surface)
+            .map(|record| (record.valid_left, record.valid_top))
+            .unwrap_or_default();
+
         let mut layer_ids = BTreeSet::new();
         for (ordinal, resource_id, key, source, width, height, region) in controls {
             let layer_id = self.alloc_node();
             let z = base_z.saturating_add(native_surface_control_depth(region));
+            let (control_x, control_y) =
+                self.surface_control_region_position(surface, descriptor, region);
             self.graph_layers.insert(
                 layer_id,
                 RuntimeGraphLayer {
@@ -4818,15 +5515,19 @@ impl RuntimeTraceApi {
                     owner_object: None,
                     key: key.clone(),
                     target_surface: Some(surface),
-                    x: region.x as f32,
-                    y: region.y as f32,
+                    x: control_x as f32,
+                    y: control_y as f32,
                     width,
                     height,
                     src_x: source.x,
                     src_y: source.y,
                     opacity: 1.0,
                     z,
-                    enabled: true,
+                    enabled: item_states
+                        .get(&(region.group, region.index))
+                        .copied()
+                        .unwrap_or(1)
+                        != 0,
                     transform_x: 0.0,
                     transform_y: 0.0,
                     transform_z: 0,
@@ -4839,8 +5540,8 @@ impl RuntimeTraceApi {
             if self.configure_image_bitmap_text_node(
                 layer_id,
                 resource_id,
-                region.x as f32,
-                region.y as f32,
+                control_x as f32,
+                control_y as f32,
                 z,
                 None,
             ) {
@@ -4849,21 +5550,25 @@ impl RuntimeTraceApi {
             layer_ids.insert(layer_id);
             trace_graph!(
                 self,
-                "surface #{surface} control layer #{layer_id} group={} index={} selected={} resource=#{resource_id} {key} rect=({},{} {}x{}) z={}",
+                "surface #{surface} control layer #{layer_id} group={} index={} selected={} resource=#{resource_id} {key} rect=({},{} {}x{}) descriptor=({}, {}) valid_origin=({}, {}) z={}",
                 region.group,
                 region.index,
                 region.selected,
-                region.x,
-                region.y,
+                control_x,
+                control_y,
                 width,
                 height,
+                region.x,
+                region.y,
+                valid_origin.0,
+                valid_origin.1,
                 base_z.saturating_add(native_surface_control_depth(region))
             );
         }
         let count = layer_ids.len();
         for stale in self
             .surface_controls
-            .replace(surface, descriptor.clone(), layer_ids)
+            .replace(owner, surface, descriptor.clone(), layer_ids)
         {
             self.graph_layers.remove(&stale);
             self.release_screen_text_node(stale);
@@ -4871,8 +5576,43 @@ impl RuntimeTraceApi {
         count
     }
 
+    fn replace_surface_control_layers(
+        &mut self,
+        surface: i32,
+        descriptor: &ethornell_vm::GraphInputDescriptor,
+    ) -> usize {
+        self.replace_surface_control_layers_for_owner(
+            SurfaceControlOwner::Surface(surface),
+            surface,
+            descriptor,
+        )
+    }
+
+    fn replace_graph_input_control_layers(
+        &mut self,
+        object: i32,
+        surface: i32,
+        descriptor: &ethornell_vm::GraphInputDescriptor,
+    ) -> usize {
+        self.replace_surface_control_layers_for_owner(
+            SurfaceControlOwner::InputObject(object),
+            surface,
+            descriptor,
+        )
+    }
+
+    fn remove_graph_input_control_layers(&mut self, object: i32) {
+        for layer in self
+            .surface_controls
+            .remove_owner(SurfaceControlOwner::InputObject(object))
+        {
+            self.graph_layers.remove(&layer);
+            self.release_screen_text_node(layer);
+        }
+    }
+
     fn remove_surface_control_layers(&mut self, surface: i32) {
-        for layer in self.surface_controls.remove(surface) {
+        for layer in self.surface_controls.remove_surface(surface) {
             self.graph_layers.remove(&layer);
             self.release_screen_text_node(layer);
         }
@@ -4921,6 +5661,21 @@ impl RuntimeTraceApi {
         };
 
         if alpha_parameter == 0
+            && mode == 128
+            && source_format == Some(1)
+            && destination_format == Some(2)
+        {
+            // sub_40AF50: when a format-1 RGB source is copied into a
+            // format-2 bitmap, the target preserves RGB and forces alpha to
+            // 255. The fourth decoded byte of a format-1 resource is not
+            // source alpha and must never leak into the destination.
+            blit_decoded_image_format1_to_format2(
+                &mut destination_image,
+                &source_image,
+                x,
+                y,
+            );
+        } else if alpha_parameter == 0
             && mode == 128
             && source_format.is_some()
             && source_format == destination_format
@@ -5024,6 +5779,37 @@ impl RuntimeTraceApi {
         Some(key)
     }
 
+    fn graph_object_alpha_debug_state(&self, object: i32) -> (i32, i32, f32) {
+        self.graph_object_properties
+            .get(&object)
+            .map(|properties| {
+                (
+                    properties.alpha_parameter(),
+                    properties.transparency_parameter(),
+                    properties.opacity(),
+                )
+            })
+            .unwrap_or((0, 0, 1.0))
+    }
+
+    fn log_graph_object_base_alpha_changed(
+        &self,
+        object: i32,
+        requested_alpha: i32,
+        before: (i32, i32, f32),
+    ) {
+        let after = self.graph_object_alpha_debug_state(object);
+        tracing::info!(
+            object,
+            requested_alpha,
+            before = ?before,
+            after = ?after,
+            native_owner = ?self.graph_native_owners.get(&object),
+            display_parent = ?self.display_tree.parent(object),
+            "GraphObjectBaseAlphaChanged"
+        );
+    }
+
     fn set_graph_object_alpha_one(&mut self, object: i32, alpha_parameter: i32) {
         let alpha_parameter = alpha_parameter.clamp(0, 256);
         if let Some(transition_mode) = self
@@ -5040,6 +5826,7 @@ impl RuntimeTraceApi {
             let update_base_alpha = matches!(transition_mode, -1 | 0 | 2 | 3);
             let update_transition = matches!(transition_mode, 1 | 2);
             if update_base_alpha {
+                let before = self.graph_object_alpha_debug_state(object);
                 self.graph_object_properties
                     .entry(object)
                     .or_default()
@@ -5047,6 +5834,7 @@ impl RuntimeTraceApi {
                 if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
                     transition.alpha_parameter = alpha_parameter;
                 }
+                self.log_graph_object_base_alpha_changed(object, alpha_parameter, before);
             }
             let key = if update_transition {
                 if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
@@ -5061,10 +5849,12 @@ impl RuntimeTraceApi {
                 "sprite mode1 #{object} SetAlpha={alpha_parameter} selector={transition_mode} rebuild={update_transition} key={key:?}"
             );
         } else {
+            let before = self.graph_object_alpha_debug_state(object);
             self.graph_object_properties
                 .entry(object)
                 .or_default()
                 .set_alpha_parameter(alpha_parameter);
+            self.log_graph_object_base_alpha_changed(object, alpha_parameter, before);
             let _ = self.graph90_refresh_backf_primary(object);
         }
     }
@@ -5076,7 +5866,7 @@ impl RuntimeTraceApi {
             return;
         }
         self.display_tree.register_inferred(object);
-        let objects = self.graph_native_descendants_inclusive(object);
+        let objects = self.graph_native_virtual_descendants_inclusive(object);
         for object in objects {
             self.set_graph_object_alpha_one(object, alpha_parameter);
         }
@@ -5096,7 +5886,7 @@ impl RuntimeTraceApi {
             return;
         }
         self.display_tree.register_inferred(object);
-        let objects = self.graph_native_descendants_inclusive(object);
+        let objects = self.graph_native_virtual_descendants_inclusive(object);
         for object in objects {
             if let Some(transition_mode) = self
                 .graph_transition_nodes
@@ -5106,6 +5896,7 @@ impl RuntimeTraceApi {
                 let update_base_alpha = matches!(transition_mode, -1 | 0 | 2 | 3);
                 let update_transition = matches!(transition_mode, 1 | 2);
                 if update_base_alpha {
+                    let before = self.graph_object_alpha_debug_state(object);
                     self.graph_object_properties
                         .entry(object)
                         .or_default()
@@ -5113,6 +5904,7 @@ impl RuntimeTraceApi {
                     if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
                         transition.alpha_parameter = alpha_parameter;
                     }
+                    self.log_graph_object_base_alpha_changed(object, alpha_parameter, before);
                 }
                 let key = if update_transition {
                     if let Some(transition) = self.graph_transition_nodes.get_mut(&object) {
@@ -5127,10 +5919,12 @@ impl RuntimeTraceApi {
                     "sprite mode1 #{object} raw SetAlpha={alpha_parameter} selector={transition_mode} rebuild={update_transition} key={key:?}"
                 );
             } else {
+                let before = self.graph_object_alpha_debug_state(object);
                 self.graph_object_properties
                     .entry(object)
                     .or_default()
                     .set_alpha_parameter(alpha_parameter);
+                self.log_graph_object_base_alpha_changed(object, alpha_parameter, before);
                 let _ = self.graph90_refresh_backf_primary(object);
             }
         }
@@ -5447,6 +6241,22 @@ impl RuntimeTraceApi {
         })
     }
 
+    /// Returns whether the native source bitmap uses target format 1 (XRGB).
+    /// Its fourth byte is software-blitter payload, not source coverage. The
+    /// one exception here is a renderer-local BackF texture whose alpha was
+    /// synthesized explicitly from the recovered native mask operation.
+    fn graph_layer_ignores_source_alpha(&self, layer_id: i32, layer: &RuntimeGraphLayer) -> bool {
+        if layer.key.starts_with("runtime:backf:") {
+            return false;
+        }
+        let display_object = layer.owner_object.unwrap_or(layer_id);
+        self.graph_object_properties
+            .get(&display_object)
+            .and_then(|properties| properties.format_resource)
+            .and_then(|bitmap| self.bitmap_formats.get(&bitmap).copied())
+            == Some(1)
+    }
+
     fn graph_draw_items(&self) -> Vec<RuntimeGraphDrawItem> {
         let mut items = Vec::new();
         // Compatibility-only title items are added only when the target graph
@@ -5618,6 +6428,28 @@ impl RuntimeTraceApi {
                 continue;
             }
             let (x, y, mut z) = self.layer_world_transform(*layer_id, layer);
+            // Mode5 render state belongs to the sprite's primary layer, whose
+            // layer id is the sprite id. Do not apply it to nested auxiliary
+            // layers that merely share the same owner.
+            let mode5_render_state = self.graph_mode5_render_states.get(layer_id).copied();
+            let destination_quad = mode5_render_state.map(|state| {
+                state
+                    .local_affine_quad
+                    .map(|[local_x, local_y]| [x + local_x, y + local_y])
+            });
+            // sub_41AFD0 clips the transformed mode-5 object against its
+            // raster bounding rectangle before sub_41C190 converts the clip
+            // to object-local coordinates. The affine source footprint may
+            // extend by half a texel, so keep the native bbox as an explicit
+            // scissor instead of allowing the GPU quad to enlarge the object.
+            let mut draw_clip = self.layer_display_clip(layer);
+            if mode5_render_state.is_some() {
+                let raster_clip = RuntimeClipRect { x, y, width, height };
+                draw_clip = Some(match draw_clip {
+                    Some(existing) => existing.intersection(raster_clip),
+                    None => raster_clip,
+                });
+            }
             let mut order_serial = self.display_order_serial(*layer_id, layer.owner_object);
             if self.surface_controls.contains_layer(*layer_id) {
                 if let Some(surface) = layer
@@ -5647,8 +6479,13 @@ impl RuntimeTraceApi {
                 src_width,
                 src_height,
                 opacity,
+                ignore_source_alpha: self.graph_layer_ignores_source_alpha(*layer_id, layer),
                 rotation_degrees: layer.rotation_degrees,
-                clip: self.layer_display_clip(layer),
+                destination_quad,
+                linear_sampling: mode5_render_state
+                    .map(|state| state.linear_sampling)
+                    .unwrap_or(true),
+                clip: draw_clip,
                 z,
                 blend_mode,
                 order_serial,
@@ -5689,7 +6526,10 @@ impl RuntimeTraceApi {
                 src_width,
                 src_height,
                 opacity: rain.opacity,
+                ignore_source_alpha: false,
                 rotation_degrees: 0.0,
+                destination_quad: None,
+                linear_sampling: true,
                 clip: None,
                 z: rain.z,
                 blend_mode: rain.blend_mode,
@@ -5845,7 +6685,12 @@ impl RuntimeTraceApi {
                 src_width: width,
                 src_height: height,
                 opacity: self.surface_display_opacity(surface.id),
+                ignore_source_alpha: surface.resource_id
+                    .and_then(|bitmap| self.bitmap_formats.get(&bitmap).copied())
+                    == Some(1),
                 rotation_degrees: 0.0,
+                destination_quad: None,
+                linear_sampling: true,
                 clip: self.surface_chain_clip(surface.id),
                 z: self.display_tree.effective_depth(surface.id, surface.z),
                 blend_mode,
@@ -5988,6 +6833,15 @@ impl RuntimeTraceApi {
     }
 
     fn push_title_compatibility_items(&self, items: &mut Vec<RuntimeGraphDrawItem>) {
+        // This is a host-only historical bring-up path. Target GraphLoadResource
+        // does not make a bitmap visible; visibility starts only after the BP
+        // script constructs/configures its display objects. Enabling this path
+        // during normal execution exposes SGTitle at opacity 1 before a native
+        // 90:56 call can establish transparency=256, producing an impossible
+        // `opaque -> transparent -> fade-in` frame.
+        if !self.title_compatibility_render_fallback {
+            return;
+        }
         if !self.title_ui_active || self.title_ui_departed {
             return;
         }
@@ -6054,7 +6908,10 @@ impl RuntimeTraceApi {
                 src_width: image.width as f32,
                 src_height: image.height as f32,
                 opacity: 1.0,
+                ignore_source_alpha: false,
                 rotation_degrees: 0.0,
+                destination_quad: None,
+                linear_sampling: true,
                 clip: None,
                 z,
                 blend_mode: 128,
@@ -6122,7 +6979,10 @@ impl RuntimeTraceApi {
                 src_width: source.width,
                 src_height: source.height,
                 opacity: 1.0,
+                ignore_source_alpha: false,
                 rotation_degrees: 0.0,
+                destination_quad: None,
+                linear_sampling: true,
                 clip: None,
                 z: 4,
                 blend_mode: 1,
@@ -6864,7 +7724,7 @@ mod input_tests {
     use super::text_anim::RuntimeRubySpan;
     use super::{
         input_class_state_for_descriptor, input_state_for_descriptor, DecodedImage,
-        BACK_F_SECONDARY_LAYER_ID,
+        SurfaceControlOwner, BACK_F_SECONDARY_LAYER_ID,
         INPUT_DESCRIPTOR_DOWN, INPUT_DESCRIPTOR_ENTER, INPUT_DESCRIPTOR_LEFT,
         INPUT_DESCRIPTOR_MOUSE_LEFT, INPUT_DESCRIPTOR_RIGHT, INPUT_DESCRIPTOR_UP,
         NATIVE_SCREEN_BITMAP,
@@ -6953,12 +7813,70 @@ mod input_tests {
     }
 
     #[test]
+    fn request_window_close_posts_through_native_close_gate_instead_of_quitting_immediately() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        let mut args = Vec::new();
+        assert_eq!(call_sys(&mut api, 0x80, 0x69, &mut args).unwrap(), Value::None);
+        assert!(std::mem::take(&mut api.pending_window_close_request));
+        assert!(!api.quit_requested);
+        assert!(api.queued_system_events.is_empty());
+
+        assert!(!api.handle_host_window_close("test"));
+        assert_eq!(api.queued_system_events.pop_front(), Some([2, 0, 0]));
+        assert!(!api.quit_requested);
+
+        api.native_system.native_close_mode = 1;
+        assert!(api.handle_host_window_close("test-native"));
+        assert!(api.queued_system_events.is_empty());
+    }
+
+    #[test]
+    fn title_resources_do_not_render_opaque_before_native_sprite_configuration() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.title_ui_active = true;
+        api.title_ui_resources_loaded = true;
+
+        for key in [
+            "sysgrp.arc:SGTitle990000",
+            "sysgrp.arc:SGTitle990200",
+            "sysgrp.arc:SGTitle990300",
+        ] {
+            api.graph_images.insert(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 255, 255, 255],
+                },
+            );
+        }
+
+        assert!(
+            api.graph_draw_items().iter().all(|item| {
+                !matches!(
+                    item.key.as_str(),
+                    "sysgrp.arc:SGTitle990000"
+                        | "sysgrp.arc:SGTitle990200"
+                        | "sysgrp.arc:SGTitle990300"
+                )
+            }),
+            "loading SGTitle resources alone must not present the legacy fully-opaque title composite"
+        );
+    }
+
+    #[test]
     fn title_composite_remains_present_across_frames() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
         api.title_ui_active = true;
         api.title_ui_resources_loaded = true;
+        api.title_compatibility_render_fallback = true;
 
         for key in [
             "sysgrp.arc:SGTitle990000",
@@ -7278,6 +8196,7 @@ mod input_tests {
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
         let window = api.alloc_window_surface(320, 96).unwrap();
+        api.set_graph_object_draw_enabled(window, true);
         api.surface_text_states.entry(window).or_default().cursor_x = 12;
         api.surface_text_states.entry(window).or_default().cursor_y = 7;
         api.native_message_surface_target = Some(window);
@@ -7347,7 +8266,7 @@ mod input_tests {
     }
 
     #[test]
-    fn base_object_and_sprite_visibility_are_independent_native_states() {
+    fn base_object_enabled_and_sprite_draw_enabled_are_independent_native_states() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
@@ -7422,10 +8341,99 @@ mod input_tests {
         let mut object_on = vec![Value::Int(object), Value::Int(1)];
         call_graph(&mut api, 0x90, 0x31, &mut object_on).unwrap();
         assert_eq!(api.graph_object_enabled.get(&object), Some(&true));
-        assert_eq!(api.graph_object_enabled.get(&sprite), Some(&false));
+        assert_eq!(api.graph_object_enabled.get(&sprite), Some(&true));
+        assert_eq!(api.graph_object_draw_enabled.get(&sprite), Some(&false));
+        assert_eq!(api.graph_object_properties[&sprite].native.enabled, 1);
+        assert_eq!(api.graph_object_properties[&sprite].native.draw_enabled, 0);
         assert!(api.graph_layers[&node].enabled);
         assert!(api.should_draw_graph_layer(node, &api.graph_layers[&node]));
         assert!(api.should_draw_text_node(&api.text_nodes[&node]));
+    }
+
+    #[test]
+    fn sprite_draw_gate_does_not_latch_indicator_hidden_across_bitmap_replacement() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.scenario_bootstrapped = true;
+
+        for (bitmap, byte) in [(30_101, 0x44u8), (30_102, 0x99u8)] {
+            api.store_runtime_bitmap(
+                bitmap,
+                DecodedImage {
+                    width: 16,
+                    height: 16,
+                    rgba: vec![byte; 16 * 16 * 4],
+                },
+                2,
+            );
+        }
+
+        let Value::Int(sprite) = call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap()
+        else {
+            panic!("sprite creation did not return a handle");
+        };
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(30_101),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(2176),
+        ];
+        call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+        assert_eq!(api.graph_object_enabled.get(&sprite), Some(&true));
+        assert_eq!(api.graph_object_draw_enabled.get(&sprite), Some(&false));
+        assert_eq!(api.graph_object_properties[&sprite].native.enabled, 1);
+        assert_eq!(api.graph_object_properties[&sprite].native.draw_enabled, 0);
+        assert!(api.graph_layers[&sprite].enabled);
+        assert!(
+            !api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]),
+            "configuring a freshly created Sprite must not bypass CDspObj+0x14"
+        );
+
+        // cnfgsldctrl._bp initially hides the indicator through 90:54, then
+        // replaces its state bitmap while hidden, and finally enables it.
+        // 90:54 is vtable+4/CDspObj+0x14; it must not poison the separate
+        // CDspObj enabled field or bake that temporary false value into the
+        // renderer layer during 90:57.
+        let mut hide = vec![Value::Int(sprite), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x54, &mut hide).unwrap();
+        assert_eq!(api.graph_object_enabled.get(&sprite), Some(&true));
+        assert_eq!(api.graph_object_draw_enabled.get(&sprite), Some(&false));
+        assert!(!api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
+
+        let mut replace = vec![Value::Int(sprite), Value::Int(30_102)];
+        call_graph(&mut api, 0x90, 0x57, &mut replace).unwrap();
+        assert!(
+            api.graph_layers[&sprite].enabled,
+            "host layer-local visibility must not cache the temporary CDspObj draw gate"
+        );
+        assert!(!api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
+
+        let mut show = vec![Value::Int(sprite), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x54, &mut show).unwrap();
+        assert_eq!(api.graph_object_enabled.get(&sprite), Some(&true));
+        assert_eq!(api.graph_object_draw_enabled.get(&sprite), Some(&true));
+        assert!(
+            api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]),
+            "indicator must become drawable immediately; moving the Knob must not be required"
+        );
+
+        // The same stale-materialization bug must not exist for the separate
+        // Graph90:31 CDspObj enabled gate either. Native visibility stays in
+        // the object; a bitmap replacement is not allowed to snapshot it into
+        // RuntimeGraphLayer::enabled.
+        let mut object_hide = vec![Value::Int(sprite), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x31, &mut object_hide).unwrap();
+        let mut replace_hidden = vec![Value::Int(sprite), Value::Int(30_101)];
+        call_graph(&mut api, 0x90, 0x57, &mut replace_hidden).unwrap();
+        assert!(api.graph_layers[&sprite].enabled);
+        assert!(!api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
+        let mut object_show = vec![Value::Int(sprite), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x31, &mut object_show).unwrap();
+        assert!(api.should_draw_graph_layer(sprite, &api.graph_layers[&sprite]));
     }
 
     #[test]
@@ -7677,6 +8685,162 @@ mod input_tests {
         let mut invalid = vec![Value::Int(surface), Value::Int(801)];
         call_graph(&mut api, 0x91, 0x89, &mut invalid).unwrap();
         assert_eq!(api.graph_surfaces[&surface].line_spacing_percent, 50);
+    }
+
+    #[test]
+    fn window_valid_region_is_not_bitmap_viewport_and_compact_icons_keep_its_origin() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 0xB000_0001_u32 as i32;
+        let normal = 20_101;
+        let hover = 20_102;
+        for (bitmap, key) in [
+            (normal, "test:compact-valid-normal"),
+            (hover, "test:compact-valid-hover"),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 40,
+                    height: 20,
+                    rgba: vec![255; 40 * 20 * 4],
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+        }
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        // Deliberately retain a non-default bitmap crop. Graph90:88 must not
+        // rewrite it: target CDspObjWindow valid bounds live in separate fields.
+        display.viewport_x = 3.0;
+        display.viewport_y = 4.0;
+        display.viewport_width = 300.0;
+        display.viewport_height = 100.0;
+        api.graph_surfaces.insert(surface, display);
+
+        let mut valid = vec![
+            Value::Int(surface),
+            Value::Int(30),
+            Value::Int(40),
+            Value::Int(200),
+            Value::Int(60),
+        ];
+        call_graph(&mut api, 0x90, 0x88, &mut valid).unwrap();
+        let window = &api.graph_surfaces[&surface];
+        assert_eq!(
+            (window.valid_left, window.valid_top, window.valid_right, window.valid_bottom),
+            (30, 40, 229, 99)
+        );
+        assert_eq!(
+            (window.viewport_x, window.viewport_y, window.viewport_width, window.viewport_height),
+            (3.0, 4.0, 300.0, 100.0),
+            "Graph90:88 is a Window valid/content rectangle, not a source crop"
+        );
+
+        let descriptor = GraphInputDescriptor {
+            compact_uses_valid_region_origin: true,
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index: 0,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x: 10,
+                y: 15,
+                width: 40,
+                height: 20,
+                normal_resource: normal,
+                selected_resource: -1,
+                hover_resource: hover,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                current_selection_hit_excluded: false,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        };
+        api.graph_input_objects.insert(
+            901,
+            super::graph_input::RuntimeGraphInputObject::new(surface),
+        );
+        GraphApi::configure_graph_input_object(&mut api, 901, descriptor);
+        let control_layer = *api
+            .graph_layers
+            .iter()
+            .find_map(|(id, _)| api.surface_controls.contains_layer(*id).then_some(id))
+            .unwrap();
+        let layer = &api.graph_layers[&control_layer];
+        assert_eq!((layer.x, layer.y), (40.0, 55.0));
+
+        // Hover swaps the child Sprite bitmap. It must not reset x/y back to
+        // raw descriptor coordinates (10,15), which was the previous bug.
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseMove { x: 141.0, y: 556.0 },
+        );
+        let layer = &api.graph_layers[&control_layer];
+        assert_eq!((layer.x, layer.y), (40.0, 55.0));
+        assert_eq!(layer.key, "test:compact-valid-hover");
+        assert!(api.hit_test_graph_input_object(901, (141.0, 556.0)).is_some());
+    }
+
+    #[test]
+    fn extended_icon_coordinates_do_not_add_window_valid_origin() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 0xB000_0002_u32 as i32;
+        let bitmap = 20_103;
+        api.store_graph_image(
+            "test:extended-direct-position".to_string(),
+            DecodedImage {
+                width: 40,
+                height: 20,
+                rgba: vec![255; 40 * 20 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:extended-direct-position".to_string()),
+        );
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.valid_left = 30;
+        display.valid_top = 40;
+        display.valid_right = 229;
+        display.valid_bottom = 99;
+        api.graph_surfaces.insert(surface, display);
+        let descriptor = GraphInputDescriptor {
+            compact_uses_valid_region_origin: false,
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index: 0,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x: 10,
+                y: 15,
+                width: 40,
+                height: 20,
+                normal_resource: bitmap,
+                selected_resource: -1,
+                hover_resource: -1,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                current_selection_hit_excluded: false,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        };
+        assert_eq!(api.replace_surface_control_layers(surface, &descriptor), 1);
+        let layer = api
+            .graph_layers
+            .iter()
+            .find_map(|(id, layer)| api.surface_controls.contains_layer(*id).then_some(layer))
+            .unwrap();
+        assert_eq!((layer.x, layer.y), (10.0, 15.0));
     }
 
     #[test]
@@ -9071,6 +10235,128 @@ mod input_tests {
     }
 
     #[test]
+    fn graph90_56_clears_stale_mode1_selector_before_applying_title_fade_alpha() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+
+        for (bitmap, key, rgba) in [
+            (501, "test:stale-mode1-primary", vec![255, 0, 0, 255]),
+            (502, "test:stale-mode1-secondary", vec![0, 0, 255, 255]),
+            (503, "test:title-fade-mode0", vec![255, 255, 255, 255]),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 1,
+                    height: 1,
+                    rgba,
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_dimensions.insert(bitmap, (1, 1));
+            api.bitmap_formats.insert(bitmap, 2);
+        }
+
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+
+        // Leave the Sprite in mode 1 with selector 1.  Under sub_428380 that
+        // selector routes virtual SetAlpha to the transition value only.
+        let mut mode1 = vec![
+            Value::Int(sprite),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(501),
+            Value::Int(502),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(100),
+            Value::Int(1),
+        ];
+        call_graph(&mut api, 0x90, 0x58, &mut mode1).unwrap();
+        assert_eq!(api.graph_object_properties[&sprite].transparency_parameter(), 0);
+        assert_eq!(api.graph_transition_nodes[&sprite].blend_selector, 1);
+
+        // The title path uses mode 0 with transparency 256 as its invisible
+        // fade-in start. Target sub_427410 resets Sprite+0x244 to -1 before
+        // sub_426F50 calls virtual SetAlpha(256). A stale selector must not
+        // steal this write into the old mode-1 transition field.
+        let mut title = vec![
+            Value::Int(sprite),
+            Value::Int(898),
+            Value::Int(488),
+            Value::Int(503),
+            Value::Int(1),
+            Value::Int(256),
+            Value::Int(1946),
+        ];
+        call_graph(&mut api, 0x90, 0x56, &mut title).unwrap();
+
+        assert!(!api.graph_transition_nodes.contains_key(&sprite));
+        let properties = &api.graph_object_properties[&sprite];
+        assert_eq!(properties.transparency_parameter(), 256);
+        assert_eq!(properties.opacity(), 0.0);
+        assert!(
+            api.graph_draw_items()
+                .into_iter()
+                .all(|item| item.owner_object != Some(sprite)),
+            "the mode-0 title image must already be invisible before its fade control starts"
+        );
+    }
+
+    #[test]
+    fn graph90_56_format1_sprite_ignores_legacy_high_byte_as_gpu_alpha() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 1262;
+        let key = "test:format1-xrgb-message-backing".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 2,
+                height: 1,
+                // Format 1 is XRGB. Deliberately keep byte 3 at zero: the
+                // target still draws both pixels as opaque source RGB.
+                rgba: vec![20, 40, 60, 0, 80, 100, 120, 0],
+            },
+        );
+        api.graph_resources
+            .insert(bitmap, RuntimeGraphResource::whole(key));
+        api.bitmap_dimensions.insert(bitmap, (2, 1));
+        api.bitmap_formats.insert(bitmap, 1);
+
+        let mut create = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(0),
+            Value::Int(480),
+            Value::Int(bitmap),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(1840),
+        ];
+        call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+
+        let items = api.graph_draw_items();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].ignore_source_alpha);
+        assert_eq!(items[0].opacity, 1.0);
+        // Renderer compatibility must not mutate the native work bitmap: its
+        // high byte remains available to target software bitmap operations.
+        assert_eq!(api.graph_bitmap_image(bitmap).unwrap().rgba[3], 0);
+    }
+
+    #[test]
     fn graph90_58_mode1_keeps_transition_value_separate_from_object_alpha() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -9239,7 +10525,7 @@ mod input_tests {
             Value::Int(handle) => handle,
             value => panic!("unexpected sprite handle {value:?}"),
         };
-        let mut configure = vec![
+        let configure_args = vec![
             Value::Int(sprite),
             Value::Int(0),
             Value::Int(200 << 16),
@@ -9258,14 +10544,21 @@ mod input_tests {
             Value::Int(256),
             Value::Int(261),
         ];
+        let mut configure = configure_args.clone();
         call_graph(&mut api, 0x90, 0x5c, &mut configure).unwrap();
 
         let layer = &api.graph_layers[&sprite];
         assert_eq!(layer.owner_object, Some(sprite));
         assert_eq!(layer.key, key);
-        assert_eq!((layer.x, layer.y, layer.z), (-248.0, -579.0, 261));
-        assert!((layer.scale_x - 1.2).abs() < 0.0001);
-        assert_eq!(layer.scale_y, 985.0 / 820.0);
+        // sub_429AF0 writes ordinary Y=560 and sub_4281E0 subtracts the
+        // mode-5 origin Y=246, so the CDspObj raster placement is Y=314.
+        assert_eq!((layer.x, layer.y, layer.z), (-248.0, 314.0, 261));
+        // Layer scale records the inclusive raster-bbox extent for clipping
+        // and legacy queries. The actual Mode5 image transform now lives in
+        // `graph_mode5_render_states` and must not stretch the bitmap to this
+        // bbox. sub_429220 gives 1775x984 for this case.
+        assert_eq!(layer.scale_x, 1775.0 / 1480.0);
+        assert_eq!(layer.scale_y, 984.0 / 820.0);
         let properties = &api.graph_object_properties[&sprite];
         assert_eq!(properties.format_resource, Some(bitmap));
         assert_eq!(properties.named_properties["target-object-mode"], 5);
@@ -9282,9 +10575,45 @@ mod input_tests {
         );
         assert_eq!(properties.alpha_parameter(), 256);
         assert!(api.graph_draw_items().is_empty());
+        let layer_position = (layer.x, layer.y);
 
         api.set_graph_object_alpha_recursive(sprite, 0);
-        assert_eq!(api.graph_draw_items().len(), 1);
+        let draw_items = api.graph_draw_items();
+        assert_eq!(draw_items.len(), 1);
+        let draw = &draw_items[0];
+        let render_state = api
+            .graph_mode5_render_states
+            .get(&sprite)
+            .copied()
+            .expect("mode-5 renderer state");
+        assert!(render_state.linear_sampling);
+        assert_eq!(draw.destination_quad, Some(render_state.local_affine_quad.map(|[x, y]| {
+            [layer_position.0 + x, layer_position.1 + y]
+        })));
+        let clip = draw.clip.expect("mode-5 raster bbox clip");
+        assert_eq!((clip.x, clip.y), (-248.0, 314.0));
+        assert_eq!((clip.width, clip.height), (draw.width, draw.height));
+
+        // Graph90:37 is the integer CDspObj offset bank consumed by
+        // sub_41B260 after Mode5 projection. A later mode-5 rebuild (as
+        // happens every spline tick) must not erase it.
+        let mut primary_offset =
+            vec![Value::Int(sprite), Value::Int(17), Value::Int(-50)];
+        call_graph(&mut api, 0x90, 0x37, &mut primary_offset).unwrap();
+        let offset_world = {
+            let layer = &api.graph_layers[&sprite];
+            api.layer_world_transform(sprite, layer)
+        };
+        assert_eq!(offset_world, (-231.0, 264.0, 261));
+
+        let mut resync = configure_args.clone();
+        call_graph(&mut api, 0x90, 0x5c, &mut resync).unwrap();
+        let layer = &api.graph_layers[&sprite];
+        assert_eq!((layer.transform_x, layer.transform_y), (17.0, -50.0));
+        assert_eq!(
+            api.layer_world_transform(sprite, layer),
+            (-231.0, 264.0, 261)
+        );
 
         let backf_bitmap = 128;
         let backf_key = "test:backf".to_string();
@@ -9324,6 +10653,52 @@ mod input_tests {
             .map(|item| item.key)
             .collect::<Vec<_>>();
         assert_eq!(output, vec![backf_key, key]);
+    }
+
+    #[test]
+    fn fresh_sprite_starts_in_target_mode0_and_accepts_primary_replacement() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 1150;
+        api.store_graph_image(
+            "test:fresh-mode0-primary".to_string(),
+            DecodedImage {
+                width: 27,
+                height: 103,
+                rgba: vec![255; 27 * 103 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:fresh-mode0-primary".to_string()),
+        );
+        api.bitmap_dimensions.insert(bitmap, (27, 103));
+        api.bitmap_formats.insert(bitmap, 2);
+
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut Vec::new()).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        assert_eq!(
+            api.graph_object_properties[&sprite].named_properties["target-object-mode"],
+            0,
+            "sub_4256C0 constructs CDspObjSprite in mode 0"
+        );
+        assert_eq!(api.graph_object_draw_enabled.get(&sprite), Some(&false));
+
+        let mut replace = vec![Value::Int(sprite), Value::Int(bitmap)];
+        call_graph(&mut api, 0x90, 0x57, &mut replace).unwrap();
+        assert_eq!(api.graph_object_properties[&sprite].format_resource, Some(bitmap));
+        let layer = api
+            .graph_layers
+            .get(&sprite)
+            .expect("fresh mode-0 90:57 must materialize the primary Sprite layer");
+        assert_eq!((layer.width, layer.height), (27.0, 103.0));
+        assert!(
+            !api.should_draw_graph_layer(sprite, layer),
+            "primary replacement must preserve constructor draw_enabled=0 until vtable+4 enables it"
+        );
     }
 
     #[test]
@@ -9487,6 +10862,328 @@ mod input_tests {
     }
 
     #[test]
+    fn knob_position_virtual_survives_mode0_primary_bitmap_replacement() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        for (bitmap, key) in [(6201, "knob-thumb-before"), (6202, "knob-thumb-after")] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 16,
+                    height: 16,
+                    rgba: vec![255; 16 * 16 * 4],
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+            api.bitmap_dimensions.insert(bitmap, (16, 16));
+            api.bitmap_formats.insert(bitmap, 2);
+        }
+
+        let mut create_sprite = Vec::new();
+        let sprite = match call_graph(&mut api, 0x90, 0x50, &mut create_sprite).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected sprite handle {value:?}"),
+        };
+        let mut configure = vec![
+            Value::Int(sprite),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(6201),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(2176),
+        ];
+        call_graph(&mut api, 0x90, 0x56, &mut configure).unwrap();
+
+        let mut create_knob = vec![Value::Int(sprite)];
+        let knob = match call_graph(&mut api, 0x90, 0xd0, &mut create_knob).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+        let mut range = vec![Value::Int(knob), Value::Int(100), Value::Int(16)];
+        call_graph(&mut api, 0x90, 0xd9, &mut range).unwrap();
+        let mut precision = vec![Value::Int(knob), Value::Int(11), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xd8, &mut precision).unwrap();
+        let mut position = vec![Value::Int(knob), Value::Int(5), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xd6, &mut position).unwrap();
+
+        // cnfgwnd._bp lays out slider Knobs through the ordinary CDspObj
+        // position syscall after cnfgsldctrl._bp has created/configured them.
+        // Knob vtable+0x28/sub_421120 must materialize the controlled Sprite's
+        // native position, not merely mutate renderer layer.x/y.
+        let mut place_knob = vec![Value::Int(knob), Value::Int(117), Value::Int(115)];
+        call_graph(&mut api, 0x90, 0x33, &mut place_knob).unwrap();
+        let before = api
+            .graph_native_base_position(sprite)
+            .expect("controlled Sprite native position");
+        assert_ne!(before, (0, 0));
+        assert_eq!(
+            (api.graph_layers[&sprite].x.round() as i32, api.graph_layers[&sprite].y.round() as i32),
+            before
+        );
+
+        // Config state changes replace the thumb bitmap through 90:57.
+        // sub_4272F0/sub_427410 keep the existing CDspObj position. If Knob
+        // synchronization updated only the host layer, 90:57 would read the
+        // stale native (0,0) and the newly visible thumb would jump there.
+        let mut replace = vec![Value::Int(sprite), Value::Int(6202)];
+        call_graph(&mut api, 0x90, 0x57, &mut replace).unwrap();
+        assert_eq!(api.graph_native_base_position(sprite), Some(before));
+        assert_eq!(
+            (api.graph_layers[&sprite].x.round() as i32, api.graph_layers[&sprite].y.round() as i32),
+            before
+        );
+        assert_eq!(api.graph_layers[&sprite].key, "knob-thumb-after");
+    }
+
+    #[test]
+    fn knob_control_pointer_is_not_a_native_parent_and_parenting_the_knob_moves_its_target() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 611;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-unowned-target".into(),
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let mut create = vec![Value::Int(target)];
+        let knob = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+
+        assert!(!api.graph_native_owners.contains_key(&target));
+        assert_eq!(api.graph_knob_states[&knob].target, target);
+        assert_eq!(
+            (
+                api.graph_knob_states[&knob].bounds_width,
+                api.graph_knob_states[&knob].bounds_height,
+            ),
+            (40, 30),
+            "sub_420EC0/sub_421200 initialize a fresh Knob range from the target rectangle"
+        );
+
+        // Create a real CDspObjGroup at (300,200), then attach the Knob at a
+        // local (50,25). sub_41AB40 calls the Knob position virtual; the Knob
+        // must forward the resulting absolute base to its controlled Sprite.
+        let mut create_group = Vec::new();
+        let group = match call_graph(&mut api, 0x90, 0xe0, &mut create_group).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected group handle {value:?}"),
+        };
+        let mut configure_group = vec![
+            Value::Int(group),
+            Value::Int(300),
+            Value::Int(200),
+            Value::Int(0),
+        ];
+        call_graph(&mut api, 0x90, 0xe5, &mut configure_group).unwrap();
+        let mut attach = vec![
+            Value::Int(group),
+            Value::Int(knob),
+            Value::Int(50),
+            Value::Int(25),
+        ];
+        call_graph(&mut api, 0x91, 0x3e, &mut attach).unwrap();
+
+        assert_eq!(api.graph_native_owners.get(&knob), Some(&group));
+        assert!(!api.graph_native_owners.contains_key(&target));
+        assert_eq!(
+            api.graph_native_base_position(target),
+            Some((350, 225)),
+            "Knob vtable+40 must move the target through its own position virtual"
+        );
+        assert_eq!((api.graph_layers[&target].x, api.graph_layers[&target].y), (350.0, 225.0));
+    }
+
+    #[test]
+    fn knob_target_can_keep_a_real_native_owner_and_multiple_knobs_may_reference_it() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 612;
+        let real_parent = 613;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-parented-target".into(),
+                target_surface: None,
+                x: 12.0,
+                y: 34.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        api.graph_native_owners.insert(target, real_parent);
+
+        let mut first_create = vec![Value::Int(target)];
+        let first = match call_graph(&mut api, 0x90, 0xd0, &mut first_create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+        let mut second_create = vec![Value::Int(target)];
+        let second = match call_graph(&mut api, 0x90, 0xd0, &mut second_create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected second knob handle {value:?}"),
+        };
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+        assert_eq!(api.graph_native_owners.get(&target), Some(&real_parent));
+    }
+
+    #[test]
+    fn knob_alpha_virtual_forwards_to_controlled_target_without_faking_membership() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 614;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-alpha-target".into(),
+                target_surface: None,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let mut create = vec![Value::Int(target)];
+        let knob = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+        let mut alpha = vec![Value::Int(knob), Value::Int(192)];
+        call_graph(&mut api, 0x90, 0x32, &mut alpha).unwrap();
+        assert_eq!(api.graph_object_properties[&knob].native.alpha_parameter, 192);
+        assert_eq!(api.graph_object_properties[&target].native.alpha_parameter, 192);
+        assert!(!api.graph_native_owners.contains_key(&target));
+    }
+
+    #[test]
+    fn watched_knob_consumes_mouse_wheel_and_reports_boundary_delta_through_da() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 615;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-wheel-target".into(),
+                target_surface: None,
+                x: 100.0,
+                y: 200.0,
+                width: 20.0,
+                height: 20.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 0,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let mut create = vec![Value::Int(target)];
+        let knob = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+        let mut range = vec![Value::Int(knob), Value::Int(20), Value::Int(120)];
+        call_graph(&mut api, 0x90, 0xd9, &mut range).unwrap();
+        let mut precision = vec![Value::Int(knob), Value::Int(0), Value::Int(11)];
+        call_graph(&mut api, 0x90, 0xd8, &mut precision).unwrap();
+        let mut position = vec![Value::Int(knob), Value::Int(0), Value::Int(5)];
+        call_graph(&mut api, 0x90, 0xd6, &mut position).unwrap();
+        let mut watch = vec![Value::Int(knob)];
+        call_graph(&mut api, 0x90, 0xde, &mut watch).unwrap();
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseWheel { delta_y: 1.0 },
+        );
+        assert_eq!(api.graph_knob_states[&knob].y, 4);
+        assert_eq!(api.graph_native_base_position(target), Some((100, 240)));
+        let mut no_boundary = vec![Value::Int(knob)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xda, &mut no_boundary).unwrap(),
+            Value::Int(0)
+        );
+
+        let mut zero = vec![Value::Int(knob), Value::Int(0), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xd6, &mut zero).unwrap();
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseWheel { delta_y: 1.0 },
+        );
+        assert_eq!(api.graph_knob_states[&knob].y, 0);
+        let mut boundary = vec![Value::Int(knob)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xda, &mut boundary).unwrap(),
+            Value::Int(-1)
+        );
+    }
+
+    #[test]
     fn knob_event_selectors_reach_the_target_confirmed_state_machine() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -9537,6 +11234,216 @@ mod input_tests {
     }
 
     #[test]
+    fn knob_draw_enable_propagates_to_the_controlled_thumb_sprite() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 603;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-visible-target".into(),
+                target_surface: None,
+                x: 100.0,
+                y: 200.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 2176,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let mut create = vec![Value::Int(target)];
+        let handle = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+        assert_eq!(api.graph_object_enabled.get(&handle), Some(&true));
+        assert_eq!(api.graph_object_draw_enabled.get(&handle), Some(&false));
+        assert!(!api.graph_knob_states[&handle].enabled);
+
+        let mut disable = vec![Value::Int(handle), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xd4, &mut disable).unwrap();
+        assert!(!api.graph_knob_states[&handle].enabled);
+        assert_eq!(api.graph_object_draw_enabled.get(&target), Some(&false));
+
+        // cnfgwnd uses the generic vtable+4 selector on the Knob wrapper when
+        // a slider becomes visible. sub_4210E0 must forward that state to the
+        // thumb Sprite configured by cnfgsldctrl._bp.
+        let mut enable = vec![Value::Int(handle), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x30, &mut enable).unwrap();
+        assert!(api.graph_knob_states[&handle].enabled);
+        assert_eq!(api.graph_object_draw_enabled.get(&target), Some(&true));
+    }
+
+    #[test]
+    fn knob_mouse_capture_drag_changed_and_active_handle_follow_target_manager() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let target = 604;
+        api.graph_layers.insert(
+            target,
+            RuntimeGraphLayer {
+                hit_id: target,
+                owner_object: None,
+                key: "knob-drag-target".into(),
+                target_surface: None,
+                x: 100.0,
+                y: 200.0,
+                width: 40.0,
+                height: 30.0,
+                src_x: 0.0,
+                src_y: 0.0,
+                opacity: 1.0,
+                z: 2176,
+                enabled: true,
+                transform_x: 0.0,
+                transform_y: 0.0,
+                transform_z: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation_degrees: 0.0,
+                clip: None,
+            },
+        );
+        let mut create = vec![Value::Int(target)];
+        let handle = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected knob handle {value:?}"),
+        };
+        let mut range = vec![Value::Int(handle), Value::Int(140), Value::Int(30)];
+        call_graph(&mut api, 0x90, 0xd9, &mut range).unwrap();
+        let mut precision = vec![Value::Int(handle), Value::Int(11), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xd8, &mut precision).unwrap();
+        let mut initial = vec![Value::Int(handle), Value::Int(0), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0xd6, &mut initial).unwrap();
+        let mut enable = vec![Value::Int(handle), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0xd4, &mut enable).unwrap();
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 110.0, y: 210.0 },
+        );
+        assert_eq!(api.graph_active_input_handle, handle);
+        let mut active = Vec::new();
+        assert_eq!(
+            call_graph(&mut api, 0x91, 0xdb, &mut active).unwrap(),
+            Value::Int(handle)
+        );
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseMove { x: 210.0, y: 210.0 },
+        );
+        assert_eq!(api.graph_knob_states[&handle].x, 10);
+        assert_eq!(api.graph_layers[&target].x, 200.0);
+        let mut changed = Vec::new();
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdb, &mut changed).unwrap(),
+            Value::Int(handle)
+        );
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseRelease { x: 210.0, y: 210.0 },
+        );
+        assert_eq!(api.graph_active_input_handle, 0);
+        assert!(api.pending_click.is_none());
+        let mut inactive = Vec::new();
+        assert_eq!(
+            call_graph(&mut api, 0x91, 0xdb, &mut inactive).unwrap(),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn graph92_9c_rasterizes_config_help_text_into_bitmap_pixels() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.text_state.font_size = 28.0;
+        api.text_state.line_height = 36.0;
+        api.text_state.color = [1.0, 1.0, 1.0, 1.0];
+        let persistent_style = (
+            api.text_state.font_size,
+            api.text_state.line_height,
+            api.text_state.color,
+        );
+        let bitmap = 1700;
+        api.recreate_native_bitmap(bitmap, 256, 16, 2);
+        let key = format!("runtime:bitmap:{bitmap}");
+        let yellow = [255_u8, 248, 180, 255];
+        {
+            let image = api.graph_images.get_mut(&key).unwrap();
+            for pixel in image.rgba.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&yellow);
+            }
+        }
+        let before = api.graph_images[&key].rgba.clone();
+        // Source/script order from cnfgwnd._bp's hover-help call. In
+        // particular arg4=0 is a valid black color and arg9=16 is the font
+        // height; the old implementation accidentally read source arg11.
+        let mut args = vec![
+            Value::Int(bitmap),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Str("ゲーム中のテキスト表示速度を変更します".into()),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(16),
+            Value::Int(100),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(5),
+            Value::Int(5),
+            Value::Int(0),
+            Value::Int(192),
+            Value::Int(0),
+        ];
+        let result = call_graph(&mut api, 0x92, 0x9c, &mut args).unwrap();
+        assert!(matches!(result, Value::Int(value) if value > 0));
+        let after = &api.graph_images[&key].rgba;
+        assert_ne!(after, &before);
+        assert!(
+            after.chunks_exact(4).any(|pixel| {
+                pixel[3] != 0
+                    && pixel[0] < yellow[0]
+                    && pixel[1] < yellow[1]
+                    && pixel[2] < yellow[2]
+            }),
+            "the call-local black style must affect the destination bitmap"
+        );
+        assert!(api.bitmap_text_runs.get(&bitmap).is_none());
+        assert_eq!(
+            (
+                api.text_state.font_size,
+                api.text_state.line_height,
+                api.text_state.color,
+            ),
+            persistent_style,
+            "Graph92:9C bitmap text must not mutate persistent message text state"
+        );
+    }
+
+    #[test]
     fn native_group_uses_tagged_handle_and_preserves_member_ownership() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -9573,6 +11480,9 @@ mod input_tests {
             Value::Int(handle) => handle,
             value => panic!("unexpected group handle {value:?}"),
         };
+        assert_eq!(api.graph_object_enabled.get(&group), Some(&true));
+        assert_eq!(api.graph_object_draw_enabled.get(&group), Some(&false));
+        assert!(!api.graph_groups[&group].draw_enabled);
         assert_eq!((group as u32) & 0xFF00_0000, 0xF100_0000);
 
         let mut configure = vec![
@@ -9824,22 +11734,30 @@ mod input_tests {
     }
 
     #[test]
-    fn graph90_34_35_39_validate_and_copy_state_through_the_child_chain() {
+    fn graph90_34_35_39_propagate_only_through_native_member_hierarchy() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
         let parent = api.alloc_window_surface(320, 180).unwrap();
-        let child = 0x8000_0042_u32 as i32;
-        api.display_tree
-            .register(child, super::NativeDisplayKind::Sprite);
-        api.display_tree.set_parent(child, parent).unwrap();
+        let native_member = 0x8000_0042_u32 as i32;
+        let portable_child = 0x8000_0043_u32 as i32;
+
+        for child in [native_member, portable_child] {
+            api.display_tree
+                .register(child, super::NativeDisplayKind::Sprite);
+            api.display_tree.set_parent(child, parent).unwrap();
+            api.graph_object_properties.entry(child).or_default();
+        }
+        // Only this relation represents CDspObj+0x12C membership. The second
+        // child is intentionally present only in the portable renderer tree.
+        api.graph_native_owners.insert(native_member, parent);
 
         for (selector, value) in [(0x34, 37), (0x35, 91), (0x39, 173)] {
             let mut args = vec![Value::Int(parent), Value::Int(value)];
             call_graph(&mut api, 0x90, selector, &mut args).unwrap();
         }
 
-        for object in [parent, child] {
+        for object in [parent, native_member] {
             let properties = &api.graph_object_properties[&object];
             assert_eq!(properties.mask_alpha, 37);
             assert_eq!(properties.native.mask_alpha, 37);
@@ -9848,18 +11766,12 @@ mod input_tests {
             assert_eq!(properties.native.alpha_multiplier, 173);
         }
 
-        api.display_tree.set_parent(child, 0).unwrap();
-        assert_eq!(api.graph_object_properties[&child].native.mask_alpha, 37);
-        assert_eq!(
-            api.graph_object_properties[&child]
-                .native
-                .fixed_parameter_16_16,
-            91 << 16
-        );
-        assert_eq!(
-            api.graph_object_properties[&child].native.alpha_multiplier,
-            173
-        );
+        let portable = &api.graph_object_properties[&portable_child];
+        assert_eq!(portable.mask_alpha, 0);
+        assert_eq!(portable.native.mask_alpha, 0);
+        assert_eq!(portable.native.fixed_parameter_16_16, 0);
+        assert_eq!(portable.alpha_multiplier, 256);
+        assert_eq!(portable.native.alpha_multiplier, 256);
 
         for selector in [0x34, 0x35, 0x39] {
             for invalid in [-1, 257] {
@@ -9875,18 +11787,6 @@ mod input_tests {
             assert!(!api.display_tree.contains(missing));
             assert!(!api.graph_object_properties.contains_key(&missing));
         }
-
-        assert_eq!(api.graph_object_properties[&parent].native.mask_alpha, 37);
-        assert_eq!(
-            api.graph_object_properties[&parent]
-                .native
-                .fixed_parameter_16_16,
-            91 << 16
-        );
-        assert_eq!(
-            api.graph_object_properties[&parent].native.alpha_multiplier,
-            173
-        );
     }
 
     #[test]
@@ -10086,6 +11986,43 @@ mod input_tests {
             ),
             (2.25, 3.5)
         );
+    }
+
+    #[test]
+    fn window_constructor_starts_draw_enabled_like_target() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(320), Value::Int(180)];
+        let window = match call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected window handle {value:?}"),
+        };
+
+        // sub_42AE20 finishes construction with sub_41B600(window, 1) and
+        // sub_41B620(window, 0). The Window is drawable immediately; scripts
+        // such as yesnownd._bp may configure transparency and start a fade
+        // without first calling Graph90:84.
+        assert_eq!(api.graph_object_enabled.get(&window), Some(&true));
+        assert_eq!(api.graph_object_draw_enabled.get(&window), Some(&true));
+        assert_eq!(api.graph_object_properties[&window].native.enabled, 1);
+        assert_eq!(api.graph_object_properties[&window].native.draw_enabled, 1);
+        assert!(api.graph_surfaces[&window].enabled);
+        assert!(api.surface_display_chain_visible(window, &api.graph_surfaces[&window]));
+
+        let mut hide = vec![Value::Int(window), Value::Int(0)];
+        call_graph(&mut api, 0x90, 0x84, &mut hide).unwrap();
+        assert_eq!(api.graph_object_draw_enabled.get(&window), Some(&false));
+        assert_eq!(api.graph_object_properties[&window].native.draw_enabled, 0);
+        assert!(!api.graph_surfaces[&window].enabled);
+        assert!(!api.surface_display_chain_visible(window, &api.graph_surfaces[&window]));
+
+        let mut show = vec![Value::Int(window), Value::Int(1)];
+        call_graph(&mut api, 0x90, 0x84, &mut show).unwrap();
+        assert_eq!(api.graph_object_draw_enabled.get(&window), Some(&true));
+        assert_eq!(api.graph_object_properties[&window].native.draw_enabled, 1);
+        assert!(api.graph_surfaces[&window].enabled);
+        assert!(api.surface_display_chain_visible(window, &api.graph_surfaces[&window]));
     }
 
     #[test]
@@ -10550,13 +12487,14 @@ mod input_tests {
     }
 
     #[test]
-    fn bitmap_text_draw_uses_native_argument_order_and_returns_advance() {
+    fn bitmap_text_draw_uses_native_argument_order_and_rasterizes_pixels() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
         let bitmap = 41;
-        api.graph_surfaces
-            .insert(bitmap, RuntimeSurface::bitmap(bitmap, 320.0, 96.0));
+        api.recreate_native_bitmap(bitmap, 320, 96, 2);
+        let key = format!("runtime:bitmap:{bitmap}");
+        let before = api.graph_images[&key].rgba.clone();
         let mut args = vec![
             Value::Int(bitmap),
             Value::Int(20),
@@ -10573,10 +12511,59 @@ mod input_tests {
 
         assert!(args.is_empty());
         assert!(matches!(result, Value::Int(advance) if advance > 20));
-        let run = api.bitmap_text_runs.get(&bitmap).unwrap().last().unwrap();
-        assert_eq!(run.text, "画面");
-        assert_eq!((run.x, run.y, run.size), (20.0, 30.0, 20.0));
-        assert_eq!(run.color, [1.0, 0.0, 0.0, 1.0]);
+        assert_ne!(&api.graph_images[&key].rgba, &before);
+        assert!(
+            api.graph_images[&key]
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0 && pixel[0] > 0),
+            "Graph92:1E must burn the red glyphs into bitmap storage"
+        );
+        assert!(
+            api.bitmap_text_runs.get(&bitmap).is_none(),
+            "direct bitmap text must not survive as a compatibility overlay"
+        );
+    }
+
+    #[test]
+    fn graph91_9c_backlog_text_is_committed_to_bitmap_pixels() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let bitmap = 1833;
+        api.recreate_native_bitmap(bitmap, 1175, 172, 2);
+        let key = format!("runtime:bitmap:{bitmap}");
+        let mut args = vec![
+            Value::Int(bitmap),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Str("特徴と呼べる特徴もない鄙びた町だった".into()),
+            Value::Int(0),
+            Value::Str("".into()),
+            Value::Int(0),
+            Value::Int(28),
+            Value::Int(100),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0x00FF_FFFF),
+        ];
+
+        let _ = call_graph(&mut api, 0x91, 0x9c, &mut args).unwrap();
+
+        assert!(args.is_empty());
+        assert!(
+            api.graph_images[&key]
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0),
+            "Graph91:9C must leave durable glyph pixels for later bitmap composition"
+        );
+        assert!(api.bitmap_text_runs.get(&bitmap).is_none());
+        let stats = api.graph_bitmap_pixel_stats(bitmap).unwrap();
+        assert!(stats.0 > 0);
+        assert!(stats.1 > 0);
     }
 
     #[test]
@@ -10673,6 +12660,73 @@ mod input_tests {
     }
 
     #[test]
+    fn mode128_format1_to_format2_does_not_leak_source_fourth_byte_as_alpha() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let source = 1151;
+        let destination = 1262;
+        let source_key = "test:format1-message-window-source".to_string();
+        let destination_key = "runtime:bitmap:1262".to_string();
+
+        api.store_graph_image(
+            source_key.clone(),
+            DecodedImage {
+                width: 2,
+                height: 1,
+                rgba: vec![80, 90, 100, 7, 110, 120, 130, 22],
+            },
+        );
+        api.graph_resources
+            .insert(source, RuntimeGraphResource::whole(source_key));
+        api.bitmap_dimensions.insert(source, (2, 1));
+        api.bitmap_formats.insert(source, 1);
+
+        api.store_graph_image(
+            destination_key.clone(),
+            DecodedImage {
+                width: 2,
+                height: 1,
+                rgba: vec![0; 8],
+            },
+        );
+        api.graph_resources
+            .insert(destination, RuntimeGraphResource::whole(destination_key));
+        api.bitmap_dimensions.insert(destination, (2, 1));
+        api.bitmap_formats.insert(destination, 2);
+        api.graph_surfaces
+            .insert(destination, RuntimeSurface::bitmap(destination, 2.0, 1.0));
+
+        api.composite_graph_bitmap(destination, source, 0, 0, 128, 0)
+            .expect("format1 -> format2 selector-128 copy");
+        assert_eq!(
+            api.graph_bitmap_image(destination).unwrap().rgba,
+            vec![80, 90, 100, 255, 110, 120, 130, 255]
+        );
+    }
+
+    #[test]
+    fn cached_resource_load_preserves_recovered_native_bitmap_format() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let key = "cached.arc:format1".to_string();
+        api.store_graph_image(
+            key.clone(),
+            DecodedImage {
+                width: 3,
+                height: 2,
+                rgba: vec![0; 3 * 2 * 4],
+            },
+        );
+        api.graph_image_formats.insert(key, 1);
+
+        assert!(api.load_graph_image_resource(1405, "cached.arc", "format1"));
+        assert_eq!(api.bitmap_dimensions.get(&1405), Some(&(3, 2)));
+        assert_eq!(api.bitmap_formats.get(&1405), Some(&1));
+    }
+
+    #[test]
     fn graph90_11_replaces_stale_same_handle_bitmap_storage() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -10694,6 +12748,7 @@ mod input_tests {
         api.graph_surfaces
             .insert(bitmap, RuntimeSurface::bitmap(bitmap, 1380.0, 820.0));
 
+        api.bitmap_auxiliary_pairs.insert(bitmap, [111, 222]);
         let mut create = vec![
             Value::Int(bitmap),
             Value::Int(1280),
@@ -10704,6 +12759,11 @@ mod input_tests {
 
         assert_eq!(api.bitmap_dimensions[&bitmap], (1280, 720));
         assert_eq!(api.bitmap_formats[&bitmap], 1);
+        assert_eq!(
+            ethornell_vm::GraphApi::query_bitmap_auxiliary_pair(&mut api, bitmap),
+            Some([-1, -1]),
+            "sub_407DA0 must reset +0x28/+0x2C on same-slot recreation"
+        );
         let image = api.graph_bitmap_image(bitmap).unwrap();
         assert_eq!((image.width, image.height), (1280, 720));
         assert!(image.rgba.iter().all(|byte| *byte == 0));
@@ -10734,6 +12794,7 @@ mod input_tests {
             .insert(source, RuntimeGraphResource::whole(source_key.clone()));
         api.bitmap_dimensions.insert(source, (1, 1));
         api.bitmap_formats.insert(source, 2);
+        api.bitmap_auxiliary_pairs.insert(source, [740, 205]);
 
         assert!(api.clone_graph_bitmap(source, destination));
         api.store_graph_image(
@@ -10750,6 +12811,7 @@ mod input_tests {
             vec![10, 20, 30, 255]
         );
         assert_eq!(api.bitmap_formats.get(&destination), Some(&2));
+        assert_eq!(api.bitmap_auxiliary_pairs.get(&destination), Some(&[740, 205]));
         assert_eq!(
             api.resolve_resource_key(destination),
             Some("runtime:bitmap:41")
@@ -10863,6 +12925,7 @@ mod input_tests {
                 hover_resource: -1,
                 hover_selected_resource: -1,
                 mask_resource: -1,
+                current_selection_hit_excluded: false,
                 flags: 0,
             }],
             ..GraphInputDescriptor::default()
@@ -10935,6 +12998,7 @@ mod input_tests {
                 hover_resource: hover,
                 hover_selected_resource: -1,
                 mask_resource: -1,
+                current_selection_hit_excluded: false,
                 flags: 0x20,
             }],
             ..GraphInputDescriptor::default()
@@ -11027,6 +13091,7 @@ mod input_tests {
                 hover_resource: -1,
                 hover_selected_resource: -1,
                 mask_resource: -1,
+                current_selection_hit_excluded: false,
                 flags: 0,
             }],
             ..GraphInputDescriptor::default()
@@ -11038,9 +13103,9 @@ mod input_tests {
             .find_map(|(id, _)| api.surface_controls.contains_layer(*id).then_some(id))
             .unwrap();
 
-        // Model the target child CDspObjSprite acquiring a final resolved
-        // position that differs from its configure-time descriptor offset.
-        // sub_4495C0 must follow this rendered rectangle, not stale BP x/y.
+        // Model the target CDspObjVirtual acquiring a final resolved position
+        // that differs from its configure-time descriptor offset. sub_4495C0
+        // must follow this final Virtual rectangle, not stale BP x/y.
         api.graph_layers.get_mut(&control_layer).unwrap().x = 60.0;
         let (region, local_x, local_y) = api
             .hit_test_graph_input_object(78, (161.0, 521.0))
@@ -11048,6 +13113,1064 @@ mod input_tests {
         assert_eq!((region.group, region.index), (0, 0));
         assert_eq!((local_x, local_y), (1, 1));
         assert!(api.hit_test_graph_input_object(78, (111.0, 521.0)).is_none());
+    }
+
+    #[test]
+    fn extended_icon_virtual_hit_uses_bitmap_intrinsic_size_not_descriptor_size() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_022;
+        let object = 92;
+        let bitmap = 1917;
+        api.store_graph_image(
+            "test:virtual-hit-size".to_string(),
+            DecodedImage {
+                width: 80,
+                height: 24,
+                rgba: vec![255; 80 * 24 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:virtual-hit-size".to_string()),
+        );
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 7,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: false,
+                    x: 10,
+                    y: 20,
+                    // Extended record w/h are internal Sprite geometry. Target
+                    // sub_44A900 sizes the hit CDspObjVirtual from sub_407F20
+                    // bitmap width/height instead of these two fields.
+                    width: 10,
+                    height: 8,
+                    normal_resource: bitmap,
+                    selected_resource: -1,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    current_selection_hit_excluded: false,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+
+        let control_layer = *api
+            .graph_layers
+            .iter()
+            .find_map(|(id, _)| {
+                api.surface_controls
+                    .contains_layer_for_owner(SurfaceControlOwner::InputObject(object), *id)
+                    .then_some(id)
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                api.graph_layers[&control_layer].width,
+                api.graph_layers[&control_layer].height,
+            ),
+            (80.0, 24.0),
+            "extended +0x10/+0x14 are transform/origin fields, not visual raster dimensions"
+        );
+
+        // x=170 is outside descriptor width 10 but inside the native Virtual's
+        // bitmap-derived width 80: [110, 190).
+        let hit = api
+            .hit_test_graph_input_object(object, (170.0, 530.0))
+            .expect("native Virtual hit rect must use configure-time bitmap dimensions");
+        assert_eq!((hit.0.group, hit.0.index), (0, 7));
+        assert_eq!((hit.1, hit.2), (60, 10));
+    }
+
+    #[test]
+    fn extended_current_selection_exclusion_falls_through_to_underlying_item() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_024;
+        let object = 95;
+        let bitmap = 1920;
+        api.store_graph_image(
+            "test:extended-current-exclusion".to_string(),
+            DecodedImage {
+                width: 80,
+                height: 40,
+                rgba: vec![255; 80 * 40 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:extended-current-exclusion".to_string()),
+        );
+        api.graph_surfaces
+            .insert(surface, RuntimeSurface::display(surface, 200.0, 100.0));
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                groups: vec![ethornell_vm::GraphInputGroup {
+                    index: 0,
+                    initial_current_item: 1,
+                    selection_enabled: true,
+                    pointer_selection_enabled: true,
+                    pointer_activation_enabled: false,
+                    selection_exclusion_key: -1,
+                    extended_flags: 0,
+                }],
+                regions: vec![
+                    GraphInputRegion {
+                        group: 0,
+                        index: 0,
+                        ordinal: 0,
+                        enabled_depth: 1,
+                        selected: false,
+                        x: 10,
+                        y: 10,
+                        width: 0,
+                        height: 0,
+                        normal_resource: bitmap,
+                        selected_resource: -1,
+                        hover_resource: -1,
+                        hover_selected_resource: -1,
+                        mask_resource: -1,
+                        current_selection_hit_excluded: false,
+                        flags: 0,
+                    },
+                    GraphInputRegion {
+                        group: 0,
+                        index: 1,
+                        ordinal: 1,
+                        enabled_depth: 1,
+                        selected: true,
+                        x: 10,
+                        y: 10,
+                        width: 0,
+                        height: 0,
+                        normal_resource: bitmap,
+                        selected_resource: -1,
+                        hover_resource: -1,
+                        hover_selected_resource: -1,
+                        mask_resource: -1,
+                        current_selection_hit_excluded: true,
+                        flags: 0,
+                    },
+                ],
+                ..GraphInputDescriptor::default()
+            },
+        );
+
+        let hit = api
+            .hit_test_graph_input_object(object, (20.0, 20.0))
+            .expect("target-ineligible current item must fall through");
+        assert_eq!((hit.0.group, hit.0.index), (0, 0));
+    }
+
+    #[test]
+    fn extended_icon_explicit_mask_rejects_transparent_coverage_and_falls_through() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_025;
+        let object = 96;
+        let bitmap = 1921;
+        let mask = 1926;
+        api.store_graph_image(
+            "test:extended-mask-visual".to_string(),
+            DecodedImage {
+                width: 80,
+                height: 40,
+                rgba: vec![255; 80 * 40 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:extended-mask-visual".to_string()),
+        );
+        let mut mask_rgba = vec![0; 80 * 40 * 4];
+        for y in 0..40usize {
+            for x in 0..40usize {
+                mask_rgba[(y * 80 + x) * 4 + 3] = 255;
+            }
+        }
+        api.store_graph_image(
+            "test:extended-mask-coverage".to_string(),
+            DecodedImage {
+                width: 80,
+                height: 40,
+                rgba: mask_rgba,
+            },
+        );
+        api.graph_resources.insert(
+            mask,
+            RuntimeGraphResource::whole("test:extended-mask-coverage".to_string()),
+        );
+        api.bitmap_formats.insert(mask, 2);
+        api.graph_surfaces
+            .insert(surface, RuntimeSurface::display(surface, 200.0, 100.0));
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                regions: vec![
+                    GraphInputRegion {
+                        group: 0,
+                        index: 0,
+                        ordinal: 0,
+                        enabled_depth: 1,
+                        selected: false,
+                        x: 10,
+                        y: 10,
+                        width: 0,
+                        height: 0,
+                        normal_resource: bitmap,
+                        selected_resource: -1,
+                        hover_resource: -1,
+                        hover_selected_resource: -1,
+                        mask_resource: -1,
+                        current_selection_hit_excluded: false,
+                        flags: 0,
+                    },
+                    GraphInputRegion {
+                        group: 0,
+                        index: 1,
+                        ordinal: 1,
+                        enabled_depth: 1,
+                        selected: false,
+                        x: 10,
+                        y: 10,
+                        width: 0,
+                        height: 0,
+                        normal_resource: bitmap,
+                        selected_resource: -1,
+                        hover_resource: -1,
+                        hover_selected_resource: -1,
+                        mask_resource: mask,
+                        current_selection_hit_excluded: false,
+                        flags: 0,
+                    },
+                ],
+                ..GraphInputDescriptor::default()
+            },
+        );
+
+        let covered = api
+            .hit_test_graph_input_object(object, (20.0, 20.0))
+            .expect("explicit target mask must accept covered pixels");
+        assert_eq!((covered.0.group, covered.0.index), (0, 1));
+
+        let transparent = api
+            .hit_test_graph_input_object(object, (70.0, 20.0))
+            .expect("transparent explicit-mask pixel must fall through to lower item");
+        assert_eq!((transparent.0.group, transparent.0.index), (0, 0));
+    }
+
+    #[test]
+    fn graph91_bb_toggles_materialized_extended_child_enabled_gate() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_025;
+        let object = 96;
+        let bitmap = 1921;
+        api.store_graph_image(
+            "test:extended-item-state".to_string(),
+            DecodedImage {
+                width: 40,
+                height: 20,
+                rgba: vec![255; 40 * 20 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:extended-item-state".to_string()),
+        );
+        api.graph_surfaces
+            .insert(surface, RuntimeSurface::display(surface, 200.0, 100.0));
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        let descriptor = GraphInputDescriptor {
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index: 0,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x: 10,
+                y: 10,
+                width: 0,
+                height: 0,
+                normal_resource: bitmap,
+                selected_resource: -1,
+                hover_resource: -1,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                current_selection_hit_excluded: false,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        };
+        GraphApi::configure_graph_input_object(&mut api, object, descriptor.clone());
+        let layer_id = *api
+            .graph_layers
+            .iter()
+            .find_map(|(id, _)| {
+                api.surface_controls
+                    .contains_layer_for_owner(SurfaceControlOwner::InputObject(object), *id)
+                    .then_some(id)
+            })
+            .unwrap();
+        assert!(api.graph_layers[&layer_id].enabled);
+        assert!(api.hit_test_graph_input_object(object, (20.0, 20.0)).is_some());
+
+        assert_eq!(GraphApi::set_graph_input_item_state(&mut api, object, 0, 0, 0), 0);
+        assert!(!api.graph_layers[&layer_id].enabled);
+        assert!(api.hit_test_graph_input_object(object, (20.0, 20.0)).is_none());
+
+        assert_eq!(GraphApi::set_graph_input_item_state(&mut api, object, 0, 0, 1), 0);
+        assert!(api.graph_layers[&layer_id].enabled);
+        assert!(api.hit_test_graph_input_object(object, (20.0, 20.0)).is_some());
+
+        // Reconfigure rebuilds target child Sprites with constructor enabled=1.
+        GraphApi::configure_graph_input_object(&mut api, object, descriptor);
+        let rebuilt_layer = *api
+            .graph_layers
+            .iter()
+            .find_map(|(id, _)| {
+                api.surface_controls
+                    .contains_layer_for_owner(SurfaceControlOwner::InputObject(object), *id)
+                    .then_some(id)
+            })
+            .unwrap();
+        assert!(api.graph_layers[&rebuilt_layer].enabled);
+    }
+
+    #[test]
+    fn processors_sharing_window_keep_independent_virtual_children() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_023;
+        let object_a = 93;
+        let object_b = 94;
+        let bitmap_a = 1918;
+        let bitmap_b = 1919;
+        for (bitmap, key) in [
+            (bitmap_a, "test:processor-a-icon"),
+            (bitmap_b, "test:processor-b-icon"),
+        ] {
+            api.store_graph_image(
+                key.to_string(),
+                DecodedImage {
+                    width: 40,
+                    height: 20,
+                    rgba: vec![255; 40 * 20 * 4],
+                },
+            );
+            api.graph_resources
+                .insert(bitmap, RuntimeGraphResource::whole(key.to_string()));
+        }
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            object_a,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        api.graph_input_objects.insert(
+            object_b,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+
+        let make_descriptor = |index, x, bitmap| GraphInputDescriptor {
+            regions: vec![GraphInputRegion {
+                group: 0,
+                index,
+                ordinal: 0,
+                enabled_depth: 1,
+                selected: false,
+                x,
+                y: 20,
+                width: 40,
+                height: 20,
+                normal_resource: bitmap,
+                selected_resource: -1,
+                hover_resource: -1,
+                hover_selected_resource: -1,
+                mask_resource: -1,
+                current_selection_hit_excluded: false,
+                flags: 0,
+            }],
+            ..GraphInputDescriptor::default()
+        };
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object_a,
+            make_descriptor(3, 10, bitmap_a),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object_b,
+            make_descriptor(9, 100, bitmap_b),
+        );
+
+        assert_eq!(
+            api.surface_controls
+                .owner_layer_count(SurfaceControlOwner::InputObject(object_a)),
+            1
+        );
+        assert_eq!(
+            api.surface_controls
+                .owner_layer_count(SurfaceControlOwner::InputObject(object_b)),
+            1
+        );
+        assert_eq!(api.surface_controls.layer_count(surface), 2);
+
+        let hit_a = api
+            .hit_test_graph_input_object(object_a, (115.0, 525.0))
+            .expect("processor A must retain its own target child set");
+        assert_eq!((hit_a.0.group, hit_a.0.index), (0, 3));
+        assert!(api
+            .hit_test_graph_input_object(object_a, (205.0, 525.0))
+            .is_none());
+        let hit_b = api
+            .hit_test_graph_input_object(object_b, (205.0, 525.0))
+            .expect("processor B must retain its own target child set");
+        assert_eq!((hit_b.0.group, hit_b.0.index), (0, 9));
+
+        api.graph_input_objects.remove(&object_a);
+        api.remove_graph_input_control_layers(object_a);
+        assert_eq!(
+            api.surface_controls
+                .owner_layer_count(SurfaceControlOwner::InputObject(object_a)),
+            0
+        );
+        assert_eq!(
+            api.surface_controls
+                .owner_layer_count(SurfaceControlOwner::InputObject(object_b)),
+            1
+        );
+        assert_eq!(api.surface_controls.layer_count(surface), 1);
+        let hit_b_after_release = api
+            .hit_test_graph_input_object(object_b, (205.0, 525.0))
+            .expect("releasing processor A must not remove processor B Virtual children");
+        assert_eq!((hit_b_after_release.0.group, hit_b_after_release.0.index), (0, 9));
+    }
+
+    #[test]
+    fn native_mouse_press_routes_real_item_before_overlapping_no_item_processor() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let button_surface = 20_024;
+        let fallback_surface = 20_025;
+        let button_object = 95;
+        let fallback_object = 96;
+        let button_bitmap = 1920;
+
+        api.store_graph_image(
+            "test:route-real-button".to_string(),
+            DecodedImage {
+                width: 40,
+                height: 20,
+                rgba: vec![255; 40 * 20 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            button_bitmap,
+            RuntimeGraphResource::whole("test:route-real-button".to_string()),
+        );
+        for surface in [button_surface, fallback_surface] {
+            let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+            display.x = 100.0;
+            display.y = 500.0;
+            api.graph_surfaces.insert(surface, display);
+        }
+        api.graph_input_objects.insert(
+            button_object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(button_surface),
+        );
+        api.graph_input_objects.insert(
+            fallback_object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(fallback_surface),
+        );
+
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            button_object,
+            GraphInputDescriptor {
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 5,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: false,
+                    x: 10,
+                    y: 20,
+                    width: 40,
+                    height: 20,
+                    normal_resource: button_bitmap,
+                    selected_resource: -1,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    current_selection_hit_excluded: false,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+        // The newer/higher-id processor intentionally has no live child under
+        // the pointer. Before routing arbitration it would still receive the
+        // same physical edge and queue Ex 0x10000007/-1.
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            fallback_object,
+            GraphInputDescriptor {
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 0,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: false,
+                    x: 250,
+                    y: 20,
+                    width: 40,
+                    height: 20,
+                    normal_resource: 99_997,
+                    selected_resource: -1,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    current_selection_hit_excluded: false,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+
+        assert!(api.process_graph_input_mouse_press((115.0, 525.0)));
+
+        let mut button_events = Vec::new();
+        while let Some(event) = api
+            .graph_input_objects
+            .get_mut(&button_object)
+            .unwrap()
+            .pop_event()
+        {
+            button_events.push(event);
+        }
+        let mut fallback_events = Vec::new();
+        while let Some(event) = api
+            .graph_input_objects
+            .get_mut(&fallback_object)
+            .unwrap()
+            .pop_event()
+        {
+            fallback_events.push(event);
+        }
+        assert!(button_events.iter().any(|event| {
+            event[0] == 0x1000_0007
+                && event[1] == super::graph_input::pack_words(0, 5)
+                && event[2] != -1
+        }));
+        assert!(!fallback_events
+            .iter()
+            .any(|event| event[0] == 0x1000_0007 && event[1] == -1));
+    }
+
+    #[test]
+    fn extended_release_timed_item_activates_on_mouse_release() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_030;
+        let object = 101;
+        let bitmap = 1924;
+        api.store_graph_image(
+            "test:release-timed-icon".to_string(),
+            DecodedImage {
+                width: 80,
+                height: 24,
+                rgba: vec![255; 80 * 24 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:release-timed-icon".to_string()),
+        );
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                groups: vec![GraphInputGroup {
+                    index: 0,
+                    initial_current_item: -1,
+                    selection_enabled: true,
+                    pointer_selection_enabled: true,
+                    pointer_activation_enabled: false,
+                    selection_exclusion_key: -1,
+                    // sub_44C6F0 false: defer activation until release.
+                    extended_flags: 0x02,
+                }],
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 2,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: false,
+                    x: 10,
+                    y: 20,
+                    width: 80,
+                    height: 24,
+                    normal_resource: bitmap,
+                    selected_resource: -1,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    current_selection_hit_excluded: false,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 120.0, y: 525.0 },
+        );
+        assert!(api.pending_input_consumed);
+        assert_eq!(
+            api.graph_input_objects[&object].deferred_pointer_activation(),
+            Some((0, 2))
+        );
+        assert!(api.graph_input_objects[&object].queued_events.is_empty());
+
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseRelease { x: 120.0, y: 525.0 },
+        );
+        assert!(
+            api.pending_input_consumed,
+            "release-timed icon activation must consume MouseRelease before CProcDspMsg"
+        );
+        assert_eq!(api.pending_click, None);
+        assert_eq!(
+            api.graph_input_objects[&object].deferred_pointer_activation(),
+            None
+        );
+        let events = api.graph_input_objects[&object]
+            .queued_events
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0][0], 0x1000_0007);
+        assert_eq!(events[0][1], super::graph_input::pack_words(0, 2));
+        assert_eq!(events[1], [0x1000_0006, super::graph_input::pack_words(0, 2), 1]);
+    }
+
+    #[test]
+    fn extended_release_timed_item_cancels_when_released_outside() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_031;
+        let object = 102;
+        let bitmap = 1925;
+        api.store_graph_image(
+            "test:release-cancel-icon".to_string(),
+            DecodedImage {
+                width: 80,
+                height: 24,
+                rgba: vec![255; 80 * 24 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:release-cancel-icon".to_string()),
+        );
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                groups: vec![GraphInputGroup {
+                    index: 0,
+                    initial_current_item: -1,
+                    selection_enabled: true,
+                    pointer_selection_enabled: true,
+                    pointer_activation_enabled: false,
+                    selection_exclusion_key: -1,
+                    extended_flags: 0x02,
+                }],
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 2,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: false,
+                    x: 10,
+                    y: 20,
+                    width: 80,
+                    height: 24,
+                    normal_resource: bitmap,
+                    selected_resource: -1,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    current_selection_hit_excluded: false,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+
+        assert!(api.process_graph_input_mouse_press((120.0, 525.0)));
+        assert!(api.process_graph_input_mouse_release((250.0, 525.0)));
+        assert_eq!(
+            api.graph_input_objects[&object].deferred_pointer_activation(),
+            None
+        );
+        assert!(api.graph_input_objects[&object].queued_events.is_empty());
+    }
+
+    #[test]
+    fn native_mouse_press_selects_only_one_no_item_fallback_scope() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let lower_surface = 20_026;
+        let upper_surface = 20_027;
+        let lower_object = 97;
+        let upper_object = 98;
+        for surface in [lower_surface, upper_surface] {
+            let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+            display.x = 100.0;
+            display.y = 500.0;
+            api.graph_surfaces.insert(surface, display);
+        }
+        for (object, surface, missing_bitmap) in [
+            (lower_object, lower_surface, 99_995),
+            (upper_object, upper_surface, 99_996),
+        ] {
+            api.graph_input_objects.insert(
+                object,
+                super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+            );
+            GraphApi::configure_graph_input_object(
+                &mut api,
+                object,
+                GraphInputDescriptor {
+                    regions: vec![GraphInputRegion {
+                        group: 0,
+                        index: 0,
+                        ordinal: 0,
+                        enabled_depth: 1,
+                        selected: false,
+                        x: 250,
+                        y: 20,
+                        width: 40,
+                        height: 20,
+                        normal_resource: missing_bitmap,
+                        selected_resource: -1,
+                        hover_resource: -1,
+                        hover_selected_resource: -1,
+                        mask_resource: -1,
+                        current_selection_hit_excluded: false,
+                        flags: 0,
+                    }],
+                    ..GraphInputDescriptor::default()
+                },
+            );
+        }
+
+        assert!(api.process_graph_input_mouse_press((115.0, 525.0)));
+        let lower_has_no_item = api.graph_input_objects.get_mut(&lower_object).unwrap().queued_events
+            .iter()
+            .any(|event| event[0] == 0x1000_0007 && event[1] == -1);
+        let upper_has_no_item = api.graph_input_objects.get_mut(&upper_object).unwrap().queued_events
+            .iter()
+            .any(|event| event[0] == 0x1000_0007 && event[1] == -1);
+        assert!(!lower_has_no_item);
+        assert!(upper_has_no_item);
+    }
+
+    #[test]
+    fn native_icon_partial_materialization_retries_missing_sibling() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_019;
+        let object = 89;
+        let first_bitmap = 1913;
+        let second_bitmap = 1916;
+        api.store_graph_image(
+            "test:first-icon".to_string(),
+            DecodedImage {
+                width: 40,
+                height: 20,
+                rgba: vec![255; 40 * 20 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            first_bitmap,
+            RuntimeGraphResource::whole("test:first-icon".to_string()),
+        );
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new_extended(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                regions: vec![
+                    GraphInputRegion {
+                        group: 0,
+                        index: 0,
+                        ordinal: 0,
+                        enabled_depth: 1,
+                        selected: false,
+                        x: 10,
+                        y: 20,
+                        width: 40,
+                        height: 20,
+                        normal_resource: first_bitmap,
+                        selected_resource: -1,
+                        hover_resource: -1,
+                        hover_selected_resource: -1,
+                        mask_resource: -1,
+                        current_selection_hit_excluded: false,
+                        flags: 0,
+                    },
+                    GraphInputRegion {
+                        group: 0,
+                        index: 1,
+                        ordinal: 1,
+                        enabled_depth: 1,
+                        selected: false,
+                        x: 100,
+                        y: 20,
+                        width: 60,
+                        height: 30,
+                        normal_resource: second_bitmap,
+                        selected_resource: -1,
+                        hover_resource: -1,
+                        hover_selected_resource: -1,
+                        mask_resource: -1,
+                        current_selection_hit_excluded: false,
+                        flags: 0,
+                    },
+                ],
+                ..GraphInputDescriptor::default()
+            },
+        );
+        assert_eq!(api.surface_controls.layer_count(surface), 1);
+        assert_eq!(api.graph_input_objects[&object].descriptor.regions.len(), 2);
+        assert!(api.hit_test_graph_input_object(object, (205.0, 525.0)).is_none());
+
+        api.store_graph_image(
+            "test:second-icon".to_string(),
+            DecodedImage {
+                width: 60,
+                height: 30,
+                rgba: vec![255; 60 * 30 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            second_bitmap,
+            RuntimeGraphResource::whole("test:second-icon".to_string()),
+        );
+        api.ensure_graph_input_control_layers(object);
+        assert_eq!(api.surface_controls.layer_count(surface), 2);
+        let hit = api
+            .hit_test_graph_input_object(object, (205.0, 525.0))
+            .expect("newly resolvable sibling should gain its target child-Sprite hit rectangle");
+        assert_eq!((hit.0.group, hit.0.index), (0, 1));
+        assert_eq!((hit.1, hit.2), (5, 5));
+
+        assert!(api.process_graph_input_mouse_press((205.0, 525.0)));
+        let mut events = Vec::new();
+        while let Some(event) = api.graph_input_objects.get_mut(&object).unwrap().pop_event() {
+            events.push(event);
+        }
+        assert!(events.iter().any(|event| {
+            event[0] == 0x1000_0007
+                && event[1] == super::graph_input::pack_words(0, 1)
+                && event[2] != -1
+        }));
+    }
+
+    #[test]
+    fn compact_icon_unresolved_item_is_retained_and_materializes_later() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_020;
+        let object = 90;
+        let bitmap = 1914;
+        let mut display = RuntimeSurface::display(surface, 320.0, 120.0);
+        display.x = 100.0;
+        display.y = 500.0;
+        display.valid_left = 8;
+        display.valid_top = 12;
+        api.graph_surfaces.insert(surface, display);
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                compact_uses_valid_region_origin: true,
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 0,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: false,
+                    x: 10,
+                    y: 20,
+                    width: 0,
+                    height: 0,
+                    normal_resource: bitmap,
+                    selected_resource: -1,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    current_selection_hit_excluded: false,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+        assert_eq!(api.graph_input_objects[&object].descriptor.regions.len(), 1);
+        assert_eq!(api.surface_controls.layer_count(surface), 0);
+
+        api.store_graph_image(
+            "test:late-icon".to_string(),
+            DecodedImage {
+                width: 40,
+                height: 20,
+                rgba: vec![255; 40 * 20 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            bitmap,
+            RuntimeGraphResource::whole("test:late-icon".to_string()),
+        );
+        api.ensure_graph_input_control_layers(object);
+        assert_eq!(api.surface_controls.layer_count(surface), 1);
+        let hit = api
+            .hit_test_graph_input_object(object, (119.0, 533.0))
+            .expect("late bitmap availability should materialize the compact child Sprite");
+        assert_eq!((hit.0.group, hit.0.index), (0, 0));
+        assert_eq!((hit.1, hit.2), (1, 1));
+    }
+
+    #[test]
+    fn compact_icon_selected_resource_supplies_configure_time_geometry() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let surface = 20_021;
+        let object = 91;
+        let selected_bitmap = 1915;
+        api.store_graph_image(
+            "test:selected-icon".to_string(),
+            DecodedImage {
+                width: 75,
+                height: 55,
+                rgba: vec![255; 75 * 55 * 4],
+            },
+        );
+        api.graph_resources.insert(
+            selected_bitmap,
+            RuntimeGraphResource::whole("test:selected-icon".to_string()),
+        );
+        api.graph_surfaces
+            .insert(surface, RuntimeSurface::display(surface, 1280.0, 720.0));
+        api.graph_input_objects.insert(
+            object,
+            super::graph_input::RuntimeGraphInputObject::new(surface),
+        );
+        GraphApi::configure_graph_input_object(
+            &mut api,
+            object,
+            GraphInputDescriptor {
+                compact_uses_valid_region_origin: true,
+                regions: vec![GraphInputRegion {
+                    group: 0,
+                    index: 17,
+                    ordinal: 0,
+                    enabled_depth: 1,
+                    selected: true,
+                    x: 1075,
+                    y: 549,
+                    width: 0,
+                    height: 0,
+                    normal_resource: 99_998,
+                    selected_resource: selected_bitmap,
+                    hover_resource: -1,
+                    hover_selected_resource: -1,
+                    mask_resource: -1,
+                    current_selection_hit_excluded: false,
+                    flags: 0,
+                }],
+                ..GraphInputDescriptor::default()
+            },
+        );
+        let region = api.graph_input_objects[&object].descriptor.regions[0];
+        assert_eq!((region.width, region.height), (75, 55));
+        assert_eq!(api.surface_controls.layer_count(surface), 1);
     }
 
     #[test]
@@ -11097,6 +14220,7 @@ mod input_tests {
                     hover_resource: -1,
                     hover_selected_resource: -1,
                     mask_resource: -1,
+                    current_selection_hit_excluded: false,
                     flags: 0,
                 }],
                 ..GraphInputDescriptor::default()
@@ -11221,6 +14345,7 @@ mod input_tests {
                 hover_resource: 77,
                 hover_selected_resource: -1,
                 mask_resource: -1,
+                current_selection_hit_excluded: false,
                 flags: 0,
             }],
             ..GraphInputDescriptor::default()
@@ -11253,6 +14378,15 @@ mod input_tests {
             api.poll_object_state_record(77),
             [0, 0, 1, 1, 11, 11],
             "base activation is reported by Graph90:BC; native running becomes zero"
+        );
+        assert!(
+            api.pending_input_consumed,
+            "target sub_46DB40 drains the mouse-left edge owned by DCIPIcon"
+        );
+        assert_eq!(
+            api.input_event_counts.get(&super::INPUT_DESCRIPTOR_MOUSE_LEFT),
+            None,
+            "the icon processor must drain the native descriptor count before CProcDspMsg"
         );
         assert_eq!(
             api.poll_object_event_record(77),
@@ -11294,6 +14428,7 @@ mod input_tests {
                 hover_resource: 77,
                 hover_selected_resource: -1,
                 mask_resource: -1,
+                current_selection_hit_excluded: false,
                 flags: 0,
             }],
             ..GraphInputDescriptor::default()
@@ -11405,6 +14540,7 @@ enum RuntimeInputEvent {
     MouseMove { x: f32, y: f32 },
     MousePress { x: f32, y: f32 },
     MouseRelease { x: f32, y: f32 },
+    MouseWheel { delta_y: f32 },
     KeyPress { descriptor: i32 },
     KeyRelease { descriptor: i32 },
 }
@@ -11744,6 +14880,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
         RuntimeInputEvent::MouseMove { x, y } => {
             let point = (x, y);
             api.mouse_pos = Some(point);
+            let _ = api.process_graph_knob_pointer_motion(point);
             api.update_graph_pointer_hover(point);
             push_runtime_window_message(api, 0x0200, pack_window_message_point(x, y), 0);
         }
@@ -11751,12 +14888,23 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             note_native_input_press(api, INPUT_DESCRIPTOR_MOUSE_LEFT);
             let point = Some((x, y));
             api.mouse_pos = point;
-            api.process_graph_input_mouse_press((x, y));
             api.mouse_pressed = true;
             api.pending_object_state = point;
             api.pending_input_state = Some(0x1000_0002);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
             api.pending_input_consumed = false;
+            // Target WndProc selects/captures CDspObjKnob before it feeds the
+            // generic mouse-left descriptor (sub_463780/sub_4637C0 versus
+            // sub_46DA80). A slider drag therefore owns this physical edge and
+            // must not simultaneously activate DCIPIcon/CProcDspMsg.
+            if api.process_graph_knob_mouse_press((x, y)) {
+                let _ = drain_native_input_descriptor(api, INPUT_DESCRIPTOR_MOUSE_LEFT);
+                api.pending_input_consumed = true;
+            } else if api.process_graph_input_mouse_press((x, y)) {
+                // DCIPIcon participates in the same native input-descriptor
+                // drain as CProcDspMsg. Preserve that one-owner consumption.
+                api.pending_input_consumed = true;
+            }
             push_runtime_window_message(api, 0x0201, pack_window_message_point(x, y), 1);
         }
         RuntimeInputEvent::MouseRelease { x, y } => {
@@ -11764,12 +14912,44 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             let point = Some((x, y));
             api.mouse_pos = point;
             api.mouse_pressed = false;
-            api.pending_click = point;
+            let knob_consumed = api.process_graph_knob_mouse_release((x, y));
+            let graph_input_consumed = if knob_consumed {
+                true
+            } else {
+                api.process_graph_input_mouse_release((x, y))
+            };
+            api.pending_click = if graph_input_consumed { None } else { point };
             api.pending_click_age_frames = 0;
             api.pending_input_state = Some(0x1000_0006);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
-            api.pending_input_consumed = false;
+            // A captured Knob or release-triggered DCIPIconEx item consumes the
+            // complete physical gesture. Do not expose it to CProcDspMsg as a
+            // second "advance text" action.
+            api.pending_input_consumed = graph_input_consumed;
             push_runtime_window_message(api, 0x0202, pack_window_message_point(x, y), 0);
+        }
+        RuntimeInputEvent::MouseWheel { delta_y } => {
+            if delta_y == 0.0 {
+                return;
+            }
+            if !api.process_graph_knob_mouse_wheel(delta_y) {
+                // Target WndProc falls through to native input descriptors
+                // when no Knob is watched: positive wheel -> descriptor 14,
+                // negative wheel -> descriptor 15, each as an immediate
+                // press/release pair.
+                let descriptor = if delta_y < 0.0 {
+                    INPUT_DESCRIPTOR_MOUSE_WHEEL_DOWN
+                } else {
+                    INPUT_DESCRIPTOR_MOUSE_WHEEL_UP
+                };
+                note_native_input_press(api, descriptor);
+                note_native_input_release(api, descriptor);
+                api.pending_input_state = Some(0x1000_0006);
+                api.pending_input_descriptor = Some(descriptor);
+                api.pending_input_consumed = false;
+            } else {
+                api.pending_input_consumed = true;
+            }
         }
         RuntimeInputEvent::KeyPress { descriptor } => {
             note_native_input_press(api, descriptor);
@@ -11793,6 +14973,7 @@ fn apply_headless_input_event(api: &mut RuntimeTraceApi, event: HeadlessInputEve
         HeadlessInputEvent::MouseMove { x, y } => RuntimeInputEvent::MouseMove { x, y },
         HeadlessInputEvent::MousePress { x, y } => RuntimeInputEvent::MousePress { x, y },
         HeadlessInputEvent::MouseRelease { x, y } => RuntimeInputEvent::MouseRelease { x, y },
+        HeadlessInputEvent::MouseWheel { delta_y } => RuntimeInputEvent::MouseWheel { delta_y },
         HeadlessInputEvent::KeyPress { key } => {
             let Some(descriptor) = input_descriptor_for_headless_key(&key) else {
                 tracing::warn!(key, "unsupported headless input key");
@@ -11866,6 +15047,14 @@ impl RuntimeTraceApi {
             .collect::<Vec<_>>();
 
         for object in objects {
+            // Retry processor-owned child/Virtual materialization before native
+            // hit testing. A resource that was not host-resolvable at
+            // Graph90:BA/Graph91:BA
+            // configure time must not leave the logical item permanently
+            // non-interactive once its bitmap becomes available. The fast path
+            // is allocation-free when descriptor and materialized ordinal sets
+            // already match.
+            self.ensure_graph_input_control_layers(object);
             let hit = self.hit_test_graph_input_object(object, point);
             let current_hit = hit
                 .as_ref()
@@ -12003,10 +15192,28 @@ impl RuntimeTraceApi {
     /// Fresh MouseDown is first masked by root+0x14 and mapped through the
     /// root+0x18 action table. Internal group+0x14 is not a fresh-click gate;
     /// it is consulted only by the later held-button reinjection path.
-    fn process_graph_input_mouse_press(&mut self, point: (f32, f32)) {
+    fn process_graph_input_mouse_press(&mut self, point: (f32, f32)) -> bool {
         // sub_448690 updates raw/pointer-current state before resolving action.
         self.update_graph_pointer_hover(point);
 
+        // Target native input is destructive at sub_46DF00 -> sub_46DB40: one
+        // physical mouse-left edge is sampled through the pointer-registration
+        // scope and therefore cannot be replayed independently to every live
+        // DCIPIcon processor. The old portable path fanned the same host edge
+        // out to all processors, which let an overlapping DCIPIconEx with no
+        // live item queue 0x10000007/-1 even when the message-window processor
+        // had a real button under the cursor. BP could consume that fallback
+        // event first and tear down both processors before the button result was
+        // observed.
+        //
+        // Build all action-1 candidates first. A live CDspObjVirtual item hit
+        // owns the edge ahead of any no-item/fallback processor. Only when no
+        // live item is hit may one pointer-scope Window receive the Ex no-item
+        // callback. Target resolves rarer true overlap cases through the descending
+        // vtable+0x1C registration ids in sub_46D660/sub_46D830. The portable
+        // runtime does not expose those target ids directly, so max(object) is
+        // only the deterministic tie-break between multiple simultaneous live
+        // hits; the message-window failure fixed here has exactly one live hit.
         let objects = self
             .graph_input_objects
             .iter()
@@ -12015,62 +15222,99 @@ impl RuntimeTraceApi {
             })
             .collect::<Vec<_>>();
 
+        let mut mapped = Vec::new();
         for object in objects {
-            let action = self
-                .graph_input_objects
-                .get(&object)
-                .map(|input| input.map_fresh_mouse_left_action(&self.graph_key_assignments))
-                .unwrap_or_default();
-            if action != 1 {
-                tracing::debug!(
-                    target: "graph_input",
-                    object,
-                    action,
-                    "fresh mouse-left did not map to DCIPIcon action 1"
-                );
-                continue;
-            }
-
-            let hit = self.hit_test_graph_input_object(object, point);
-            let Some((region, local_x, local_y)) = hit else {
-                // Base DCIPIcon's action-with-no-item callback is a no-op.
-                // DCIPIconEx overrides vtable+0x18 with sub_44B9E0 and queues
-                // 0x10000007 carrying processor-local coordinates.
-                if self
-                    .graph_input_objects
-                    .get(&object)
-                    .is_some_and(|input| input.extended)
-                {
-                    let (object_x, object_y) = self.graph_input_object_local_point(object, point);
-                    if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                        input.queue_event([
-                            0x1000_0007,
-                            -1,
-                            graph_input::pack_words(object_y, object_x),
-                        ]);
-                    }
-                }
+            let Some(input) = self.graph_input_objects.get(&object) else {
                 continue;
             };
+            let action = input.map_fresh_mouse_left_action(&self.graph_key_assignments);
+            let surface = input.layer;
+            let extended = input.extended;
+            let action_mode = input.descriptor.flags[3] & 7;
+            let input_mask = input.descriptor.flags[2];
+            let hit = (action == 1)
+                .then(|| self.hit_test_graph_input_object(object, point))
+                .flatten();
+            tracing::info!(
+                object,
+                surface,
+                action_mode,
+                input_mask = format_args!("0x{input_mask:08X}"),
+                mapped_action = action,
+                hit_group = hit.as_ref().map(|(region, _, _)| region.group).unwrap_or(-1),
+                hit_item = hit.as_ref().map(|(region, _, _)| region.index).unwrap_or(-1),
+                "GraphInputPressRouteCandidate"
+            );
+            if action == 1 {
+                mapped.push((object, surface, extended, hit));
+            }
+        }
 
-            let (extended, activation_allowed) = self
+        // A real target item has its own CDspObjVirtual and wins over the
+        // processor-level no-item callback. This is the important distinction
+        // for the message-window pair seen in runtime traces: the 14-item
+        // processor must win over the adjacent 1-item processor whose child was
+        // not materialized.
+        if let Some((object, surface, extended, hit)) = mapped
+            .iter()
+            .filter(|(_, _, _, hit)| hit.is_some())
+            .max_by_key(|(object, _, _, _)| *object)
+            .cloned()
+        {
+            let (region, local_x, local_y) = hit.expect("filtered live item hit");
+            let activation_is_immediate = self
                 .graph_input_objects
                 .get(&object)
-                .map(|input| (input.extended, input.pointer_activation_allowed(region)))
-                .unwrap_or((false, false));
-            if !activation_allowed {
+                .is_some_and(|input| input.pointer_activation_is_immediate(region));
+            let group_extended_flags = self
+                .graph_input_objects
+                .get(&object)
+                .and_then(|input| {
+                    input
+                        .descriptor
+                        .groups
+                        .iter()
+                        .find(|group| group.index == region.group)
+                        .map(|group| group.extended_flags)
+                })
+                .unwrap_or_default();
+
+            tracing::info!(
+                object,
+                surface,
+                extended,
+                group = region.group,
+                item = region.index,
+                local_x,
+                local_y,
+                group_extended_flags = format_args!("0x{group_extended_flags:08X}"),
+                item_flags = format_args!("0x{:08X}", region.flags),
+                activation_timing = if activation_is_immediate { "press" } else { "release" },
+                "GraphInputPressRouteSelected"
+            );
+
+            // sub_46DF00/sub_46DB40 destructively samples the selected pointer
+            // scope. DCIPIconEx vtable+0x48 (`sub_44C6F0`) does not reject a
+            // false result: sub_448690 stores the hit in this[36] and activates
+            // it when mouse-left is later released over the same item.
+            let _ = drain_native_input_descriptor(self, INPUT_DESCRIPTOR_MOUSE_LEFT);
+            if !activation_is_immediate {
+                if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                    input.defer_pointer_activation(region);
+                }
                 tracing::info!(
                     target: "graph_input",
                     object,
                     group = region.group,
                     item = region.index,
                     extended,
-                    "native icon-input press rejected by target item gates"
+                    "native icon-input activation deferred until mouse release"
                 );
-                continue;
+                return true;
             }
 
             if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                input.clear_deferred_pointer_activation();
                 input.begin_interaction(region, local_x, local_y);
                 if extended {
                     let payload = graph_input::pack_words(region.group, region.index);
@@ -12094,10 +15338,251 @@ impl RuntimeTraceApi {
                 extended,
                 "native icon-input press activated item"
             );
+            return true;
+        }
+
+        // No live item was hit. Target sub_46D830 still scopes the destructive
+        // input read to the top registered pointer object, so do not emit Ex
+        // no-item callbacks for every processor. Restrict fallback candidates
+        // to visible owning Windows that actually contain the pointer, then
+        // select the highest native id/registration priority.
+        let fallback = mapped
+            .iter()
+            .filter(|(_, surface, _, hit)| {
+                hit.is_none() && self.graph_input_surface_contains_point(*surface, point)
+            })
+            .max_by_key(|(object, _, _, _)| *object)
+            .cloned();
+
+        let Some((object, surface, extended, _)) = fallback else {
+            return false;
+        };
+        let (object_x, object_y) = self.graph_input_object_local_point(object, point);
+        let logical_regions = self
+            .graph_input_objects
+            .get(&object)
+            .map(|input| input.descriptor.regions.len())
+            .unwrap_or_default();
+        let materialized_regions = self
+            .graph_layers
+            .iter()
+            .filter(|(layer_id, layer)| {
+                layer.target_surface == Some(surface)
+                    && self.surface_controls.contains_layer_for_owner(
+                        SurfaceControlOwner::InputObject(object),
+                        **layer_id,
+                    )
+            })
+            .count();
+        let child_rects = self
+            .graph_layers
+            .iter()
+            .filter_map(|(&layer_id, layer)| {
+                if layer.target_surface != Some(surface)
+                    || !self.surface_controls.contains_layer_for_owner(
+                        SurfaceControlOwner::InputObject(object),
+                        layer_id,
+                    )
+                {
+                    return None;
+                }
+                let ordinal = usize::try_from(layer.hit_id).ok()?;
+                let region = self
+                    .graph_input_objects
+                    .get(&object)?
+                    .descriptor
+                    .regions
+                    .get(ordinal)?;
+                let (left, top, _) = self.layer_world_transform(layer_id, layer);
+                let configure_resource = native_surface_control_configure_resource(region);
+                let (width, height) = self
+                    .resource_image_region(configure_resource)
+                    .map(|(_, source)| (source.width, source.height))
+                    .unwrap_or((layer.width, layer.height));
+                Some(format!(
+                    "ord={ordinal}/g{}/i{} res={} rect=({:.1},{:.1} {:.1}x{:.1})",
+                    region.group,
+                    region.index,
+                    configure_resource,
+                    left,
+                    top,
+                    width,
+                    height
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        tracing::info!(
+            object,
+            surface,
+            extended,
+            screen_x = point.0,
+            screen_y = point.1,
+            local_x = object_x,
+            local_y = object_y,
+            logical_regions,
+            materialized_regions,
+            child_rects = %child_rects,
+            "GraphInputNoItemHit"
+        );
+        tracing::info!(
+            object,
+            surface,
+            extended,
+            local_x = object_x,
+            local_y = object_y,
+            "GraphInputPressRouteSelectedFallback"
+        );
+
+        // Sampling the selected native pointer scope drains the edge regardless
+        // of whether the base processor has a callback. DCIPIconEx overrides
+        // the no-item callback with sub_44B9E0 and queues 0x10000007/-1.
+        let _ = drain_native_input_descriptor(self, INPUT_DESCRIPTOR_MOUSE_LEFT);
+        if extended {
+            if let Some(input) = self.graph_input_objects.get_mut(&object) {
+                input.queue_event([
+                    0x1000_0007,
+                    -1,
+                    graph_input::pack_words(object_y, object_x),
+                ]);
+            }
+        }
+        true
+    }
+
+    /// Complete a DCIPIconEx activation that `sub_448690` deferred in
+    /// DCIPIcon+0x90 (`this[36]`). A false vtable+0x48/sub_44C6F0 result on
+    /// MouseDown means "activate on release", not "disabled". The target
+    /// waits for mouse-left to become up, requires pointer-current to still be
+    /// the same live item, then re-enters action 1; the non--1 pending slot
+    /// bypasses the immediate-activation predicate and calls the normal state
+    /// transition path.
+    fn process_graph_input_mouse_release(&mut self, point: (f32, f32)) -> bool {
+        self.update_graph_pointer_hover(point);
+
+        let pending = self
+            .graph_input_objects
+            .iter()
+            .filter_map(|(&object, input)| {
+                input
+                    .deferred_pointer_activation()
+                    .map(|item| (object, item))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return false;
+        }
+
+        let mut matching = Vec::new();
+        for (object, pending_item) in &pending {
+            let hit = self.hit_test_graph_input_object(*object, point);
+            let matches_pending = hit
+                .as_ref()
+                .is_some_and(|(region, _, _)| (region.group, region.index) == *pending_item);
+            tracing::info!(
+                object = *object,
+                pending_group = pending_item.0,
+                pending_item = pending_item.1,
+                release_hit_group = hit.as_ref().map(|(region, _, _)| region.group).unwrap_or(-1),
+                release_hit_item = hit.as_ref().map(|(region, _, _)| region.index).unwrap_or(-1),
+                matches_pending,
+                "GraphInputReleaseRouteCandidate"
+            );
+            if matches_pending {
+                if let Some((region, local_x, local_y)) = hit {
+                    matching.push((*object, region, local_x, local_y));
+                }
+            }
+        }
+
+        // Target clears this[36] when release occurs away from the pending
+        // pointer-current item. Clear every portable pending slot before
+        // dispatch so reconfiguration/event handling cannot leave stale state.
+        for (object, _) in &pending {
+            if let Some(input) = self.graph_input_objects.get_mut(object) {
+                input.clear_deferred_pointer_activation();
+            }
+        }
+
+        // One physical press was routed to one processor, so normally there is
+        // exactly one pending object. Keep the same deterministic native-id
+        // tie-break as the press path for corrupted/overlapping states.
+        let Some((object, region, local_x, local_y)) = matching
+            .into_iter()
+            .max_by_key(|(object, _, _, _)| *object)
+        else {
+            tracing::info!(
+                pending_processors = pending.len(),
+                "GraphInputReleaseDeferredActivationCancelled"
+            );
+            // The native icon scope owned the original press. Its matching
+            // release must not fall through to CProcDspMsg and advance text
+            // merely because the pointer was dragged off the button.
+            return true;
+        };
+
+        let extended = self
+            .graph_input_objects
+            .get(&object)
+            .is_some_and(|input| input.extended);
+        if let Some(input) = self.graph_input_objects.get_mut(&object) {
+            input.begin_interaction(region, local_x, local_y);
+            if extended {
+                let payload = graph_input::pack_words(region.group, region.index);
+                input.queue_event([
+                    0x1000_0007,
+                    payload,
+                    graph_input::pack_words(local_y, local_x),
+                ]);
+                input.queue_event([0x1000_0006, payload, 1]);
+            }
+        }
+        self.last_hit_control = graph_input::pack_words(region.group, region.index);
+        self.last_hit_payload = region.index;
+        tracing::info!(
+            target: "graph_input",
+            object,
+            group = region.group,
+            item = region.index,
+            local_x,
+            local_y,
+            extended,
+            "GraphInputReleaseDeferredActivationCompleted"
+        );
+        true
+    }
+
+    fn graph_input_surface_contains_point(&self, surface: i32, point: (f32, f32)) -> bool {
+        let Some(record) = self.graph_surfaces.get(&surface) else {
+            return false;
+        };
+        if !self.surface_display_chain_visible(surface, record) {
+            return false;
+        }
+        let (left, top) = self.surface_world_position(surface);
+        let right = left + record.width.max(0.0);
+        let bottom = top + record.height.max(0.0);
+        point.0 >= left && point.0 < right && point.1 >= top && point.1 < bottom
+    }
+
+    fn ensure_graph_input_control_layers(&mut self, object: i32) {
+        let Some((surface, descriptor)) = self
+            .graph_input_objects
+            .get(&object)
+            .map(|input| (input.layer, input.descriptor.clone()))
+        else {
+            return;
+        };
+        if self.graph_surfaces.contains_key(&surface) {
+            self.replace_graph_input_control_layers(object, surface, &descriptor);
         }
     }
 
     fn refresh_graph_input_control_layers(&mut self, object: i32) {
+        // Visual state changes are also a natural point to retry any logical
+        // items whose child Sprite could not be materialized during configure.
+        self.ensure_graph_input_control_layers(object);
         let Some((surface, descriptor, hovered, selections, extended)) = self
             .graph_input_objects
             .get(&object)
@@ -12129,7 +15614,10 @@ impl RuntimeTraceApi {
             .iter()
             .filter_map(|(&layer_id, layer)| {
                 if layer.target_surface != Some(surface)
-                    || !self.surface_controls.contains_layer(layer_id)
+                    || !self.surface_controls.contains_layer_for_owner(
+                        SurfaceControlOwner::InputObject(object),
+                        layer_id,
+                    )
                 {
                     return None;
                 }
@@ -12161,23 +15649,17 @@ impl RuntimeTraceApi {
                             .map(|_| region.normal_resource)
                     })?;
                 let (key, source) = self.resource_image_region(resource_id)?;
-                let width = if region.width > 0 {
-                    region.width as f32
-                } else {
-                    source.width
-                };
-                let height = if region.height > 0 {
-                    region.height as f32
-                } else {
-                    source.height
-                };
+                let width = source.width;
+                let height = source.height;
+                let (control_x, control_y) =
+                    self.surface_control_region_position(surface, &descriptor, region);
                 Some((
                     layer_id,
                     resource_id,
                     key.to_string(),
                     source,
-                    region.x as f32,
-                    region.y as f32,
+                    control_x as f32,
+                    control_y as f32,
                     width,
                     height,
                     layer.z,
@@ -12232,6 +15714,30 @@ impl RuntimeTraceApi {
         }
     }
 
+}
+
+impl RuntimeTraceApi {
+    /// Process one host WM_CLOSE using the target window-procedure contract.
+    ///
+    /// Target sub_498DC0 checks dword_506A84 (Sys80:68). When it is zero the
+    /// close is intercepted and sub_496540 queues the three-DWORD native event
+    /// `[2, 0, 0]`; otherwise DefWindowProc receives WM_CLOSE and the native
+    /// window is allowed to close. Returns true only for that latter case.
+    fn handle_host_window_close(&mut self, source: &'static str) -> bool {
+        let mode = self.native_system.native_close_mode;
+        if mode != 0 {
+            tracing::info!(mode, source, "WM_CLOSE allowed by native close mode");
+            return true;
+        }
+        self.queued_system_events.push_back([2, 0, 0]);
+        tracing::info!(
+            mode,
+            source,
+            pending_events = self.queued_system_events.len(),
+            "WM_CLOSE intercepted into native event code 2"
+        );
+        false
+    }
 }
 
 impl ethornell_vm::SysApi for RuntimeTraceApi {
@@ -12306,8 +15812,19 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn poll_queued_event(&mut self) -> Option<[i32; 3]> {
         let event = self.queued_system_events.pop_front();
-        tracing::debug!(?event, "PollQueuedEvent");
-        event
+        if let Some([event_type, code, parameter]) = event {
+            tracing::info!(
+                event_type,
+                code,
+                parameter,
+                remaining = self.queued_system_events.len(),
+                "PollQueuedEvent consumed native event"
+            );
+            Some([event_type, code, parameter])
+        } else {
+            tracing::debug!("PollQueuedEvent empty");
+            None
+        }
     }
 
     fn load_file_bytes(&mut self, archive: &str, file: &str) -> Option<Vec<u8>> {
@@ -14263,10 +17780,13 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x69) => {
-                // funcs_48B30E[0x69] -> sub_4894B0 posts WM_CLOSE. Both
-                // frontends observe this flag at the same frame boundary.
-                self.quit_requested = true;
-                tracing::info!("RequestWindowClose");
+                // Target sub_4894B0 calls PostMessageA(hWndParent, WM_CLOSE,
+                // 0, 0). Posting is asynchronous: do not convert this into an
+                // immediate host quit, because native_close_mode==0 must first
+                // pass through sub_498DC0 -> sub_496540(2, 0, 0), which is what
+                // sysmsg._bp turns into the 0x4000/endsys/yesnownd flow.
+                self.pending_window_close_request = true;
+                tracing::info!("RequestWindowClose posted host WM_CLOSE");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0x6a) => {
@@ -14843,10 +18363,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         }
         self.graph_surfaces.get(&window).map(|surface| {
             [
-                surface.viewport_x as i32,
-                surface.viewport_y as i32,
-                surface.viewport_x as i32 + surface.viewport_width as i32 - 1,
-                surface.viewport_y as i32 + surface.viewport_height as i32 - 1,
+                surface.valid_left,
+                surface.valid_top,
+                surface.valid_right,
+                surface.valid_bottom,
             ]
         })
     }
@@ -15056,6 +18576,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         self.store_graph_image(key.clone(), image);
         self.graph_resources
             .insert(bitmap, RuntimeGraphResource::whole(key));
+        self.reset_bitmap_auxiliary_pair(bitmap);
         self.bitmap_dimensions
             .insert(bitmap, (width as u32, height as u32));
         self.graph_surfaces.insert(
@@ -15161,23 +18682,39 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         object: i32,
         mut descriptor: ethornell_vm::GraphInputDescriptor,
     ) {
-        for region in &mut descriptor.regions {
-            if region.width > 0 && region.height > 0 {
-                continue;
-            }
-            let Some((_, image_region)) = self.resource_image_region(region.normal_resource) else {
-                continue;
-            };
-            if region.width <= 0 {
-                region.width = image_region.width.round() as i32;
-            }
-            if region.height <= 0 {
-                region.height = image_region.height.round() as i32;
+        if descriptor.compact_uses_valid_region_origin {
+            for region in &mut descriptor.regions {
+                if region.width > 0 && region.height > 0 {
+                    continue;
+                }
+                // Compact DCIPIcon items do not contain width/height. Target
+                // sub_447C10 resolves the bitmap selected for the configure-time
+                // group current item (selected resource when present, otherwise
+                // normal) and derives the child rectangle from that bitmap. Keep
+                // the logical item even if the host cache cannot resolve it yet;
+                // a later materialization retry must still have an item to build.
+                let resource_id = native_surface_control_configure_resource(region);
+                let image_region = self
+                    .resource_image_region(resource_id)
+                    .map(|(_, region)| region);
+                let Some(image_region) = image_region else {
+                    continue;
+                };
+                if region.width <= 0 {
+                    region.width = image_region.width.round() as i32;
+                }
+                if region.height <= 0 {
+                    region.height = image_region.height.round() as i32;
+                }
             }
         }
-        descriptor
-            .regions
-            .retain(|region| region.enabled_depth != 0 && region.width > 0 && region.height > 0);
+        // DCIPIconEx *does* contain dwords at +0x10/+0x14, but target
+        // sub_44A900 passes them to sub_42BED0 as mode-5 origin/transform
+        // parameters. Never overwrite zero values with bitmap dimensions.
+        // Do not retain()/delete unresolved or disabled items here. The target
+        // copies the complete descriptor and independently decides which items
+        // receive live CDspObjVirtual children. Removing an item changes group/item
+        // identity and makes later resource availability impossible to recover.
         self.sync_title_controls_from_input(object, &descriptor);
         let region_count = descriptor.regions.len();
         let descriptor_changed = self
@@ -15190,7 +18727,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 .iter()
                 .map(|region| {
                     format!(
-                        "group={} index={} ordinal={} enabled_depth={} selected={} rect=({},{} {}x{}) resources=(normal={},selected={},hover={},hover_selected={},aux={}) flags=0x{:08X}",
+                        "group={} index={} ordinal={} enabled_depth={} selected={} pos=({}, {}) transform_fields=({}, {}) resources=(normal={},selected={},hover={},hover_selected={},mask={}) current_hit_excluded={} flags=0x{:08X}",
                         region.group,
                         region.index,
                         region.ordinal,
@@ -15205,6 +18742,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         region.hover_resource,
                         region.hover_selected_resource,
                         region.mask_resource,
+                        region.current_selection_hit_excluded,
                         region.flags
                     )
                 })
@@ -15216,10 +18754,72 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             .or_insert_with(|| RuntimeGraphInputObject::new(0));
         input.configure(descriptor);
         let input_layer = input.layer;
+        let input_extended = input.extended;
         let descriptor = input.descriptor.clone();
-        if self.graph_surfaces.contains_key(&input_layer) {
-            self.replace_surface_control_layers(input_layer, &descriptor);
-        }
+        let materialized_controls = if self.graph_surfaces.contains_key(&input_layer) {
+            self.replace_graph_input_control_layers(object, input_layer, &descriptor)
+        } else {
+            0
+        };
+        let unresolved_controls = descriptor
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| region.enabled_depth != 0)
+            .filter_map(|(ordinal, region)| {
+                let resource = native_surface_control_configure_resource(region);
+                self.resource_image_region(resource).is_none().then(|| {
+                    format!(
+                        "ord={ordinal}/g{}/i{} res={resource}",
+                        region.group, region.index
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let materialized_layout = self
+            .graph_input_objects
+            .get(&object)
+            .map(|input| {
+                descriptor
+                    .regions
+                    .iter()
+                    .filter(|region| region.enabled_depth != 0)
+                    .filter_map(|region| {
+                        let resource = native_surface_control_configure_resource(region);
+                        let (_, image) = self.resource_image_region(resource)?;
+                        Some(format!(
+                            "g{}/i{} pos=({}, {}) raster={}x{} tf=({}, {}) mask={} mask_fmt={:?} depth={} current={} exclude={} state={}",
+                            region.group,
+                            region.index,
+                            region.x,
+                            region.y,
+                            image.width as i32,
+                            image.height as i32,
+                            region.width,
+                            region.height,
+                            region.mask_resource,
+                            self.bitmap_formats.get(&region.mask_resource).copied(),
+                            native_surface_control_depth(region),
+                            input.is_current_selection(region.group, region.index),
+                            region.current_selection_hit_excluded,
+                            i32::from(input.item_enabled(region.group, region.index)),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
+        tracing::info!(
+            object,
+            surface = input_layer,
+            extended = input_extended,
+            logical_regions = region_count,
+            materialized_controls,
+            unresolved_controls = %unresolved_controls,
+            materialized_layout = %materialized_layout,
+            "GraphConfigureIconInputProcessor"
+        );
         // sub_44A900 resets the pointer-current item and immediately reruns
         // hit testing. If the cursor is already over an item, the target can
         // therefore queue the initial 0x10000002 record during configure.
@@ -15891,11 +19491,12 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let enabled = pop_int_value(stack).unwrap_or_default() != 0;
                 let window = pop_int_value(stack).unwrap_or_default();
                 let updated = Self::is_window_surface_handle(window)
-                    && self.graph_surfaces.get_mut(&window).is_some_and(|record| {
-                        record.enabled = enabled;
-                        true
-                    });
+                    && self.graph_surfaces.contains_key(&window);
                 if updated {
+                    // sub_47DC90 -> sub_462CA0 -> sub_440A90 -> vtable+4 ->
+                    // CDspObj::sub_41AE00. This writes +0x14 and recursively
+                    // propagates through the native member list.
+                    self.set_graph_object_draw_enabled(window, enabled);
                     trace_graph!(self, "window #{window} draw-enabled={enabled}");
                 }
                 tracing::info!(window, enabled, updated, "GraphSetWindowDrawEnabled");
@@ -15980,10 +19581,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         });
                     if valid {
                         if let Some(surface) = self.graph_surfaces.get_mut(&window) {
-                            surface.viewport_x = x as f32;
-                            surface.viewport_y = y as f32;
-                            surface.viewport_width = width as f32;
-                            surface.viewport_height = height as f32;
+                            surface.valid_left = x;
+                            surface.valid_top = y;
+                            surface.valid_right = x.saturating_add(width).saturating_sub(1);
+                            surface.valid_bottom = y.saturating_add(height).saturating_sub(1);
                         }
                         trace_graph!(
                             self,
@@ -16010,10 +19611,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let out_rect_ptr = args.get(1).map(value_to_i32).unwrap_or_default();
                 let region = self.graph_surfaces.get(&window).map(|surface| {
                     [
-                        surface.viewport_x as i32,
-                        surface.viewport_y as i32,
-                        surface.viewport_x as i32 + surface.viewport_width as i32 - 1,
-                        surface.viewport_y as i32 + surface.viewport_height as i32 - 1,
+                        surface.valid_left,
+                        surface.valid_top,
+                        surface.valid_right,
+                        surface.valid_bottom,
                     ]
                 });
                 tracing::debug!(window, out_rect_ptr, ?region, "GraphGetWindowValidRegion");
@@ -16137,6 +19738,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 self.effects.remove_bitmap(bitmap_id);
                 self.bitmap_dimensions.remove(&bitmap_id);
                 self.bitmap_formats.remove(&bitmap_id);
+                self.reset_bitmap_auxiliary_pair(bitmap_id);
                 let existed = self.graph_surfaces.remove(&bitmap_id).is_some()
                     | self.graph_resources.remove(&bitmap_id).is_some();
                 tracing::debug!(bitmap_id, existed, "GraphReleaseBitmap");
@@ -16230,11 +19832,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     let source_key = self.resolve_resource_key(source).map(str::to_owned);
                     let source_format = self.bitmap_formats.get(&source).copied();
                     let destination_format = self.bitmap_formats.get(&destination).copied();
+                    let source_stats = self.graph_bitmap_pixel_stats(source);
+                    let destination_before_stats = self.graph_bitmap_pixel_stats(destination);
                     let copied_vector = self.effects.copy_vector_map(destination, source, x, y);
                     self.composite_bitmap_text(destination, source, x, y, mode);
                     if let Some(key) =
                         self.composite_graph_bitmap(destination, source, x, y, mode, parameter)
                     {
+                        let output_stats = self.graph_bitmap_pixel_stats(destination);
                         tracing::info!(
                             destination,
                             source,
@@ -16245,6 +19850,9 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             source_key = ?source_key,
                             source_format = ?source_format,
                             destination_format = ?destination_format,
+                            source_stats = ?source_stats,
+                            destination_before_stats = ?destination_before_stats,
+                            output_stats = ?output_stats,
                             output_key = %key,
                             "GraphCompositeBitmap"
                         );
@@ -16488,50 +20096,119 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let object = stack.pop();
                 let object_id = object.as_ref().map(value_to_i32).unwrap_or_default();
                 let removed = self.graph_input_objects.remove(&object_id);
-                if let Some(input) = removed.as_ref() {
-                    self.remove_surface_control_layers(input.layer);
+                if removed.is_some() {
+                    self.remove_graph_input_control_layers(object_id);
                 }
                 tracing::info!(?object, "GraphReleaseIconInputProcessor");
                 return Ok(ethornell_vm::Value::Int(i32::from(removed.is_some())));
             }
             (0x90, 0xd0) => {
                 let target = pop_int_value(stack).unwrap_or_default();
-                let handle = if self.graph_handle_exists(target)
-                    && !self.graph_native_owners.contains_key(&target)
-                    && !self.graph_knob_target_owners.contains_key(&target)
-                {
+                // Target sub_442100 only resolves the supplied CDspObj and
+                // allocates a Knob slot. It does not require the target to be
+                // unparented and does not claim it as a member child.
+                let handle = if self.graph_handle_exists(target) {
                     self.alloc_graph_knob_handle().map(|handle| {
+                        // sub_420EC0 initializes the Knob's ordinary +0x30/+0x34
+                        // position from target vtable+0x30 (sub_41B240): the
+                        // target's raw/native base position, not composite/world.
                         let (base_x, base_y) = self
-                            .graph_native_composite_position(target)
+                            .graph_native_base_position(target)
                             .map(|(x, y)| (x as f32, y as f32))
                             .unwrap_or_else(|| self.graph_object_position(target));
-                        self.graph_knob_states
-                            .insert(handle, GraphKnobState::new(target, base_x, base_y));
-                        self.graph_knob_target_owners.insert(target, handle);
-                        self.graph_native_owners.insert(target, handle);
+                        let dimensions = self.graph_knob_target_dimensions(target);
+                        let mut state = GraphKnobState::new(target, base_x, base_y);
+                        // sub_420EC0 queries the controlled target through
+                        // vtable+0x20 and immediately calls sub_421200 with
+                        // that rectangle's inclusive width/height. A fresh
+                        // Knob therefore starts with a movement range exactly
+                        // the size of its target, not a synthetic 0x0 range.
+                        let _ = state.set_bounds(
+                            dimensions.0.round().max(1.0) as i32,
+                            dimensions.1.round().max(1.0) as i32,
+                            dimensions.0,
+                            dimensions.1,
+                        );
+                        self.graph_knob_states.insert(handle, state);
                         self.display_tree.register(handle, NativeDisplayKind::Knob);
+                        self.graph_object_enabled.insert(handle, true);
+                        self.graph_object_draw_enabled.insert(handle, false);
                         self.graph90_initialize_native_constructor_sort(
                             handle,
                             NativeDisplayKind::Knob,
                         );
+                        {
+                            let native = &mut self
+                                .graph_object_properties
+                                .entry(handle)
+                                .or_default()
+                                .native;
+                            native.enabled = 1;
+                            native.draw_enabled = 0;
+                        }
+
+                        // sub_420EC0 copies target alpha (+0xAC) and priority
+                        // (+0x1C) into the wrapper. Knob->target forwarding is
+                        // virtual dispatch, not graph ownership.
+                        if let Some(target_native) = self
+                            .graph_object_properties
+                            .get(&target)
+                            .map(|properties| properties.native)
+                        {
+                            let knob = &mut self
+                                .graph_object_properties
+                                .entry(handle)
+                                .or_default()
+                                .native;
+                            knob.position_x = base_x.round() as i32;
+                            knob.position_y = base_y.round() as i32;
+                            knob.alpha_parameter = target_native.alpha_parameter;
+                            knob.priority = target_native.priority;
+                            knob.unknown_a8_to_ab = target_native.unknown_a8_to_ab;
+                        }
+                        self.display_tree
+                            .set_local_position(handle, base_x, base_y);
+
+                        // Constructor ends with sub_421430(0,0), which aligns
+                        // the controlled target to the Knob's current position.
+                        self.apply_graph_knob_position(handle);
                         handle
                     })
                 } else {
                     None
                 };
                 let handle = handle.unwrap_or_default();
-                tracing::debug!(target, handle, "GraphCreateKnobObject");
+                if let Some(state) = self.graph_knob_states.get(&handle).copied() {
+                    let dimensions = self.graph_knob_target_dimensions(state.target);
+                    tracing::info!(
+                        target,
+                        handle,
+                        base_x = state.base_x,
+                        base_y = state.base_y,
+                        target_width = dimensions.0,
+                        target_height = dimensions.1,
+                        target_owner = ?self.graph_native_owners.get(&target),
+                        "GraphCreateKnobObject"
+                    );
+                } else {
+                    tracing::info!(target, handle, "GraphCreateKnobObject");
+                }
                 return Ok(ethornell_vm::Value::Int(handle));
             }
             (0x90, 0xd1) => {
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let removed = self.graph_knob_states.remove(&handle);
                 if let Some(state) = removed {
-                    self.graph_knob_target_owners.remove(&state.target);
-                    if self.graph_native_owners.get(&state.target) == Some(&handle) {
-                        self.graph_native_owners.remove(&state.target);
+                    // CDspObjKnob owns only a raw control pointer to `target`;
+                    // destroying the Knob does not detach/reparent that object.
+                    let _ = state;
+                    self.graph_knob_watches.retain(|watched| *watched != handle);
+                    if self.graph_active_input_handle == handle {
+                        self.graph_active_input_handle = 0;
                     }
-                    self.graph_knob_watches.remove(&handle);
+                    self.graph_object_enabled.remove(&handle);
+                    self.graph_object_draw_enabled.remove(&handle);
+                    self.graph_object_properties.remove(&handle);
                     self.display_tree.remove(handle);
                 }
                 tracing::debug!(
@@ -16543,26 +20220,25 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             (0x90, 0xd4) => {
                 let enabled = pop_int_value(stack).unwrap_or_default() != 0;
                 let handle = pop_int_value(stack).unwrap_or_default();
-                let target = self.graph_knob_states.get_mut(&handle).map(|state| {
-                    state.enabled = enabled;
-                    state.target
-                });
-                if let Some(target) = target {
-                    self.graph_object_enabled.insert(target, enabled);
-                    self.display_tree.set_enabled(handle, enabled);
+                let valid = self.graph_knob_states.contains_key(&handle);
+                if valid {
+                    // Selector D4 reaches CDspObjKnob vtable+4 (sub_4210E0),
+                    // i.e. the same draw-enable operation as generic 90:30.
+                    // It is not CDspObj::enabled and must propagate to target.
+                    self.set_graph_object_draw_enabled(handle, enabled);
                 }
-                tracing::debug!(
-                    handle,
-                    enabled,
-                    valid = target.is_some(),
-                    "GraphSetKnobEnabled"
-                );
+                tracing::debug!(handle, enabled, valid, "GraphSetKnobEnabled");
             }
             (0x90, 0xd5) => {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
                 let updated = if let Some(state) = self.graph_knob_states.get_mut(&handle) {
+                    // Graph90:D5 -> sub_442320 -> Knob vtable+0x2C
+                    // (sub_421110) -> sub_41B1B0 -> virtual vtable+0x28.
+                    // Because the receiver is a CDspObjKnob, that virtual call
+                    // re-enters sub_421120 and forwards the new Knob base plus
+                    // its current logical slider offset to the controlled target.
                     state.set_base_position(x, y);
                     true
                 } else {
@@ -16570,10 +20246,25 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 };
                 if updated {
                     self.apply_graph_knob_position(handle);
+                    let properties = self.graph_object_properties.entry(handle).or_default();
+                    properties.native.position_x = x;
+                    properties.native.position_y = y;
                     self.display_tree
                         .set_local_position(handle, x as f32, y as f32);
                 }
-                tracing::debug!(handle, x, y, updated, "GraphSetKnobBasePosition");
+                let state_after = self.graph_knob_states.get(&handle).copied();
+                let target_position = state_after
+                    .and_then(|state| self.graph_native_base_position(state.target));
+                tracing::info!(
+                    handle,
+                    x,
+                    y,
+                    updated,
+                    target = state_after.map(|state| state.target).unwrap_or_default(),
+                    ?target_position,
+                    target_owner = ?state_after.and_then(|state| self.graph_native_owners.get(&state.target).copied()),
+                    "GraphSetKnobBasePosition"
+                );
             }
             (0x90, 0xd6) => {
                 let y = pop_int_value(stack).unwrap_or_default();
@@ -16592,7 +20283,21 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 if accepted {
                     self.apply_graph_knob_position(handle);
                 }
-                tracing::debug!(handle, x, y, accepted, "GraphSetKnobPosition");
+                let state_after = self.graph_knob_states.get(&handle).copied();
+                let target_position = state_after
+                    .and_then(|state| self.graph_native_base_position(state.target));
+                tracing::info!(
+                    handle,
+                    x,
+                    y,
+                    accepted,
+                    target = state_after.map(|state| state.target).unwrap_or_default(),
+                    base_x = state_after.map(|state| state.base_x).unwrap_or_default(),
+                    base_y = state_after.map(|state| state.base_y).unwrap_or_default(),
+                    ?target_position,
+                    target_owner = ?state_after.and_then(|state| self.graph_native_owners.get(&state.target).copied()),
+                    "GraphSetKnobPosition"
+                );
             }
             (0x90, 0xd7) => {
                 let handle = pop_int_value(stack).unwrap_or_default();
@@ -16689,13 +20394,25 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0xde) => {
                 let handle = pop_int_value(stack).unwrap_or_default();
-                let watched = self.graph_knob_states.contains_key(&handle)
-                    && self.graph_knob_watches.insert(handle);
+                let watched = if self.graph_knob_states.contains_key(&handle) {
+                    // sub_4638E0 allocates a new 8-byte list node and prepends
+                    // it unconditionally. Preserve order and duplicates: the
+                    // first node owns wheel input in sub_463920.
+                    self.graph_knob_watches.push_front(handle);
+                    true
+                } else {
+                    false
+                };
                 tracing::debug!(handle, watched, "GraphWatchKnobObject");
             }
             (0x90, 0xdf) => {
                 let handle = pop_int_value(stack).unwrap_or_default();
-                let removed = self.graph_knob_watches.remove(&handle);
+                let removed = self
+                    .graph_knob_watches
+                    .iter()
+                    .position(|watched| *watched == handle)
+                    .and_then(|index| self.graph_knob_watches.remove(index))
+                    .is_some();
                 tracing::debug!(handle, removed, "GraphUnwatchKnobObject");
             }
             (0x90, 0xbc) => {
@@ -16788,10 +20505,21 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     .map(|handle| {
                         self.graph_groups.insert(handle, GraphGroupState::default());
                         self.display_tree.register(handle, NativeDisplayKind::Group);
+                        self.graph_object_enabled.insert(handle, true);
+                        self.graph_object_draw_enabled.insert(handle, false);
                         self.graph90_initialize_native_constructor_sort(
                             handle,
                             NativeDisplayKind::Group,
                         );
+                        {
+                            let native = &mut self
+                                .graph_object_properties
+                                .entry(handle)
+                                .or_default()
+                                .native;
+                            native.enabled = 1;
+                            native.draw_enabled = 0;
+                        }
                         handle
                     })
                     .unwrap_or_default();
@@ -16809,6 +20537,9 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         let _ = self.graph_links.set_parent(object, 0, true, true);
                         let _ = self.display_tree.set_parent(object, 0);
                     }
+                    self.graph_object_enabled.remove(&handle);
+                    self.graph_object_draw_enabled.remove(&handle);
+                    self.graph_object_properties.remove(&handle);
                     self.display_tree.remove(handle);
                 }
                 tracing::info!(
@@ -16828,9 +20559,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     // Current target sub_4426A0 calls group vtable+4;
                     // CDspObj::sub_41AE00 writes +0x14 and recursively invokes
                     // the same draw-enable setter on member records (+0x12C).
-                    for object in self.graph_native_descendants_inclusive(handle) {
-                        self.set_graph_object_draw_enabled(object, enabled);
-                    }
+                    self.set_graph_object_draw_enabled(handle, enabled);
                 }
                 tracing::info!(
                     handle,
@@ -17203,32 +20932,45 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 tracing::debug!(object, enabled, "GraphSetObjectUpdateFlag");
             }
             (0x92, 0x9c) => {
-                // funcs_486FEE[0x9C] -> sub_4867D0 pops 21 values and
-                // converts native pop slots 14 and 17 through sub_48DF50.
-                // sub_435290 clears the 16-record fragment table before each
-                // render; sub_434BA0 publishes the final x/y pair globally.
+                // funcs_486FEE[0x9C] -> sub_4867D0 pops 21 values. Target
+                // sub_403B10 -> sub_434BA0 -> sub_434C50 rasterizes glyphs
+                // directly into the supplied bitmap descriptor; it does not
+                // create a separate display/text node. This distinction is
+                // required by cnfgwnd._bp, which first tiles resource 3838 as
+                // the yellow help-strip background and then burns the hover
+                // help string into the same bitmap before displaying it.
                 let args = pop_args(stack, 21);
                 self.system92_text_fragment_records.clear();
-                let text = args.get(17).and_then(value_to_string);
-                let auxiliary_text = args.get(14).and_then(value_to_string);
-                if let Some(size) = args
-                    .get(9)
-                    .map(value_to_i32)
-                    .filter(|size| (8..=96).contains(size))
-                {
-                    self.text_state.font_size = size as f32;
-                    self.text_state.line_height = size as f32 + 6.0;
-                }
-                if let Some(color) = args
-                    .get(4)
-                    .and_then(|value| infer_text_color(std::slice::from_ref(value)))
-                {
-                    self.text_state.color = color;
-                }
-                let color = self.text_state.color;
-                self.render_graph_text(&args);
+                let target = args.get(20).map(value_to_i32).unwrap_or_default();
                 let x = args.get(19).map(value_to_i32).unwrap_or_default();
                 let y = args.get(18).map(value_to_i32).unwrap_or_default();
+                let text = args.get(17).and_then(value_to_string);
+                let auxiliary_text = args.get(14).and_then(value_to_string);
+                // Script argument 9 is the visible glyph height. In reverse-pop
+                // order that is args[11]; the previous args[9] interpretation
+                // accidentally read source argument 11 (zero in config).
+                let size = args
+                    .get(11)
+                    .map(value_to_i32)
+                    .filter(|size| (4..=256).contains(size))
+                    .unwrap_or(self.text_state.font_size.max(1.0) as i32);
+                // Script argument 4 is the primary packed 0xRRGGBB color. Zero
+                // is a valid black color (used by config hover help), so this
+                // path must not use the old nonzero-color heuristic.
+                let packed_color = args.get(16).map(value_to_i32).unwrap_or_default();
+                let color = [
+                    ((packed_color >> 16) & 0xff) as f32 / 255.0,
+                    ((packed_color >> 8) & 0xff) as f32 / 255.0,
+                    (packed_color & 0xff) as f32 / 255.0,
+                    1.0,
+                ];
+                let horizontal_scale = args
+                    .get(10)
+                    .map(value_to_i32)
+                    .filter(|value| *value > 0)
+                    .unwrap_or(100);
+                let spacing = args.get(7).map(value_to_i32).unwrap_or_default();
+
                 let normalized = text
                     .as_deref()
                     .map(text_anim::normalize_message_text)
@@ -17242,31 +20984,49 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         },
                     );
                 }
-                let spacing = args.get(7).map(value_to_i32).unwrap_or_default();
-                let advance = snapshot::measure_text_advance(
-                    &normalized,
-                    self.text_state.font_size,
-                    spacing as f32,
-                );
-                let result = x.saturating_add(advance);
-                self.system92_text_output_pair = [result, y];
+
+                let output_pair = if normalized.is_empty() {
+                    (x, y)
+                } else {
+                    self.rasterize_graph_bitmap_text(
+                        target,
+                        &normalized,
+                        x,
+                        y,
+                        size as f32,
+                        spacing as f32,
+                        horizontal_scale as f32,
+                        color,
+                    )
+                    .unwrap_or_else(|| {
+                        let advance = snapshot::measure_text_advance(
+                            &normalized,
+                            size as f32,
+                            spacing as f32,
+                        );
+                        (x.saturating_add(advance), y)
+                    })
+                };
+                self.system92_text_output_pair = [output_pair.0, output_pair.1];
+                let result = output_pair.0;
                 if let Some(text) = text {
                     tracing::info!(
+                        target,
                         %text,
                         ?auxiliary_text,
-                        render_override = self.system92_text_render_override,
+                        size,
+                        spacing,
+                        horizontal_scale,
+                        packed_color = format_args!("0x{packed_color:06X}"),
                         output_pair = ?self.system92_text_output_pair,
-                        state = ?self.text_state,
-                        ?color,
-                        "RenderText"
+                        "GraphRenderTextBitmap"
                     );
                 } else {
                     tracing::debug!(
+                        target,
                         ?auxiliary_text,
                         output_pair = ?self.system92_text_output_pair,
-                        state = ?self.text_state,
-                        ?color,
-                        "RenderText without inline string"
+                        "GraphRenderTextBitmap without inline string"
                     );
                 }
                 return Ok(ethornell_vm::Value::Int(result));
@@ -17303,11 +21063,20 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let format_resource = args.first().map(value_to_i32).unwrap_or(-1);
                 let target = args.get(1).map(value_to_i32).unwrap_or_default();
                 let properties = self.graph_object_properties.entry(target).or_default();
-                properties.format_resource = match format_resource {
+                // Target sub_47B4B0 -> sub_462050 -> sub_443A40 ->
+                // sub_41BC70 builds CDspObj's independent 1-bit hit mask. It
+                // does not replace a Sprite/Background primary bitmap.
+                properties.hit_mask_resource = match format_resource {
                     -1 => None,
                     value => Some(value),
                 };
-                tracing::debug!(target, format_resource, "GraphSetObjectHitMaskBitmap");
+                tracing::info!(
+                    target,
+                    format_resource,
+                    primary = ?properties.format_resource,
+                    hit_mask = ?properties.hit_mask_resource,
+                    "GraphSetObjectHitMaskBitmap"
+                );
                 trace_graph!(self, "object #{target} hit-mask bitmap={format_resource}");
             }
             (0x90, 0x3d) => {
@@ -17883,13 +21652,55 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         index: i32,
         state: i32,
     ) -> i32 {
-        let Some(input) = self.graph_input_objects.get_mut(&object) else {
-            return 1;
+        let (surface, ordinal) = {
+            let Some(input) = self.graph_input_objects.get_mut(&object) else {
+                return 1;
+            };
+            if let Err(status) = input.set_item_state(group, index, state) {
+                return status;
+            }
+            let ordinal = input
+                .descriptor
+                .regions
+                .iter()
+                .find(|region| region.group == group && region.index == index)
+                .map(|region| region.ordinal);
+            (input.layer, ordinal)
         };
-        match input.set_item_state(group, index, state) {
-            Ok(()) => 0,
-            Err(status) => status,
+
+        // Target Graph91:BB: sub_44B460 -> sub_42C060 -> sub_41AD60.
+        // It changes CDspObj.enabled on the already-materialized child Sprite;
+        // it is not a descriptor-only bookkeeping flag. Mirror that gate on
+        // the matching private control layer so both drawing and hit testing
+        // change immediately.
+        let enabled = state != 0;
+        let owner = SurfaceControlOwner::InputObject(object);
+        let layer_ids = self
+            .graph_layers
+            .iter()
+            .filter_map(|(&layer_id, layer)| {
+                (layer.target_surface == Some(surface)
+                    && ordinal == Some(layer.hit_id)
+                    && self.surface_controls.contains_layer_for_owner(owner, layer_id))
+                    .then_some(layer_id)
+            })
+            .collect::<Vec<_>>();
+        for layer_id in &layer_ids {
+            if let Some(layer) = self.graph_layers.get_mut(layer_id) {
+                layer.enabled = enabled;
+            }
         }
+        tracing::info!(
+            object,
+            group,
+            item = index,
+            state,
+            enabled,
+            materialized_layers = ?layer_ids,
+            "GraphSetExtendedIconInputItemStateApplied"
+        );
+        self.graph_redraw_requested = Some(false);
+        0
     }
 
     fn set_graph_key_assignment(&mut self, assignment: i32, values: [i32; 24]) -> bool {
@@ -18242,6 +22053,18 @@ fn value_to_i32(value: &ethornell_vm::Value) -> i32 {
         ethornell_vm::Value::Str(_)
         | ethornell_vm::Value::Program(_)
         | ethornell_vm::Value::None => 0,
+    }
+}
+
+fn native_surface_control_configure_resource(region: &ethornell_vm::GraphInputRegion) -> i32 {
+    // sub_447C10/sub_44A900 begin with the normal bitmap id and substitute
+    // the configure-time selected/current bitmap only when the normal slot is
+    // present and the selected slot is not -1. Bitmap lookup failure after
+    // choosing that id does not fall back to another visual state.
+    if region.normal_resource != -1 && region.selected && region.selected_resource != -1 {
+        region.selected_resource
+    } else {
+        region.normal_resource
     }
 }
 
@@ -18674,6 +22497,14 @@ fn run_headless(
                 "headless",
             );
             let last_report = frame_report.last_report;
+            if std::mem::take(&mut runtime.api.pending_window_close_request)
+                && runtime.api.handle_host_window_close("Sys80:69/headless")
+            {
+                // Headless has no native HWND to destroy. Native-close mode
+                // therefore terminates the host loop; intercepted mode queues
+                // `[2,0,0]` for sysmsg._bp on the next scheduler pass.
+                runtime.api.quit_requested = true;
+            }
             let frame_native_calls = runtime
                 .api
                 .total_native_calls
@@ -18869,13 +22700,10 @@ fn run_window(
         Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
             WindowEvent::CloseRequested => {
                 let allow_native_close = runtime
-                    .as_ref()
-                    .map_or(true, |runtime| runtime.api.native_system.native_close_mode != 0);
+                    .as_mut()
+                    .map_or(true, |runtime| runtime.api.handle_host_window_close("window"));
                 if allow_native_close {
                     target.exit();
-                } else if let Some(runtime) = runtime.as_mut() {
-                    runtime.api.queued_system_events.push_back([2, 0, 0]);
-                    tracing::info!("WM_CLOSE intercepted into native event code 2");
                 }
             }
             WindowEvent::Resized(size) => {
@@ -18910,15 +22738,6 @@ fn run_window(
                     }
                 }
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => target.exit(),
             WindowEvent::CursorMoved { position, .. } => {
                 cursor_surface_pos = Some((position.x as f32, position.y as f32));
                 let cursor_game_pos =
@@ -18991,6 +22810,20 @@ fn run_window(
                                 RuntimeInputEvent::KeyRelease { descriptor },
                             );
                         }
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta_y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32,
+                };
+                if delta_y != 0.0 {
+                    if runtime.is_some() {
+                        queue_runtime_input_event(
+                            &mut pending_input_events,
+                            RuntimeInputEvent::MouseWheel { delta_y },
+                        );
                     }
                 }
             }
@@ -19072,6 +22905,12 @@ fn run_window(
                         );
                     }
                     let last_report = frame_report.last_report;
+                    if std::mem::take(&mut runtime.api.pending_window_close_request)
+                        && runtime.api.handle_host_window_close("Sys80:69")
+                    {
+                        target.exit();
+                        return;
+                    }
                     if let Some(title) = runtime.api.pending_window_title.take() {
                         window.set_title(&title);
                     }
@@ -19270,8 +23109,11 @@ fn run_window(
                         src_width: item.src_width / texture.width as f32,
                         src_height: item.src_height / texture.height as f32,
                         opacity: item.opacity,
+                        ignore_source_alpha: item.ignore_source_alpha,
                         blend_mode: item.blend_mode,
                         rotation_degrees: item.rotation_degrees,
+                        destination_quad: item.destination_quad,
+                        linear_sampling: item.linear_sampling,
                         clip: item
                             .clip
                             .map(|clip| [clip.x, clip.y, clip.width, clip.height]),
@@ -19491,8 +23333,11 @@ fn push_fit_texture_command(
         src_width: 1.0,
         src_height: 1.0,
         opacity: 1.0,
+        ignore_source_alpha: false,
         blend_mode: 128,
         rotation_degrees: 0.0,
+        destination_quad: None,
+        linear_sampling: true,
         clip: None,
         z: 0,
     });

@@ -5,6 +5,7 @@ pub enum HeadlessInputEvent {
     MouseMove { x: f32, y: f32 },
     MousePress { x: f32, y: f32 },
     MouseRelease { x: f32, y: f32 },
+    MouseWheel { delta_y: f32 },
     KeyPress { key: String },
     KeyRelease { key: String },
 }
@@ -16,6 +17,7 @@ enum HeadlessInputAction {
     MouseDown { x: f32, y: f32 },
     MouseUp { x: f32, y: f32 },
     Click { x: f32, y: f32 },
+    MouseWheel { delta_y: f32 },
     KeyPress { key: String },
 }
 
@@ -66,6 +68,9 @@ impl HeadlessInputScript {
                     x: parse_f32(x, token)?,
                     y: parse_f32(y, token)?,
                 },
+                ["wheel", delta_y] => HeadlessInputAction::MouseWheel {
+                    delta_y: parse_f32(delta_y, token)?,
+                },
                 ["key", key] if !key.trim().is_empty() => HeadlessInputAction::KeyPress {
                     key: key.trim().to_ascii_lowercase(),
                 },
@@ -107,6 +112,9 @@ impl HeadlessInputScript {
                     self.queued_release = Some(HeadlessInputEvent::MouseRelease { x, y });
                     return Some(HeadlessInputEvent::MousePress { x, y });
                 }
+                HeadlessInputAction::MouseWheel { delta_y } => {
+                    return Some(HeadlessInputEvent::MouseWheel { delta_y });
+                }
                 HeadlessInputAction::KeyPress { key } => {
                     self.queued_release = Some(HeadlessInputEvent::KeyRelease { key: key.clone() });
                     return Some(HeadlessInputEvent::KeyPress { key });
@@ -131,6 +139,16 @@ mod tests {
         assert!(matches!(
             script.tick(),
             Some(HeadlessInputEvent::KeyRelease { key }) if key == "enter"
+        ));
+        assert!(script.tick().is_none());
+    }
+
+    #[test]
+    fn wheel_action_replays_the_same_runtime_event_as_gui_wheel_input() {
+        let mut script = HeadlessInputScript::parse("wheel:-1").expect("parse input script");
+        assert!(matches!(
+            script.tick(),
+            Some(HeadlessInputEvent::MouseWheel { delta_y }) if delta_y == -1.0
         ));
         assert!(script.tick().is_none());
     }

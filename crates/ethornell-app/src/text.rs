@@ -154,9 +154,11 @@ impl RuntimeTraceApi {
 
     pub(crate) fn render_graph_text(&mut self, args: &[ethornell_vm::Value]) {
         let text = match args.len() {
-            // GraphDrawTextEx(target, x, y, text, mode, annotation, ...).
-            // pop_args stores native arguments in top-to-bottom pop order.
+            // Graph91:9C/9D immediate bitmap text. pop_args stores native
+            // arguments in top-to-bottom pop order; 9D has one additional
+            // leading style-mode pop.
             14 => args.get(10).and_then(value_to_text_string),
+            15 => args.get(11).and_then(value_to_text_string),
             // RenderText(target, x, y, text, ...).
             21 => args.get(17).and_then(value_to_text_string),
             _ => args.iter().find_map(value_to_text_string),
@@ -176,15 +178,19 @@ impl RuntimeTraceApi {
             if target != -1 && self.graph_surfaces.contains_key(&target) {
                 let x = args.get(19).map(value_to_i32).unwrap_or_default() as f32;
                 let y = args.get(18).map(value_to_i32).unwrap_or_default() as f32;
-                // sub_4867D0 pop slot 9 is source argument 11 (font size).
+                // sub_4867D0 pops source args 20..0. Source arg 9 is
+                // therefore pop slot 11 and is the font-height operand paired
+                // with source arg 10 by sub_4035A0.
                 let size = args
-                    .get(9)
+                    .get(11)
                     .map(value_to_i32)
-                    .filter(|size| (8..=96).contains(size))
+                    .filter(|size| (4..=256).contains(size))
                     .unwrap_or(self.text_state.font_size as i32) as f32;
-                // pop slot 4 is the packed RGB argument passed to sub_434E30.
+                // Source arg 4 is pop slot 16 and is the primary packed RGB
+                // text color. Zero is valid black and must not be treated as
+                // an absent/default color.
                 let color = args
-                    .get(4)
+                    .get(16)
                     .map(value_to_i32)
                     .filter(|color| (0..=0xFF_FFFF).contains(color))
                     .map(|color| {
@@ -223,52 +229,88 @@ impl RuntimeTraceApi {
                 return;
             }
         }
-        if args.len() == 14 {
-            let target = args.get(13).map(value_to_i32).unwrap_or_default();
+        if matches!(args.len(), 14 | 15) {
+            // Graph91:9C/sub_484A30 and 91:9D/sub_484C40 both select source
+            // argument 0 as the destination, then call sub_403B10 ->
+            // sub_434BA0 -> sub_434C50. 9D adds one final source-order style
+            // selector, which becomes args[0] in reverse-pop order and shifts
+            // the renderer fields by one slot. Neither target path creates a
+            // display-tree text node: glyphs are committed immediately to the
+            // selected bitmap.
+            let shift = if args.len() == 15 { 1 } else { 0 };
+            let target = args
+                .get(13 + shift)
+                .map(value_to_i32)
+                .unwrap_or_default();
             if target != -1 && self.graph_surfaces.contains_key(&target) {
-                let x = args.get(12).map(value_to_i32).unwrap_or_default() as f32;
-                let y = args.get(11).map(value_to_i32).unwrap_or_default() as f32;
+                let x = args
+                    .get(12 + shift)
+                    .map(value_to_i32)
+                    .unwrap_or_default();
+                let y = args
+                    .get(11 + shift)
+                    .map(value_to_i32)
+                    .unwrap_or_default();
                 let size = args
-                    .get(6)
+                    .get(6 + shift)
                     .map(value_to_i32)
                     .filter(|size| (8..=96).contains(size))
-                    .unwrap_or(self.text_state.font_size as i32) as f32;
-                let color = args
-                    .first()
+                    .unwrap_or(self.text_state.font_size as i32);
+                let horizontal_scale = args
+                    .get(5 + shift)
+                    .map(value_to_i32)
+                    .filter(|scale| *scale > 0)
+                    .unwrap_or(100);
+                let spacing = args
+                    .get(2 + shift)
+                    .map(value_to_i32)
+                    .unwrap_or_default();
+                let packed_color = args
+                    .get(shift)
                     .map(value_to_i32)
                     .filter(|color| (0..=0xFF_FFFF).contains(color))
-                    .map(|color| {
-                        [
-                            ((color >> 16) & 0xff) as f32 / 255.0,
-                            ((color >> 8) & 0xff) as f32 / 255.0,
-                            (color & 0xff) as f32 / 255.0,
-                            1.0,
-                        ]
-                    })
-                    .unwrap_or(self.text_state.color);
+                    .unwrap_or_else(|| {
+                        let color = self.text_state.color;
+                        ((color[0].clamp(0.0, 1.0) * 255.0).round() as i32) << 16
+                            | ((color[1].clamp(0.0, 1.0) * 255.0).round() as i32) << 8
+                            | (color[2].clamp(0.0, 1.0) * 255.0).round() as i32
+                    });
+                let color = [
+                    ((packed_color >> 16) & 0xff) as f32 / 255.0,
+                    ((packed_color >> 8) & 0xff) as f32 / 255.0,
+                    (packed_color & 0xff) as f32 / 255.0,
+                    1.0,
+                ];
                 let normalized = normalize_message_text(&text);
-                self.store_bitmap_text_run(
+                let rasterized = !normalized.is_empty()
+                    && self
+                        .rasterize_graph_bitmap_text(
+                            target,
+                            &normalized,
+                            x,
+                            y,
+                            size as f32,
+                            spacing as f32,
+                            horizontal_scale as f32,
+                            color,
+                        )
+                        .is_some();
+                tracing::info!(
                     target,
-                    RuntimeTextNode {
-                        text: normalized.clone(),
-                        enabled: true,
-                        owner_object: None,
-                        screen_attached: false,
-                        target_surface: None,
-                        x,
-                        y,
-                        size,
-                        line_height: size * 1.35,
-                        formatted_layout: false,
-                        color,
-                        z: target,
-                        ruby_spans: Vec::new(),
-                        style_spans: Vec::new(),
-                    },
+                    x,
+                    y,
+                    size,
+                    spacing,
+                    horizontal_scale,
+                    style_mode = ?(args.len() == 15).then(|| value_to_i32(&args[0])),
+                    packed_color = format_args!("0x{packed_color:06X}"),
+                    rasterized,
+                    pixel_stats = ?self.graph_bitmap_pixel_stats(target),
+                    text = %normalized,
+                    "GraphDrawBitmapText"
                 );
-                tracing::info!(target, x, y, size, text = %normalized, "GraphDrawBitmapText");
                 self.trace_graph(format!(
-                    "draw text into bitmap #{target} at ({x:.0},{y:.0}) {normalized:?}"
+                    "draw text into bitmap #{target} at ({x},{y}) rasterized={rasterized} {normalized:?}"
                 ));
                 return;
             }

@@ -222,30 +222,27 @@ impl RuntimeTraceApi {
                 let spacing = source.get(7).map(value_to_i32).unwrap_or_default();
                 let packed_rgb = source.get(8).map(value_to_i32).unwrap_or(0x00ff_ffff);
                 let normalized = text_anim::normalize_message_text(&text);
+                let color = [
+                    ((packed_rgb >> 16) & 0xff) as f32 / 255.0,
+                    ((packed_rgb >> 8) & 0xff) as f32 / 255.0,
+                    (packed_rgb & 0xff) as f32 / 255.0,
+                    1.0,
+                ];
                 if destination > 0 && !normalized.is_empty() {
-                    self.store_bitmap_text_run(
+                    // sub_485F10 -> sub_4039E0 -> sub_403840 writes glyph
+                    // coverage directly into the selected bitmap descriptor.
+                    // Keep the public result as the accumulated text advance;
+                    // the rasterizer's absolute output X is not the syscall
+                    // return value.
+                    let _ = self.rasterize_graph_bitmap_text(
                         destination,
-                        RuntimeTextNode {
-                            text: normalized.clone(),
-                            enabled: true,
-                            owner_object: None,
-                            screen_attached: false,
-                            target_surface: None,
-                            x: x as f32,
-                            y: y as f32,
-                            size: size as f32,
-                            line_height: size as f32 * 1.35,
-                            formatted_layout: false,
-                            color: [
-                                ((packed_rgb >> 16) & 0xff) as f32 / 255.0,
-                                ((packed_rgb >> 8) & 0xff) as f32 / 255.0,
-                                (packed_rgb & 0xff) as f32 / 255.0,
-                                1.0,
-                            ],
-                            z: destination,
-                            ruby_spans: Vec::new(),
-                            style_spans: Vec::new(),
-                        },
+                        &normalized,
+                        x,
+                        y,
+                        size as f32,
+                        spacing as f32,
+                        100.0,
+                        color,
                     );
                 }
                 ethornell_vm::Value::Int(snapshot::measure_text_advance(

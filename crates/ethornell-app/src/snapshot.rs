@@ -130,21 +130,7 @@ pub(crate) fn compose_runtime_frame_through_priority(
         let Some(src) = api.graph_images.get(&item.key) else {
             continue;
         };
-        composite_nearest(
-            &mut out,
-            src,
-            item.x,
-            item.y,
-            item.width,
-            item.height,
-            item.src_x,
-            item.src_y,
-            item.src_width,
-            item.src_height,
-            item.opacity,
-            item.blend_mode,
-            item.clip,
-        );
+        composite_runtime_item(&mut out, src, &item);
     }
 
     if include_text && std::env::var_os("ETHORNELL_SNAPSHOT_HIDE_TEXT").is_none() {
@@ -308,21 +294,7 @@ pub(crate) fn compose_graph_object(
         let Some(source) = api.graph_images.get(&item.key) else {
             continue;
         };
-        composite_nearest(
-            &mut out,
-            source,
-            item.x,
-            item.y,
-            item.width,
-            item.height,
-            item.src_x,
-            item.src_y,
-            item.src_width,
-            item.src_height,
-            item.opacity,
-            item.blend_mode,
-            item.clip,
-        );
+        composite_runtime_item(&mut out, source, &item);
     }
 
     for node in selected_text {
@@ -400,24 +372,51 @@ fn capture_draw_item(
     if layer.width <= 0.0 || layer.height <= 0.0 {
         return None;
     }
-    let width = (layer.width * layer.scale_x)
-        .abs()
-        .min(image.width as f32 * layer.scale_x.abs().max(1.0));
-    let height = (layer.height * layer.scale_y)
-        .abs()
-        .min(image.height as f32 * layer.scale_y.abs().max(1.0));
     let src_x = layer.src_x.clamp(0.0, image.width.saturating_sub(1) as f32);
     let src_y = layer
         .src_y
         .clamp(0.0, image.height.saturating_sub(1) as f32);
-    let src_width = width.min(image.width as f32 - src_x).max(0.0);
-    let src_height = height.min(image.height as f32 - src_y).max(0.0);
+    let src_width = layer.width.min(image.width as f32 - src_x).max(0.0);
+    let src_height = layer.height.min(image.height as f32 - src_y).max(0.0);
+    let width = (src_width * layer.scale_x).abs();
+    let height = (src_height * layer.scale_y).abs();
     let (world_x, world_y, world_z) = api.layer_world_transform(layer_id, layer);
+    let item_x = world_x - origin_x;
+    let item_y = world_y - origin_y;
+    // Mode5 render state belongs to the sprite's primary layer, whose layer
+    // id is the sprite id. Do not leak that affine transform into any nested
+    // auxiliary layer that merely shares the same owner.
+    let mode5_render_state = api.graph_mode5_render_states.get(&layer_id).copied();
+    let destination_quad = mode5_render_state.map(|state| {
+        state.local_affine_quad.map(|[local_x, local_y]| {
+            [item_x + local_x, item_y + local_y]
+        })
+    });
+    let mut draw_clip = api
+        .layer_display_clip(layer)
+        .map(|clip| crate::graph::RuntimeClipRect {
+            x: clip.x - origin_x,
+            y: clip.y - origin_y,
+            width: clip.width,
+            height: clip.height,
+        });
+    if mode5_render_state.is_some() {
+        let raster_clip = crate::graph::RuntimeClipRect {
+            x: item_x,
+            y: item_y,
+            width,
+            height,
+        };
+        draw_clip = Some(match draw_clip {
+            Some(existing) => existing.intersection(raster_clip),
+            None => raster_clip,
+        });
+    }
     (src_width > 0.0 && src_height > 0.0).then(|| RuntimeGraphDrawItem {
         owner_object: layer.owner_object.or(Some(layer_id)),
         key: draw_key.to_string(),
-        x: world_x - origin_x,
-        y: world_y - origin_y,
+        x: item_x,
+        y: item_y,
         width,
         height,
         src_x,
@@ -425,15 +424,13 @@ fn capture_draw_item(
         src_width,
         src_height,
         opacity,
+        ignore_source_alpha: api.graph_layer_ignores_source_alpha(layer_id, layer),
         rotation_degrees: layer.rotation_degrees,
-        clip: api
-            .layer_display_clip(layer)
-            .map(|clip| crate::graph::RuntimeClipRect {
-                x: clip.x - origin_x,
-                y: clip.y - origin_y,
-                width: clip.width,
-                height: clip.height,
-            }),
+        destination_quad,
+        linear_sampling: mode5_render_state
+            .map(|state| state.linear_sampling)
+            .unwrap_or(true),
+        clip: draw_clip,
         z: world_z,
         blend_mode,
         order_serial: api.display_order_serial(layer_id, layer.owner_object),
@@ -563,6 +560,76 @@ fn snapshot_font() -> Option<&'static FontArc> {
         ethornell_render::load_system_cjk_font().ok()
     })
     .as_ref()
+}
+
+/// Rasterize the target's direct bitmap-text path into an existing RGBA
+/// bitmap. Unlike `draw_text_node`, this routine intentionally has no
+/// message-window margin or automatic wrapping: Graph92:9C/sub_434C50 writes
+/// glyphs into the caller-provided bitmap at the supplied coordinates and
+/// advances only on explicit newlines.
+pub(crate) fn rasterize_bitmap_text(
+    dst: &mut DecodedImage,
+    text: &str,
+    start_x: i32,
+    start_y: i32,
+    size: f32,
+    spacing: f32,
+    horizontal_scale_percent: f32,
+    color: [f32; 4],
+) -> (i32, i32) {
+    let size = size.max(1.0);
+    let horizontal_scale = if horizontal_scale_percent > 0.0 {
+        horizontal_scale_percent / 100.0
+    } else {
+        1.0
+    };
+    let line_height = size.max(1.0);
+    let mut x = start_x as f32;
+    let mut line_y = start_y as f32;
+
+    let Some(font) = snapshot_font() else {
+        let char_w = (size * 0.55).max(1.0);
+        let char_h = (size * 0.85).max(1.0) as i32;
+        for ch in text.chars() {
+            if ch == '\n' {
+                x = start_x as f32;
+                line_y += line_height;
+                continue;
+            }
+            let width = (char_w * horizontal_scale).max(1.0).round() as i32;
+            fill_rect(
+                dst,
+                x.round() as i32,
+                line_y.round() as i32,
+                width,
+                char_h,
+                color,
+                None,
+            );
+            x += char_w * horizontal_scale + spacing;
+        }
+        return (x.round() as i32, line_y.round() as i32);
+    };
+
+    let scale = PxScale::from(size);
+    let scaled = font.as_scaled(scale);
+    for ch in text.chars() {
+        if ch == '\n' {
+            x = start_x as f32;
+            line_y += line_height;
+            continue;
+        }
+        let glyph_id = font.glyph_id(ch);
+        let advance = scaled.h_advance(glyph_id).max(size * 0.5);
+        let baseline = line_y + scaled.ascent();
+        let glyph = glyph_id.with_scale_and_position(scale, point(x, baseline));
+        draw_glyph(dst, font, glyph, color, 0, 0, false, false, None);
+        // Config resources use 100%; preserve the target's horizontal-scale
+        // advance contract for other callers even though ab_glyph does not
+        // provide an inexpensive per-glyph X-only transform here.
+        x += advance * horizontal_scale + spacing;
+    }
+    (x.round() as i32, line_y.round() as i32)
 }
 
 pub(crate) fn measure_text_advance(text: &str, size: f32, spacing: f32) -> i32 {
@@ -726,6 +793,182 @@ fn point_in_clip(x: i32, y: i32, clip: Option<crate::graph::RuntimeClipRect>) ->
     })
 }
 
+fn composite_runtime_item(
+    dst: &mut DecodedImage,
+    src: &DecodedImage,
+    item: &RuntimeGraphDrawItem,
+) {
+    if let Some(quad) = item.destination_quad {
+        composite_affine_mode5(
+            dst,
+            src,
+            quad,
+            item.src_x,
+            item.src_y,
+            item.src_width,
+            item.src_height,
+            item.opacity,
+            item.blend_mode,
+            item.clip,
+            item.linear_sampling,
+            item.ignore_source_alpha,
+        );
+    } else {
+        composite_nearest(
+            dst,
+            src,
+            item.x,
+            item.y,
+            item.width,
+            item.height,
+            item.src_x,
+            item.src_y,
+            item.src_width,
+            item.src_height,
+            item.opacity,
+            item.blend_mode,
+            item.clip,
+        );
+    }
+}
+
+fn composite_affine_mode5(
+    dst: &mut DecodedImage,
+    src: &DecodedImage,
+    quad: [[f32; 2]; 4],
+    src_x: f32,
+    src_y: f32,
+    src_width: f32,
+    src_height: f32,
+    opacity: f32,
+    blend_mode: i32,
+    clip: Option<crate::graph::RuntimeClipRect>,
+    linear_sampling: bool,
+    ignore_source_alpha: bool,
+) {
+    if src.width == 0
+        || src.height == 0
+        || src_width <= 0.0
+        || src_height <= 0.0
+        || opacity <= 0.0
+    {
+        return;
+    }
+    let [top_left, bottom_left, _bottom_right, top_right] = quad;
+    let ux = top_right[0] - top_left[0];
+    let uy = top_right[1] - top_left[1];
+    let vx = bottom_left[0] - top_left[0];
+    let vy = bottom_left[1] - top_left[1];
+    let determinant = ux * vy - uy * vx;
+    if determinant.abs() <= f32::EPSILON {
+        return;
+    }
+
+    let min_x = quad.iter().map(|point| point[0]).fold(f32::INFINITY, f32::min);
+    let max_x = quad
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = quad.iter().map(|point| point[1]).fold(f32::INFINITY, f32::min);
+    let max_y = quad
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let clip_x0 = clip.map(|clip| clip.x).unwrap_or(0.0);
+    let clip_y0 = clip.map(|clip| clip.y).unwrap_or(0.0);
+    let clip_x1 = clip
+        .map(|clip| clip.x + clip.width)
+        .unwrap_or(dst.width as f32);
+    let clip_y1 = clip
+        .map(|clip| clip.y + clip.height)
+        .unwrap_or(dst.height as f32);
+    let x0 = min_x.floor().max(0.0).max(clip_x0) as i32;
+    let y0 = min_y.floor().max(0.0).max(clip_y0) as i32;
+    let x1 = max_x.ceil().min(dst.width as f32).min(clip_x1) as i32;
+    let y1 = max_y.ceil().min(dst.height as f32).min(clip_y1) as i32;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let alpha_scale = opacity.clamp(0.0, 1.0);
+    for dy in y0..y1 {
+        for dx in x0..x1 {
+            let px = dx as f32 + 0.5 - top_left[0];
+            let py = dy as f32 + 0.5 - top_left[1];
+            let u = (px * vy - py * vx) / determinant;
+            let v = (ux * py - uy * px) / determinant;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                continue;
+            }
+            // UV 0/1 represent source texel edges. Convert back to the native
+            // convention where integer source coordinates are texel centres.
+            let source_x = src_x + u * src_width - 0.5;
+            let source_y = src_y + v * src_height - 0.5;
+            let source = if linear_sampling {
+                sample_mode5_bilinear(src, source_x, source_y)
+            } else {
+                sample_mode5_nearest(src, source_x, source_y)
+            };
+            let Some(mut source) = source else {
+                continue;
+            };
+            if ignore_source_alpha {
+                source[3] = 255;
+            }
+            let dst_i = ((dy as u32 * dst.width + dx as u32) * 4) as usize;
+            blend_pixel_native(
+                &mut dst.rgba[dst_i..dst_i + 4],
+                &source,
+                alpha_scale,
+                blend_mode,
+            );
+        }
+    }
+}
+
+fn sample_mode5_nearest(src: &DecodedImage, x: f32, y: f32) -> Option<[u8; 4]> {
+    let x = x.floor() as i32;
+    let y = y.floor() as i32;
+    source_pixel_or_none(src, x, y)
+}
+
+fn sample_mode5_bilinear(src: &DecodedImage, x: f32, y: f32) -> Option<[u8; 4]> {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    // sub_417C50 uses the high four bits of each 16-bit fractional word for
+    // its MMX interpolation table. Quantize to the same 1/16 steps.
+    let fx = ((x - x.floor()) * 16.0).floor().clamp(0.0, 15.0) / 16.0;
+    let fy = ((y - y.floor()) * 16.0).floor().clamp(0.0, 15.0) / 16.0;
+    let p00 = source_pixel_or_zero(src, x0, y0);
+    let p10 = source_pixel_or_zero(src, x0 + 1, y0);
+    let p01 = source_pixel_or_zero(src, x0, y0 + 1);
+    let p11 = source_pixel_or_zero(src, x0 + 1, y0 + 1);
+    if p00 == [0; 4] && p10 == [0; 4] && p01 == [0; 4] && p11 == [0; 4] {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for channel in 0..4 {
+        let top = p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx;
+        let bottom = p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx;
+        out[channel] = (top * (1.0 - fy) + bottom * fy)
+            .floor()
+            .clamp(0.0, 255.0) as u8;
+    }
+    Some(out)
+}
+
+fn source_pixel_or_none(src: &DecodedImage, x: i32, y: i32) -> Option<[u8; 4]> {
+    if x < 0 || y < 0 || x >= src.width as i32 || y >= src.height as i32 {
+        return None;
+    }
+    let index = ((y as u32 * src.width + x as u32) * 4) as usize;
+    Some(src.rgba[index..index + 4].try_into().expect("RGBA source pixel"))
+}
+
+fn source_pixel_or_zero(src: &DecodedImage, x: i32, y: i32) -> [u8; 4] {
+    source_pixel_or_none(src, x, y).unwrap_or([0; 4])
+}
+
 fn composite_nearest(
     dst: &mut DecodedImage,
     src: &DecodedImage,
@@ -794,7 +1037,7 @@ fn blend_pixel_native(dst: &mut [u8], src: &[u8], alpha_scale: f32, blend_mode: 
 
 #[cfg(test)]
 mod native_compositor_tests {
-    use super::{composite_nearest, stable_framebuffer_hash};
+    use super::{composite_affine_mode5, composite_nearest, stable_framebuffer_hash};
     use crate::graph::RuntimeClipRect;
     use ethornell_image::DecodedImage;
 
@@ -804,6 +1047,40 @@ mod native_compositor_tests {
             height: 1,
             rgba: vec![r, g, b, a],
         }
+    }
+
+    #[test]
+    fn mode5_identity_affine_preserves_source_rows() {
+        let source = DecodedImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                255, 0, 0, 255,
+                0, 255, 0, 255,
+                0, 0, 255, 255,
+                255, 255, 255, 255,
+            ],
+        };
+        let mut destination = DecodedImage {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 2 * 2 * 4],
+        };
+        composite_affine_mode5(
+            &mut destination,
+            &source,
+            [[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0]],
+            0.0,
+            0.0,
+            2.0,
+            2.0,
+            1.0,
+            1,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(destination.rgba, source.rgba);
     }
 
     #[test]

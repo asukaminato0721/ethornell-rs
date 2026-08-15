@@ -20,12 +20,53 @@ pub struct CbgMetadata {
     pub width: u32,
     pub height: u32,
     pub bpp: u32,
+    /// Target image-header word at CBG +0x18. sub_401C10 consults this
+    /// subtype for 32-bpp images: 4/5/7 select native formats 4/5/7, while
+    /// every other value selects format 2. sub_469EE0 rewrites decoded
+    /// 24-bpp CBGs to 32-bpp/subtype 7 before format selection.
+    pub image_subtype: u16,
+    /// Target image-header word at CBG +0x1A. Values 0 and 1 are accepted by
+    /// sub_401EF0; value 1 means the following embedded reference point is
+    /// copied into bitmap-registry DWORDs +0x28/+0x2C.
+    pub embedded_point_flag: u16,
+    /// CBG +0x1C, valid when `embedded_point_flag == 1`.
+    pub embedded_x: u16,
+    /// CBG +0x1E, valid when `embedded_point_flag == 1`.
+    pub embedded_y: u16,
     pub version: Option<u32>,
     pub intermediate_length: Option<u32>,
     pub encoded_length: Option<u32>,
     pub key: Option<u32>,
     pub checksum: Option<u32>,
     pub xor_check: Option<u32>,
+}
+
+impl CbgMetadata {
+    /// Native bitmap-registry format selected by sub_401C10 followed by the
+    /// format-7 normalization in sub_407DA0. This is the storage/display
+    /// format attached to the concrete bitmap slot, not merely bytes-per-pixel.
+    pub fn native_bitmap_format(&self) -> Option<i32> {
+        match self.bpp {
+            8 => Some(3),
+            16 => Some(0),
+            // sub_469EE0 converts decoded 24-bpp CBGs to 32-bpp/subtype 7;
+            // sub_401C10 returns 7 and sub_407DA0 normalizes 7 -> 1.
+            24 => Some(1),
+            32 => Some(match self.image_subtype {
+                4 => 4,
+                5 => 5,
+                7 => 1,
+                _ => 2,
+            }),
+            48 => Some(6),
+            _ => None,
+        }
+    }
+
+    pub fn embedded_point(&self) -> Option<[i32; 2]> {
+        (self.embedded_point_flag == 1)
+            .then_some([i32::from(self.embedded_x), i32::from(self.embedded_y)])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -220,7 +261,15 @@ pub fn parse_cbg_metadata(buf: &[u8]) -> Result<CbgMetadata> {
     let width = cursor.read_u16::<LittleEndian>()? as u32;
     let height = cursor.read_u16::<LittleEndian>()? as u32;
     let bpp = cursor.read_u32::<LittleEndian>()?;
-    let _unk = cursor.read_u64::<LittleEndian>()?;
+    // sub_469EE0 copies CBG +0x10..+0x1F verbatim into the target's internal
+    // 16-byte image header. sub_401EF0 then reads word[5] (+0x1A) as a
+    // 0/1 presence flag and word[6..=7] (+0x1C/+0x1E) as the bitmap
+    // descriptor reference point. sub_401C10 reads the first word at +0x18
+    // as the 32-bpp image subtype used to select native bitmap format.
+    let image_subtype = cursor.read_u16::<LittleEndian>()?;
+    let embedded_point_flag = cursor.read_u16::<LittleEndian>()?;
+    let embedded_x = cursor.read_u16::<LittleEndian>()?;
+    let embedded_y = cursor.read_u16::<LittleEndian>()?;
     let intermediate_length = cursor.read_u32::<LittleEndian>()?;
     let key = cursor.read_u32::<LittleEndian>()?;
     let encoded_length = cursor.read_u32::<LittleEndian>()?;
@@ -232,6 +281,10 @@ pub fn parse_cbg_metadata(buf: &[u8]) -> Result<CbgMetadata> {
         width,
         height,
         bpp,
+        image_subtype,
+        embedded_point_flag,
+        embedded_x,
+        embedded_y,
         version: Some(version),
         intermediate_length: Some(intermediate_length),
         encoded_length: Some(encoded_length),
@@ -257,6 +310,10 @@ mod tests {
         data[0x10..0x12].copy_from_slice(&640u16.to_le_bytes());
         data[0x12..0x14].copy_from_slice(&480u16.to_le_bytes());
         data[0x14..0x18].copy_from_slice(&32u32.to_le_bytes());
+        data[0x18..0x1a].copy_from_slice(&7u16.to_le_bytes());
+        data[0x1a..0x1c].copy_from_slice(&1u16.to_le_bytes());
+        data[0x1c..0x1e].copy_from_slice(&740u16.to_le_bytes());
+        data[0x1e..0x20].copy_from_slice(&205u16.to_le_bytes());
         data[0x20..0x24].copy_from_slice(&123u32.to_le_bytes());
         data[0x24..0x28].copy_from_slice(&0x4567u32.to_le_bytes());
         data[0x28..0x2c].copy_from_slice(&456u32.to_le_bytes());
@@ -268,7 +325,39 @@ mod tests {
         assert_eq!(meta.width, 640);
         assert_eq!(meta.height, 480);
         assert_eq!(meta.bpp, 32);
+        assert_eq!(meta.image_subtype, 7);
+        assert_eq!(meta.native_bitmap_format(), Some(1));
+        assert_eq!(meta.embedded_point_flag, 1);
+        assert_eq!(meta.embedded_point(), Some([740, 205]));
         assert_eq!(meta.version, Some(2));
         assert_eq!(meta.encoded_length, Some(456));
+    }
+
+    #[test]
+    fn cbg_native_bitmap_format_matches_target_subtype_rules() {
+        let base = CbgMetadata {
+            width: 1,
+            height: 1,
+            bpp: 32,
+            image_subtype: 0,
+            embedded_point_flag: 0,
+            embedded_x: 0,
+            embedded_y: 0,
+            version: Some(2),
+            intermediate_length: None,
+            encoded_length: None,
+            key: None,
+            checksum: None,
+            xor_check: None,
+        };
+
+        assert_eq!(base.native_bitmap_format(), Some(2));
+        assert_eq!(CbgMetadata { image_subtype: 4, ..base.clone() }.native_bitmap_format(), Some(4));
+        assert_eq!(CbgMetadata { image_subtype: 5, ..base.clone() }.native_bitmap_format(), Some(5));
+        assert_eq!(CbgMetadata { image_subtype: 7, ..base.clone() }.native_bitmap_format(), Some(1));
+        assert_eq!(CbgMetadata { bpp: 24, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(1));
+        assert_eq!(CbgMetadata { bpp: 8, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(3));
+        assert_eq!(CbgMetadata { bpp: 16, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(0));
+        assert_eq!(CbgMetadata { bpp: 48, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(6));
     }
 }

@@ -28,6 +28,12 @@ pub(crate) struct RuntimeGraphInputObject {
     state_region: i32,
     state_value: i32,
     state_local: (i32, i32),
+    /// Target DCIPIcon+0x90 (`this[36]`): an item whose activation is
+    /// deferred until mouse-left is released.  DCIPIconEx vtable+0x48
+    /// (`sub_44C6F0`) does not disable these items; a false return stores the
+    /// current live-item index here and `sub_448690` activates it on release
+    /// only if the pointer is still over the same item.
+    deferred_pointer_activation: Option<(i32, i32)>,
 }
 
 impl RuntimeGraphInputObject {
@@ -57,6 +63,7 @@ impl RuntimeGraphInputObject {
             state_region: -1,
             state_value: 0,
             state_local: (0, 0),
+            deferred_pointer_activation: None,
         }
     }
 
@@ -89,17 +96,17 @@ impl RuntimeGraphInputObject {
         self.state_region = -1;
         self.state_value = 0;
         self.state_local = (0, 0);
+        self.deferred_pointer_activation = None;
         self.descriptor = descriptor;
         self.active = true;
         self.running = true;
         self.queued_events.clear();
         self.indirect_messages.clear();
-        self.item_states.retain(|&(group, index), _| {
-            self.descriptor
-                .regions
-                .iter()
-                .any(|region| region.group == group && region.index == index)
-        });
+        // Target sub_44A900 destroys and recreates the extended processor's
+        // live child Sprites on every configure. Graph91:BB toggles those
+        // children, not immutable descriptor bits, so prior runtime states do
+        // not survive a descriptor rebuild.
+        self.item_states.clear();
     }
 
     pub(crate) fn set_item_state(&mut self, group: i32, index: i32, state: i32) -> Result<(), i32> {
@@ -156,6 +163,27 @@ impl RuntimeGraphInputObject {
         self.current_selections.get(&group).copied() == Some(index)
     }
 
+    /// Graph91:BB reaches sub_44B460 -> sub_42C060 -> CDspObj::SetEnabled on
+    /// the materialized child Sprite. Unmentioned items keep the constructor
+    /// default enabled=1.
+    pub(crate) fn item_enabled(&self, group: i32, index: i32) -> bool {
+        self.item_states
+            .get(&(group, index))
+            .copied()
+            .unwrap_or(1)
+            != 0
+    }
+
+    /// Target DCIPIconEx hit selection calls vtable+0x28 (sub_44C110) before
+    /// accepting a materialized child. Extended source item+0x34 excludes an
+    /// item only while that item is the group's current selection.
+    pub(crate) fn pointer_hit_eligible(&self, region: GraphInputRegion) -> bool {
+        self.item_enabled(region.group, region.index)
+            && !(self.extended
+                && region.current_selection_hit_excluded
+                && self.is_current_selection(region.group, region.index))
+    }
+
     pub(crate) fn group_pointer_selection_enabled(&self, group: i32) -> bool {
         self.descriptor.pointer_processing_enabled
             && self
@@ -186,12 +214,15 @@ impl RuntimeGraphInputObject {
                 .unwrap_or(self.descriptor.groups.is_empty())
     }
 
-    /// Eligibility after target `sub_448690` has already mapped the physical
-    /// input edge to action 1. Base DCIPIcon accepts every valid hit here.
-    /// DCIPIconEx additionally applies `sub_44C6F0`: source group+0x3C bit
-    /// 0x02 and item+0xC0 bit 0x20 reject activation. Group+0x14 is
-    /// intentionally absent because it only controls held-button reinjection.
-    pub(crate) fn pointer_activation_allowed(&self, region: GraphInputRegion) -> bool {
+    /// Whether target action 1 activates this item immediately on MouseDown.
+    /// Base DCIPIcon always does. DCIPIconEx vtable+0x48 (`sub_44C6F0`)
+    /// returns true when source group+0x3C bit 0x02 and item+0xC0 bit 0x20 are
+    /// both clear. A false return is *not* a disabled-item result: `sub_448690`
+    /// stores the hit in DCIPIcon+0x90 (`this[36]`) and, after mouse-left is
+    /// released, re-enters action 1 if the pointer still hits the same item.
+    /// Group+0x14 is intentionally absent because it only controls held-button
+    /// action reinjection.
+    pub(crate) fn pointer_activation_is_immediate(&self, region: GraphInputRegion) -> bool {
         if !self.extended {
             return true;
         }
@@ -203,6 +234,18 @@ impl RuntimeGraphInputObject {
             .map(|candidate| candidate.extended_flags)
             .unwrap_or_default();
         group_flags & 0x02 == 0 && region.flags & 0x20 == 0
+    }
+
+    pub(crate) fn defer_pointer_activation(&mut self, region: GraphInputRegion) {
+        self.deferred_pointer_activation = Some((region.group, region.index));
+    }
+
+    pub(crate) fn deferred_pointer_activation(&self) -> Option<(i32, i32)> {
+        self.deferred_pointer_activation
+    }
+
+    pub(crate) fn clear_deferred_pointer_activation(&mut self) {
+        self.deferred_pointer_activation = None;
     }
 
     /// Map one fresh physical mouse-left edge through the root input action
@@ -347,6 +390,7 @@ impl RuntimeGraphInputObject {
             .regions
             .iter()
             .filter(|region| region.enabled_depth != 0)
+            .filter(|region| self.pointer_hit_eligible(**region))
             .filter_map(|region| {
                 let left = region.x as f32;
                 let top = region.y as f32;
@@ -401,6 +445,7 @@ mod tests {
             hover_resource: -1,
             hover_selected_resource: -1,
             mask_resource: -1,
+            current_selection_hit_excluded: false,
             flags: 0,
         }
     }
@@ -477,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_activation_filter_is_independent_from_hoverability() {
+    fn extended_activation_timing_is_independent_from_hoverability() {
         let mut input = RuntimeGraphInputObject::new_extended(7);
         let mut item = region();
         item.hover_resource = 11;
@@ -496,13 +541,18 @@ mod tests {
         });
 
         assert_eq!(input.hit_test((20.0, 30.0)).map(|hit| hit.0.index), Some(1));
-        assert!(!input.pointer_activation_allowed(item));
+        assert!(!input.pointer_activation_is_immediate(item));
 
         input.descriptor.groups[0].extended_flags = 0;
         item.flags = 0x20;
-        assert!(!input.pointer_activation_allowed(item));
+        assert!(!input.pointer_activation_is_immediate(item));
 
         item.flags = 0;
-        assert!(input.pointer_activation_allowed(item));
+        assert!(input.pointer_activation_is_immediate(item));
+
+        input.defer_pointer_activation(item);
+        assert_eq!(input.deferred_pointer_activation(), Some((item.group, item.index)));
+        input.clear_deferred_pointer_activation();
+        assert_eq!(input.deferred_pointer_activation(), None);
     }
 }

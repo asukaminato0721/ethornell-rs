@@ -16,6 +16,12 @@ pub(crate) struct GraphKnobState {
     pub(crate) event_y: i32,
     pub(crate) event_kind: i32,
     pub(crate) changed: bool,
+    /// Mouse-to-thumb offset captured by CDspObjKnob::BeginDrag
+    /// (target sub_4212A0). These are screen-space pixels because the target
+    /// stores the pointer position minus the controlled object's composite
+    /// position at capture time.
+    pub(crate) drag_offset_x: f32,
+    pub(crate) drag_offset_y: f32,
 }
 
 impl GraphKnobState {
@@ -24,7 +30,7 @@ impl GraphKnobState {
             target,
             base_x,
             base_y,
-            enabled: true,
+            enabled: false,
             relative_mode: 1,
             x: 0,
             y: 0,
@@ -37,6 +43,8 @@ impl GraphKnobState {
             event_y: 0,
             event_kind: 0,
             changed: false,
+            drag_offset_x: 0.0,
+            drag_offset_y: 0.0,
         }
     }
 
@@ -55,6 +63,31 @@ impl GraphKnobState {
 
     pub(crate) fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
+    }
+
+    /// Portable equivalent of sub_421520, used by the native mouse-wheel
+    /// watch list. Wheel input changes the logical Y coordinate by exactly
+    /// one step and records a one-shot event regardless of whether the move
+    /// succeeded. The event-kind field is nonzero only when SetPosition
+    /// rejected the requested step at the range boundary; Graph90:DA then
+    /// returns the unconsumed vertical delta so an outer control can handle it.
+    pub(crate) fn wheel_step(
+        &mut self,
+        delta_y: i32,
+        target_width: f32,
+        target_height: f32,
+    ) -> bool {
+        let accepted = self.set_position(
+            self.x,
+            self.y.wrapping_add(delta_y),
+            target_width,
+            target_height,
+        );
+        self.event_pending = true;
+        self.event_x = 0;
+        self.event_y = delta_y;
+        self.event_kind = i32::from(!accepted);
+        accepted
     }
 
     pub(crate) fn set_extent(&mut self, extent_x: i32, extent_y: i32) -> bool {
@@ -133,6 +166,61 @@ impl GraphKnobState {
                 + native_knob_offset(self.y, self.extent_y, self.bounds_height, target_height),
         )
     }
+
+    /// Portable equivalent of target sub_4212A0.  The native `relative_mode`
+    /// flag (CDspObjKnob+0x140) decides whether a drag preserves the point
+    /// inside the thumb at which the user grabbed it.
+    pub(crate) fn begin_drag(&mut self, mouse_x: f32, mouse_y: f32, target_x: f32, target_y: f32) {
+        if self.relative_mode != 0 {
+            self.drag_offset_x = mouse_x - target_x;
+            self.drag_offset_y = mouse_y - target_y;
+        } else {
+            self.drag_offset_x = 0.0;
+            self.drag_offset_y = 0.0;
+        }
+    }
+
+    /// Portable equivalent of target sub_421300. `origin_x/y` is the
+    /// screen-space position at which logical (0,0) places the controlled
+    /// sprite. The target clamps in pixel space first and then converts back
+    /// to the logical precision domain using the same 16.16 step and rounding
+    /// bias as sub_4215E0/sub_421640.
+    pub(crate) fn drag_to(
+        &mut self,
+        mouse_x: f32,
+        mouse_y: f32,
+        origin_x: f32,
+        origin_y: f32,
+        target_width: f32,
+        target_height: f32,
+    ) -> bool {
+        let desired_x = mouse_x - self.drag_offset_x - origin_x;
+        let desired_y = mouse_y - self.drag_offset_y - origin_y;
+        let logical_x = native_knob_logical_from_pixel(
+            desired_x,
+            self.extent_x,
+            self.bounds_width,
+            target_width,
+        );
+        let logical_y = native_knob_logical_from_pixel(
+            desired_y,
+            self.extent_y,
+            self.bounds_height,
+            target_height,
+        );
+        if logical_x == self.x && logical_y == self.y {
+            return false;
+        }
+        // The values were produced by the target's own clamp/range mapping, so
+        // this call should be accepted unless the object was reconfigured in
+        // the middle of the host event. Preserve SetPosition's validation.
+        if self.set_position(logical_x, logical_y, target_width, target_height) {
+            self.changed = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // CDspObjKnob::SetPosition (sub_421430) uses a 16.16 step calculated by
@@ -147,6 +235,24 @@ fn native_knob_offset(value: i32, extent: i32, bounds: i32, target_size: f32) ->
     }
     let step = native_knob_step(extent, available);
     (((step + 1) * i64::from(value)) >> 16) as f32
+}
+
+fn native_knob_logical_from_pixel(pixel: f32, extent: i32, bounds: i32, target_size: f32) -> i32 {
+    let available = bounds.saturating_sub(target_size.round().max(1.0) as i32);
+    if available <= 0 {
+        return 0;
+    }
+    let pixel = pixel.round().clamp(0.0, available as f32) as i32;
+    match extent {
+        i32::MIN..=0 => pixel,
+        1 => 0,
+        _ => {
+            let step = native_knob_step(extent, available);
+            let round_bias = available / (2 * extent - 2);
+            ((((i64::from(pixel + round_bias)) << 16) / step)
+                .clamp(0, i64::from(native_knob_limit(extent, bounds, target_size)))) as i32
+        }
+    }
 }
 
 fn native_knob_limit(extent: i32, bounds: i32, target_size: f32) -> i32 {
@@ -175,7 +281,9 @@ fn native_knob_step(extent: i32, available: i32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{native_knob_limit, native_knob_offset, GraphKnobState};
+    use super::{
+        native_knob_limit, native_knob_logical_from_pixel, native_knob_offset, GraphKnobState,
+    };
 
     #[test]
     fn native_knob_range_reaches_both_pixel_bounds() {
@@ -206,4 +314,43 @@ mod tests {
         assert!(!state.set_bounds(26, 565, 27.0, 566.0));
         assert_eq!((state.bounds_width, state.bounds_height), (0, 0));
     }
+    #[test]
+    fn inverse_drag_mapping_matches_native_precision_endpoints() {
+        assert_eq!(native_knob_logical_from_pixel(0.0, 64, 406, 40.0), 0);
+        assert_eq!(native_knob_logical_from_pixel(366.0, 64, 406, 40.0), 63);
+        assert_eq!(native_knob_logical_from_pixel(-100.0, 64, 406, 40.0), 0);
+        assert_eq!(native_knob_logical_from_pixel(999.0, 64, 406, 40.0), 63);
+    }
+
+    #[test]
+    fn config_slider_precision_round_trips_horizontal_and_vertical_endpoints() {
+        // cnfgsldctrl._bp uses 101 logical horizontal positions over a
+        // 406-pixel content range. cnfgclrwnd._bp uses 257 vertical logical
+        // positions for the color slider. Keep both endpoint mappings stable.
+        let horizontal_available = 406 - 40;
+        assert_eq!(native_knob_offset(100, 101, 406, 40.0), horizontal_available as f32);
+        assert_eq!(
+            native_knob_logical_from_pixel(horizontal_available as f32, 101, 406, 40.0),
+            100
+        );
+
+        let vertical_available = 212 - 20;
+        assert_eq!(native_knob_offset(256, 257, 212, 20.0), vertical_available as f32);
+        assert_eq!(
+            native_knob_logical_from_pixel(vertical_available as f32, 257, 212, 20.0),
+            256
+        );
+    }
+
+    #[test]
+    fn relative_drag_preserves_grab_offset_and_marks_changed() {
+        let mut state = GraphKnobState::new(7, 0.0, 0.0);
+        assert!(state.set_extent(64, 0));
+        assert!(state.set_bounds(406, 40, 40.0, 40.0));
+        state.begin_drag(110.0, 20.0, 100.0, 0.0);
+        assert!(state.drag_to(210.0, 20.0, 100.0, 0.0, 40.0, 40.0));
+        assert!(state.x > 0);
+        assert!(state.changed);
+    }
+
 }

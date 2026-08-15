@@ -83,15 +83,15 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         confidence: "high",
         evidence: "target sub_473650 and BP call corpus",
     },
-    // 0x08 load: Pop an address and load a value of the selected width.
+    // 0x08 load: Pop an address and load a signed value of the selected width.
     BpOpcodeSpec {
         code: 0x08,
         symbol: "load",
         stack_effect: "1 -> 1",
-        immediate: "width selector",
-        description: "Pop an address and load a value of the selected width.",
+        immediate: "width selector: 0=i8, 1=i16, 2=i32",
+        description: "Pop an address; load signed 8-, 16-, or 32-bit data selected by width; sign-extend narrow values to one BP value.",
         confidence: "high",
-        evidence: "native load handler",
+        evidence: "target sub_473680: *(char *), *(__int16 *), *(int *) then sub_4450D0",
     },
     // 0x09 move: Store through a destination pointer and push the assigned value back.
     BpOpcodeSpec {

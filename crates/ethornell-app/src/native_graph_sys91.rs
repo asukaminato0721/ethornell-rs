@@ -252,6 +252,7 @@ impl RuntimeTraceApi {
                 let x = pop_int_value(stack).unwrap_or_default();
                 self.graph_global_offset = (x as f32, y as f32);
                 self.graph_redraw_requested = Some(false);
+                tracing::info!(x, y, "GraphSetGlobalDisplayOffset");
                 self.trace_graph(format!("global display offset=({x},{y}) (91:06)"));
                 ethornell_vm::Value::None
             }
@@ -646,42 +647,21 @@ impl RuntimeTraceApi {
     }
 
     fn graph91_current_active_knob_handle(&mut self) -> i32 {
-        let mut selected = None::<(u32, i32)>;
-        if let Some((mouse_x, mouse_y)) = self.mouse_pos {
-            for (&handle, state) in &self.graph_knob_states {
-                if !state.enabled {
-                    continue;
-                }
-                let (x, y) = self
-                    .graph_native_composite_position(state.target)
-                    .map(|(x, y)| (x as f32, y as f32))
-                    .unwrap_or_else(|| self.graph_object_position(state.target));
-                let (width, height) = self.graph_knob_target_dimensions(state.target);
-                if mouse_x >= x
-                    && mouse_y >= y
-                    && mouse_x < x + width.max(1.0)
-                    && mouse_y < y + height.max(1.0)
-                {
-                    let priority = self
-                        .graph_object_properties
-                        .get(&state.target)
-                        .map(|properties| properties.native.priority)
-                        .unwrap_or_default();
-                    if selected.map_or(true, |previous| (priority, handle) >= previous) {
-                        selected = Some((priority, handle));
-                    }
-                }
-            }
+        // Target sub_4639A0 does not perform a hover query. It returns the
+        // handle stored in the manager's active-drag record (dword_565FC8),
+        // or zero when no knob owns the current mouse gesture.
+        let handle = self.graph_active_input_handle;
+        if handle != 0
+            && self
+                .graph_knob_states
+                .get(&handle)
+                .is_some_and(|state| state.enabled)
+        {
+            handle
+        } else {
+            self.graph_active_input_handle = 0;
+            0
         }
-        let handle = selected.map(|(_, handle)| handle).unwrap_or_else(|| {
-            self.graph_knob_states
-                .get(&self.graph_active_input_handle)
-                .filter(|state| state.enabled && (state.event_pending || state.changed))
-                .map(|_| self.graph_active_input_handle)
-                .unwrap_or_default()
-        });
-        self.graph_active_input_handle = handle;
-        handle
     }
 
     pub(super) fn dispatch_system91_88_9f(

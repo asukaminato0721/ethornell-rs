@@ -27,7 +27,15 @@ pub(crate) struct RuntimeGraphObjectProperties {
     pub(crate) blend_mode: i32,
     pub(crate) mask_alpha: i32,
     pub(crate) alpha_multiplier: i32,
+    /// Primary display bitmap for Sprite/Background subclasses. Keep this
+    /// separate from CDspObj hit masks and CDspObjSprite auxiliary bitmaps.
     pub(crate) format_resource: Option<i32>,
+    /// CDspObjSprite +0x13C auxiliary bitmap installed by Graph90:55 /
+    /// sub_427F80. This modifies Sprite rendering but is not its primary.
+    pub(crate) aux_resource: Option<i32>,
+    /// Base CDspObj generated hit-mask source installed by Graph90:3C /
+    /// sub_443A40 -> sub_41BC70. It controls pointer acceptance only.
+    pub(crate) hit_mask_resource: Option<i32>,
     pub(crate) properties: BTreeMap<u32, (i32, i32)>,
     pub(crate) named_properties: BTreeMap<String, i32>,
 }
@@ -42,6 +50,8 @@ impl Default for RuntimeGraphObjectProperties {
             mask_alpha: 0,
             alpha_multiplier: 256,
             format_resource: None,
+            aux_resource: None,
+            hit_mask_resource: None,
             properties: BTreeMap::new(),
             named_properties: BTreeMap::new(),
         }
@@ -311,6 +321,13 @@ pub(crate) struct RuntimeSurface {
     pub(crate) viewport_y: f32,
     pub(crate) viewport_width: f32,
     pub(crate) viewport_height: f32,
+    /// CDspObjWindow+0x1A0..+0x1AC inclusive valid/content rectangle. This is
+    /// independent from bitmap source cropping (`viewport_*`). Compact
+    /// DCIPIcon construction adds valid_left/valid_top to each item offset.
+    pub(crate) valid_left: i32,
+    pub(crate) valid_top: i32,
+    pub(crate) valid_right: i32,
+    pub(crate) valid_bottom: i32,
     pub(crate) resource_id: Option<i32>,
     /// CDspObjWindow+0x3C0/+0x3C4/+0x3C8. The target stores one of six
     /// permutations of the three window composition passes.
@@ -347,6 +364,10 @@ impl RuntimeSurface {
             viewport_y: 0.0,
             viewport_width: width,
             viewport_height: height,
+            valid_left: 0,
+            valid_top: 0,
+            valid_right: width.max(1.0).round() as i32 - 1,
+            valid_bottom: height.max(1.0).round() as i32 - 1,
             resource_id: None,
             composition_order: [0, 1, 2],
             blend_mode: 0,
@@ -380,7 +401,19 @@ pub(crate) struct RuntimeGraphDrawItem {
     pub(crate) src_width: f32,
     pub(crate) src_height: f32,
     pub(crate) opacity: f32,
+    /// Target bitmap format 1 is XRGB: byte 3 is software-blitter payload,
+    /// not source-alpha coverage. The GPU renderer must therefore ignore the
+    /// sampled alpha byte for these draw items while still applying object
+    /// transparency through `opacity`.
+    pub(crate) ignore_source_alpha: bool,
     pub(crate) rotation_degrees: f32,
+    /// Optional target mode-5 affine footprint in final game coordinates,
+    /// ordered TL, BL, BR, TR. When present, the renderer must use these
+    /// vertices directly instead of rotating/stretching the raster bbox.
+    pub(crate) destination_quad: Option<[[f32; 2]; 4]>,
+    /// Native mode-5 interpolation selector: false = nearest, true = bilinear.
+    /// Non-mode-5 draw items retain the renderer's historical linear sampling.
+    pub(crate) linear_sampling: bool,
     pub(crate) clip: Option<RuntimeClipRect>,
     pub(crate) z: i32,
     /// Native CDspObj blend selector. The renderer maps the recovered common
@@ -655,6 +688,36 @@ pub(crate) fn blit_decoded_image_format2_source_over(
     }
 }
 
+/// Native selector-128 format-1 -> format-2 conversion in `sub_40AF50`.
+/// Format 1 carries RGB but no source-alpha semantics; when copied into a
+/// format-2 bitmap the target preserves RGB and forces the destination alpha
+/// byte to 255 (`pixel | 0xFF000000`).
+pub(crate) fn blit_decoded_image_format1_to_format2(
+    destination: &mut DecodedImage,
+    source: &DecodedImage,
+    destination_x: i32,
+    destination_y: i32,
+) {
+    for source_y in 0..source.height as i32 {
+        let target_y = destination_y + source_y;
+        if !(0..destination.height as i32).contains(&target_y) {
+            continue;
+        }
+        for source_x in 0..source.width as i32 {
+            let target_x = destination_x + source_x;
+            if !(0..destination.width as i32).contains(&target_x) {
+                continue;
+            }
+            let source_index = (source_y as usize * source.width as usize + source_x as usize) * 4;
+            let target_index =
+                (target_y as usize * destination.width as usize + target_x as usize) * 4;
+            destination.rgba[target_index..target_index + 3]
+                .copy_from_slice(&source.rgba[source_index..source_index + 3]);
+            destination.rgba[target_index + 3] = 0xff;
+        }
+    }
+}
+
 /// Native same-format selector 128 path (`sub_40AF50 -> sub_40ADF0`).  This
 /// is a byte/pixel replacement after clipping, not source-over compositing.
 pub(crate) fn blit_decoded_image_raw_copy(
@@ -869,6 +932,10 @@ pub(crate) struct NativeMode5NodeArgs {
     /// CDspObjSprite+0x27C.  sub_429AF0 uses this as the gate for
     /// perspective-projecting the resolved X/Y position by the Z scale.
     pub(crate) project_position: bool,
+    /// CDspObjSprite+0x280. sub_4258D0 passes this to sub_417730: zero
+    /// selects the nearest-neighbour rasterizer (sub_418280), nonzero selects
+    /// the bilinear rasterizer (sub_417C50).
+    pub(crate) interpolation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -914,8 +981,10 @@ impl Default for NativeMode5DynamicState {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct NativeMode5Geometry {
-    /// Raster top-left returned by sub_4281E0 after subtracting the mode-5
-    /// origin offset.
+    /// Raster top-left returned by sub_4281E0 after the ordinary CDspObj
+    /// position (including its integer offset banks) has the mode-5 raster
+    /// origin removed. The bottom-up convention belongs to the affine source
+    /// transform; it does not invert the display object's screen Y axis.
     pub(crate) x: f32,
     pub(crate) y: f32,
     /// Ordinary CDspObj pixel position written by sub_429AF0 through
@@ -930,6 +999,19 @@ pub(crate) struct NativeMode5Geometry {
     pub(crate) origin_offset_y: f32,
     pub(crate) scale: f32,
     pub(crate) rotation_degrees: f32,
+    /// Forward affine image footprint, relative to the raster top-left. The
+    /// points are source-edge TL, BL, BR, TR. The target does not stretch the
+    /// bitmap to `width`/`height`: those values are only the inclusive raster
+    /// bounding rectangle used for clipping. sub_416750 performs the inverse
+    /// mapping for each destination pixel; this quad is the algebraic inverse
+    /// of that mapping.
+    pub(crate) local_affine_quad: [[f32; 2]; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RuntimeMode5RenderState {
+    pub(crate) local_affine_quad: [[f32; 2]; 4],
+    pub(crate) linear_sampling: bool,
 }
 
 impl NativeMode5NodeArgs {
@@ -945,6 +1027,7 @@ impl NativeMode5NodeArgs {
             rotation: *values.get(10)?,
             perspective: *values.get(11)?,
             project_position: *values.get(12)? != 0,
+            interpolation: *values.get(13)? != 0,
         })
     }
 
@@ -965,8 +1048,8 @@ impl NativeMode5NodeArgs {
 
     /// Exact mode-5 projection recovered from
     /// sub_4296C0 -> sub_429220 -> sub_429AF0.  The constructor arguments at
-    /// indices 8/9 are base transform offsets in integer pixels (stored as
-    /// 16.16 by sub_427AA0), not a bitmap anchor.
+    /// indices 8/9 are the bitmap-origin coordinates consumed by the native
+    /// bottom-up DIB transform (stored as 16.16 by sub_427AA0).
     pub(crate) fn screen_geometry_mode5_exact(
         self,
         image_width: f32,
@@ -1120,6 +1203,52 @@ impl NativeMode5NodeArgs {
         let object_x = object_x_fixed >> 16;
         let object_y = object_y_fixed >> 16;
 
+        // sub_4258D0 case 5 passes
+        //   frac + ((raster_origin - local_clip) << 16)
+        // to sub_417730. sub_416750 then inverse-maps every destination pixel
+        // back into source coordinates. Algebraically inverting that mapping
+        // gives the source-pixel-centre -> raster-local transform below. Keep
+        // the 16-bit ordinary-position remainder: sub_429AF0 stores it at
+        // Sprite+0x2A4/+0x2A8 and the case-5 rasterizer consumes it.
+        let fractional_x = f64::from((object_x_fixed as u32 & 0xffff) as u16) / 65_536.0;
+        let fractional_y = f64::from((object_y_fixed as u32 & 0xffff) as u16) / 65_536.0;
+        let anchor_x = f64::from(offset_x_16_16) / 65_536.0;
+        let anchor_y = f64::from(offset_y_16_16) / 65_536.0;
+        let map_source_edge = |source_x: f64, source_y: f64| -> [f32; 2] {
+            let source_dx = (source_x - anchor_x) * sx;
+            let source_dy = (source_y - anchor_y) * sy;
+            [
+                (origin_offset_x
+                    + fractional_x
+                    + source_dx * cos
+                    + source_dy * sin
+                    + 0.5) as f32,
+                (origin_offset_y
+                    + fractional_y
+                    - source_dx * sin
+                    + source_dy * cos
+                    + 0.5) as f32,
+            ]
+        };
+        // The native rasterizer addresses destination pixels by integer pixel
+        // centre (local 0 means the centre of the first pixel), whereas GPU
+        // vertex coordinates address pixel edges (the first fragment centre is
+        // at 0.5). The +0.5 above is only that coordinate-system bridge; it is
+        // not a target half-pixel correction. Texture UV 0/1 are texel edges,
+        // while native source integer coordinates denote texel centres, so the
+        // source footprint expands by half a texel. The native raster bbox is
+        // still applied as a scissor and remains authoritative.
+        let local_affine_quad = [
+            map_source_edge(-0.5, -0.5),
+            map_source_edge(-0.5, height - 0.5),
+            map_source_edge(width - 0.5, height - 0.5),
+            map_source_edge(width - 0.5, -0.5),
+        ];
+
+        // sub_4281E0 calls sub_41B260 to resolve the ordinary screen
+        // position, then subtracts Sprite+0x2DC/+0x2E0.  Do not flip this Y:
+        // the target's bottom-up DIB convention is consumed by the affine
+        // rasterizer (sub_417730/sub_416750), not by CDspObj screen placement.
         NativeMode5Geometry {
             x: object_x as f32 - origin_offset_x as f32,
             y: object_y as f32 - origin_offset_y as f32,
@@ -1131,6 +1260,7 @@ impl NativeMode5NodeArgs {
             origin_offset_y: origin_offset_y as f32,
             scale: perspective_scale as f32,
             rotation_degrees: (f64::from(rotation) / 65_536.0) as f32,
+            local_affine_quad,
         }
     }
 
@@ -1261,6 +1391,12 @@ impl NativeMode5NodeArgs {
             origin_offset_y: origin_offset_y as f32,
             scale: scale as f32,
             rotation_degrees: angle as f32,
+            local_affine_quad: [
+                [0.0, 0.0],
+                [0.0, height as f32],
+                [width as f32, height as f32],
+                [width as f32, 0.0],
+            ],
         }
     }
 }
@@ -1269,13 +1405,29 @@ impl NativeMode5NodeArgs {
 mod tests {
     use super::{
         backf_mask_weight, blend_decoded_image_parameter, blit_decoded_image,
-        blit_decoded_image_parameter, crossfade_decoded_images, native_draw_order,
+        blit_decoded_image_format1_to_format2, blit_decoded_image_parameter,
+        crossfade_decoded_images, native_draw_order,
         scale_decoded_image_fixed,
         NativeMode5DynamicState, NativeMode5NodeArgs, RuntimeGraphDrawItem,
         RuntimeGraphObjectProperties, RuntimeGraphResource,
     };
     use ethornell_image::DecodedImage;
 
+
+    #[test]
+    fn mode5_arg13_selects_native_sampling_path() {
+        let mut args = [0i32; 17];
+        args[0] = 1;
+        args[4] = 2;
+        args[13] = 0;
+        assert!(!NativeMode5NodeArgs::from_source_args(&args)
+            .expect("mode-5 args")
+            .interpolation);
+        args[13] = 1;
+        assert!(NativeMode5NodeArgs::from_source_args(&args)
+            .expect("mode-5 args")
+            .interpolation);
+    }
 
     #[test]
     fn mode5_ordinary_position_uses_valid_graph_center_not_bitmap_center() {
@@ -1290,6 +1442,7 @@ mod tests {
             rotation: 0,
             perspective: 0,
             project_position: true,
+            interpolation: false,
         };
         let dynamic = NativeMode5DynamicState::default();
         let geometry = mode5.screen_geometry_mode5_exact(
@@ -1325,6 +1478,7 @@ mod tests {
             rotation: 0,
             perspective: 640,
             project_position: true,
+            interpolation: true,
         };
         let geometry = mode5.screen_geometry_mode5_exact(
             1480.0,
@@ -1338,6 +1492,96 @@ mod tests {
         assert_eq!((geometry.x, geometry.y), (-248.0, 107.0));
         assert_eq!((geometry.width, geometry.height), (1775.0, 984.0));
         assert!((geometry.scale - 1.2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn mode5_opening_affine_quad_maps_source_row_zero_to_first_destination_pixel() {
+        fn source_center_destination(
+            quad: [[f32; 2]; 4],
+            width: f32,
+            height: f32,
+            source_x: f32,
+            source_y: f32,
+        ) -> [f32; 2] {
+            let u = (source_x + 0.5) / width;
+            let v = (source_y + 0.5) / height;
+            let [tl, bl, _br, tr] = quad;
+            [
+                tl[0] + (tr[0] - tl[0]) * u + (bl[0] - tl[0]) * v,
+                tl[1] + (tr[1] - tl[1]) * u + (bl[1] - tl[1]) * v,
+            ]
+        }
+
+        // Opening background class: source anchor Y=205, ordinary Y=360+200,
+        // perspective scale 1.2. Target sub_429220 gives origin_y=246, so
+        // sub_4281E0 gives world_y=314. The affine path must leave those
+        // values untouched while mapping source row 0 to raster-local pixel 0.
+        let first = NativeMode5NodeArgs {
+            node_id: 1,
+            position_x: 0,
+            position_y: 200 << 16,
+            position_z: -128 << 16,
+            resource_id: 2,
+            anchor_x: 740,
+            anchor_y: 205,
+            rotation: 0,
+            perspective: 640,
+            project_position: false,
+            interpolation: true,
+        }
+        .screen_geometry_mode5_exact(
+            1480.0,
+            820.0,
+            1280.0,
+            720.0,
+            (-1, -1),
+            true,
+            NativeMode5DynamicState::default(),
+        );
+        assert_eq!((first.object_x, first.object_y), (640.0, 560.0));
+        assert_eq!((first.origin_offset_x, first.origin_offset_y), (888.0, 246.0));
+        assert_eq!((first.x, first.y), (-248.0, 314.0));
+        let first_pixel =
+            source_center_destination(first.local_affine_quad, 1480.0, 820.0, 0.0, 0.0);
+        // The 16.16 perspective scale is 0x13333 rather than mathematical
+        // 1.2, so target raster rounding leaves a tiny subpixel remainder.
+        // Source (0,0) must still land within a few thousandths of the first
+        // GPU fragment centre, never tens of pixels away.
+        assert!((first_pixel[0] - 0.5).abs() < 0.005);
+        assert!((first_pixel[1] - 0.5).abs() < 0.005);
+
+        // Second opening class: scale 2.0, ordinary Y=360+100, origin_y=410.
+        // The target world Y is therefore 50, again with source row 0 at the
+        // first destination pixel rather than at a bbox-derived scaled offset.
+        let second = NativeMode5NodeArgs {
+            node_id: 1,
+            position_x: 0,
+            position_y: 100 << 16,
+            position_z: -640 << 16,
+            resource_id: 2,
+            anchor_x: 740,
+            anchor_y: 205,
+            rotation: 0,
+            perspective: 640,
+            project_position: false,
+            interpolation: true,
+        }
+        .screen_geometry_mode5_exact(
+            1480.0,
+            820.0,
+            1280.0,
+            720.0,
+            (-1, -1),
+            true,
+            NativeMode5DynamicState::default(),
+        );
+        assert_eq!((second.object_x, second.object_y), (640.0, 460.0));
+        assert_eq!((second.origin_offset_x, second.origin_offset_y), (1480.0, 410.0));
+        assert_eq!((second.x, second.y), (-840.0, 50.0));
+        let second_pixel =
+            source_center_destination(second.local_affine_quad, 1480.0, 820.0, 0.0, 0.0);
+        assert!((second_pixel[0] - 0.5).abs() < 0.001);
+        assert!((second_pixel[1] - 0.5).abs() < 0.001);
     }
 
     #[test]
@@ -1394,6 +1638,29 @@ mod tests {
         destination.rgba.fill(0);
         blit_decoded_image_parameter(&mut destination, &source, 0, 0, 128, 128);
         assert_eq!(destination.rgba[3], 128);
+    }
+
+    #[test]
+    fn native_format1_to_format2_copy_preserves_rgb_and_forces_opaque_alpha() {
+        let source = DecodedImage {
+            width: 2,
+            height: 1,
+            // Format-1 alpha bytes are not semantically source alpha. Keep
+            // deliberately low values to guard against the message-window
+            // regression where those bytes leaked into a format-2 canvas.
+            rgba: vec![10, 20, 30, 7, 40, 50, 60, 22],
+        };
+        let mut destination = DecodedImage {
+            width: 2,
+            height: 1,
+            rgba: vec![0; 8],
+        };
+
+        blit_decoded_image_format1_to_format2(&mut destination, &source, 0, 0);
+        assert_eq!(
+            destination.rgba,
+            vec![10, 20, 30, 255, 40, 50, 60, 255]
+        );
     }
 
     #[test]
@@ -1525,7 +1792,10 @@ mod tests {
             src_width: 1.0,
             src_height: 1.0,
             opacity: 1.0,
+            ignore_source_alpha: false,
             rotation_degrees: 0.0,
+            destination_quad: None,
+            linear_sampling: true,
             clip: None,
             z: 0,
             blend_mode: 1,

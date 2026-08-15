@@ -31,10 +31,21 @@ pub enum RenderCommand {
         src_width: f32,
         src_height: f32,
         opacity: f32,
+        /// Ignore sampled texture alpha. Native bitmap format 1 is XRGB; its
+        /// fourth byte is not source coverage, while object transparency is
+        /// still supplied separately through `opacity`.
+        ignore_source_alpha: bool,
         /// Native CDspObj blend selector. Common recovered modes are routed
         /// to dedicated pipelines; unknown values retain ordinary alpha.
         blend_mode: i32,
         rotation_degrees: f32,
+        /// Optional affine destination footprint in virtual/game coordinates,
+        /// ordered TL, BL, BR, TR. Native mode 5 supplies this directly from
+        /// the inverse of sub_416750 rather than rotating a raster bbox.
+        destination_quad: Option<[[f32; 2]; 4]>,
+        /// Texture interpolation selector. Native mode 5 recovers this from
+        /// CDspObjSprite+0x280 (0 nearest, nonzero bilinear).
+        linear_sampling: bool,
         clip: Option<[f32; 4]>,
         z: i32,
     },
@@ -59,7 +70,8 @@ pub struct TextureHandle {
 
 struct TextureRecord {
     texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    linear_bind_group: wgpu::BindGroup,
+    nearest_bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
     opaque: bool,
@@ -90,6 +102,7 @@ struct Vertex {
     position: [f32; 2],
     texcoord: [f32; 2],
     opacity: f32,
+    ignore_source_alpha: f32,
 }
 
 impl Vertex {
@@ -111,6 +124,11 @@ impl Vertex {
                 wgpu::VertexAttribute {
                     offset: 16,
                     shader_location: 2,
+                    format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 20,
+                    shader_location: 3,
                     format: wgpu::VertexFormat::Float32,
                 },
             ],
@@ -153,7 +171,8 @@ pub struct Renderer<'w> {
     subtractive_pipeline: wgpu::RenderPipeline,
     constant_interpolation_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    linear_sampler: wgpu::Sampler,
+    nearest_sampler: wgpu::Sampler,
     textures: BTreeMap<TextureId, TextureRecord>,
     text_cache: BTreeMap<TextCacheKey, TextureHandle>,
     next_texture_id: TextureId,
@@ -312,10 +331,16 @@ impl<'w> Renderer<'w> {
                 },
             }),
         );
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ethornell-linear-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ethornell-nearest-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -336,7 +361,8 @@ impl<'w> Renderer<'w> {
             subtractive_pipeline,
             constant_interpolation_pipeline,
             bind_group_layout,
-            sampler,
+            linear_sampler,
+            nearest_sampler,
             textures: BTreeMap::new(),
             text_cache: BTreeMap::new(),
             next_texture_id: 1,
@@ -461,23 +487,30 @@ impl<'w> Renderer<'w> {
         });
         self.write_texture(&texture, image);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ethornell-texture-bind-group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let make_bind_group = |label: &'static str, sampler: &wgpu::Sampler| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            })
+        };
+        let linear_bind_group =
+            make_bind_group("ethornell-texture-linear-bind-group", &self.linear_sampler);
+        let nearest_bind_group =
+            make_bind_group("ethornell-texture-nearest-bind-group", &self.nearest_sampler);
         TextureRecord {
             texture,
-            bind_group,
+            linear_bind_group,
+            nearest_bind_group,
             width: image.width,
             height: image.height,
             opaque: image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255),
@@ -568,8 +601,11 @@ impl<'w> Renderer<'w> {
                 src_width,
                 src_height,
                 opacity,
+                ignore_source_alpha,
                 blend_mode,
                 rotation_degrees,
+                destination_quad,
+                linear_sampling,
                 clip,
             ) = match command {
                 RenderCommand::DrawTexture {
@@ -583,8 +619,11 @@ impl<'w> Renderer<'w> {
                     src_width,
                     src_height,
                     opacity,
+                    ignore_source_alpha,
                     blend_mode,
                     rotation_degrees,
+                    destination_quad,
+                    linear_sampling,
                     clip,
                     ..
                 } => {
@@ -602,8 +641,11 @@ impl<'w> Renderer<'w> {
                         src_width,
                         src_height,
                         opacity,
+                        ignore_source_alpha,
                         blend_mode,
                         rotation_degrees,
+                        destination_quad,
+                        linear_sampling,
                         clip,
                     )
                 }
@@ -638,13 +680,27 @@ impl<'w> Renderer<'w> {
                         handle.width as f32,
                         handle.height as f32,
                         1.0,
+                        false,
                         1,
                         0.0,
+                        None,
+                        true,
                         clip,
                     )
                 }
                 RenderCommand::Clear { .. } => continue,
             };
+            let surface_destination_quad = destination_quad.map(|quad| {
+                let (scale, offset_x, offset_y) = viewport_transform(
+                    self.config.width as f32,
+                    self.config.height as f32,
+                    self.virtual_width,
+                    self.virtual_height,
+                );
+                quad.map(|[game_x, game_y]| {
+                    [offset_x + game_x * scale, offset_y + game_y * scale]
+                })
+            });
             let (x, y, width, height) = self.game_to_surface_rect(x, y, width, height);
             let scissor = match clip {
                 Some(rect) => match self.game_clip_to_scissor(rect) {
@@ -658,30 +714,56 @@ impl<'w> Renderer<'w> {
                 .get(&texture)
                 .map(|record| record.opaque)
                 .unwrap_or(false);
-            let pipeline_kind = native_pipeline_kind(blend_mode, opacity, texture_opaque);
+            let pipeline_kind = native_pipeline_kind(
+                blend_mode,
+                opacity,
+                texture_opaque || ignore_source_alpha,
+            );
             let shader_opacity = if pipeline_kind == NativePipelineKind::ConstantInterpolation {
                 1.0
             } else {
                 opacity
             };
-            let vertices = quad_vertices(
-                x,
-                y,
-                width,
-                height,
-                src_x,
-                src_y,
-                src_width,
-                src_height,
-                shader_opacity,
-                rotation_degrees,
-                self.config.width as f32,
-                self.config.height as f32,
-            );
+            let vertices = if let Some(points) = surface_destination_quad {
+                quad_vertices_from_points(
+                    points,
+                    src_x,
+                    src_y,
+                    src_width,
+                    src_height,
+                    shader_opacity,
+                    ignore_source_alpha,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                )
+            } else {
+                quad_vertices(
+                    x,
+                    y,
+                    width,
+                    height,
+                    src_x,
+                    src_y,
+                    src_width,
+                    src_height,
+                    shader_opacity,
+                    ignore_source_alpha,
+                    rotation_degrees,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                )
+            };
             let vertex_start = frame_vertices.len() as u32;
             frame_vertices.extend_from_slice(&vertices);
             let vertex_range = vertex_start..vertex_start + vertices.len() as u32;
-            draw_items.push((texture, vertex_range, scissor, pipeline_kind, opacity));
+            draw_items.push((
+                texture,
+                vertex_range,
+                scissor,
+                pipeline_kind,
+                opacity,
+                linear_sampling,
+            ));
         }
 
         let stale_text_keys = self
@@ -732,7 +814,9 @@ impl<'w> Renderer<'w> {
             if let Some(vertex_buffer) = frame_vertex_buffer.as_ref() {
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             }
-            for (texture, vertex_range, scissor, pipeline_kind, opacity) in &draw_items {
+            for (texture, vertex_range, scissor, pipeline_kind, opacity, linear_sampling) in
+                &draw_items
+            {
                 let pipeline = match pipeline_kind {
                     NativePipelineKind::Replace => &self.replace_pipeline,
                     NativePipelineKind::Additive => &self.additive_pipeline,
@@ -758,7 +842,12 @@ impl<'w> Renderer<'w> {
                     pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                 }
                 if let Some(record) = self.textures.get(texture) {
-                    pass.set_bind_group(0, &record.bind_group, &[]);
+                    let bind_group = if *linear_sampling {
+                        &record.linear_bind_group
+                    } else {
+                        &record.nearest_bind_group
+                    };
+                    pass.set_bind_group(0, bind_group, &[]);
                     pass.draw(vertex_range.clone(), 0..1);
                 }
             }
@@ -1098,6 +1187,7 @@ fn quad_vertices(
     src_w: f32,
     src_h: f32,
     opacity: f32,
+    ignore_source_alpha: bool,
     rotation_degrees: f32,
     sw: f32,
     sh: f32,
@@ -1110,49 +1200,54 @@ fn quad_vertices(
     let rotate = |px: f32, py: f32| {
         let dx = px - center_x;
         let dy = py - center_y;
-        let rx = center_x + dx * cos - dy * sin;
-        let ry = center_y + dx * sin + dy * cos;
-        [rx / sw * 2.0 - 1.0, 1.0 - ry / sh * 2.0]
+        [
+            center_x + dx * cos - dy * sin,
+            center_y + dx * sin + dy * cos,
+        ]
     };
-    let top_left = rotate(x, y);
-    let bottom_left = rotate(x, y + h);
-    let bottom_right = rotate(x + w, y + h);
-    let top_right = rotate(x + w, y);
+    quad_vertices_from_points(
+        [
+            rotate(x, y),
+            rotate(x, y + h),
+            rotate(x + w, y + h),
+            rotate(x + w, y),
+        ],
+        src_x,
+        src_y,
+        src_w,
+        src_h,
+        opacity,
+        ignore_source_alpha,
+        sw,
+        sh,
+    )
+}
+
+fn quad_vertices_from_points(
+    points: [[f32; 2]; 4],
+    src_x: f32,
+    src_y: f32,
+    src_w: f32,
+    src_h: f32,
+    opacity: f32,
+    ignore_source_alpha: bool,
+    sw: f32,
+    sh: f32,
+) -> [Vertex; 6] {
+    let to_ndc = |[px, py]: [f32; 2]| [px / sw * 2.0 - 1.0, 1.0 - py / sh * 2.0];
+    let [top_left, bottom_left, bottom_right, top_right] = points.map(to_ndc);
     let u0 = src_x.clamp(0.0, 1.0);
     let v0 = src_y.clamp(0.0, 1.0);
     let u1 = (src_x + src_w).clamp(0.0, 1.0);
     let v1 = (src_y + src_h).clamp(0.0, 1.0);
+    let ignore_source_alpha = if ignore_source_alpha { 1.0 } else { 0.0 };
     [
-        Vertex {
-            position: top_left,
-            texcoord: [u0, v0],
-            opacity,
-        },
-        Vertex {
-            position: bottom_left,
-            texcoord: [u0, v1],
-            opacity,
-        },
-        Vertex {
-            position: bottom_right,
-            texcoord: [u1, v1],
-            opacity,
-        },
-        Vertex {
-            position: top_left,
-            texcoord: [u0, v0],
-            opacity,
-        },
-        Vertex {
-            position: bottom_right,
-            texcoord: [u1, v1],
-            opacity,
-        },
-        Vertex {
-            position: top_right,
-            texcoord: [u1, v0],
-            opacity,
-        },
+        Vertex { position: top_left, texcoord: [u0, v0], opacity, ignore_source_alpha },
+        Vertex { position: bottom_left, texcoord: [u0, v1], opacity, ignore_source_alpha },
+        Vertex { position: bottom_right, texcoord: [u1, v1], opacity, ignore_source_alpha },
+        Vertex { position: top_left, texcoord: [u0, v0], opacity, ignore_source_alpha },
+        Vertex { position: bottom_right, texcoord: [u1, v1], opacity, ignore_source_alpha },
+        Vertex { position: top_right, texcoord: [u1, v0], opacity, ignore_source_alpha },
     ]
 }
 
@@ -1161,12 +1256,14 @@ struct VertexIn {
   @location(0) position: vec2<f32>,
   @location(1) texcoord: vec2<f32>,
   @location(2) opacity: f32,
+  @location(3) ignore_source_alpha: f32,
 };
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) texcoord: vec2<f32>,
   @location(1) opacity: f32,
+  @location(2) ignore_source_alpha: f32,
 };
 
 @vertex
@@ -1175,6 +1272,7 @@ fn vs_main(v: VertexIn) -> VertexOut {
   out.position = vec4<f32>(v.position, 0.0, 1.0);
   out.texcoord = v.texcoord;
   out.opacity = v.opacity;
+  out.ignore_source_alpha = v.ignore_source_alpha;
   return out;
 }
 
@@ -1184,7 +1282,8 @@ fn vs_main(v: VertexIn) -> VertexOut {
 @fragment
 fn fs_main(v: VertexOut) -> @location(0) vec4<f32> {
   let c = textureSample(tex, samp, v.texcoord);
-  return vec4<f32>(c.rgb, c.a * v.opacity);
+  let source_alpha = select(c.a, 1.0, v.ignore_source_alpha > 0.5);
+  return vec4<f32>(c.rgb, source_alpha * v.opacity);
 }
 "#;
 

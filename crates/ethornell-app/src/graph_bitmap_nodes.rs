@@ -73,6 +73,7 @@ impl RuntimeTraceApi {
         self.graph_resources.remove(&bitmap);
         self.graph_bindings.remove(&bitmap);
         self.graph_config.bitmap_priorities.remove(&bitmap);
+        self.reset_bitmap_auxiliary_pair(bitmap);
 
         let key = format!("runtime:bitmap:{bitmap}");
         self.graph_images.remove(&key);

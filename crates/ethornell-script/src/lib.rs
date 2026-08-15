@@ -377,7 +377,7 @@ pub fn candidate_call_name(group: u8, id: u16) -> Option<&'static str> {
         (0x90, 0x50) => Some("GraphCreateSpriteObject"),
         (0x90, 0x51) => Some("GraphReleaseSpriteObject"),
         (0x90, 0x53) => Some("GraphRefreshSpriteObject"),
-        (0x90, 0x54) => Some("GraphSetSpriteEnabled"),
+        (0x90, 0x54) => Some("GraphSetSpriteDrawEnabled"),
         (0x90, 0x55) => Some("GraphSetSpriteAuxBitmap"),
         (0x90, 0x56) => Some("GraphConfigureSpriteSingleBitmap"),
         (0x90, 0x57) => Some("GraphReplaceSpriteBitmap"),

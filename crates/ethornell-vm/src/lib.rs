@@ -1227,13 +1227,15 @@ pub trait GraphApi {
         false
     }
 
-    /// Set the two target bitmap descriptor DWORDs at +0x28/+0x2c. They are
-    /// auxiliary metadata and must not be confused with width/height.
+    /// Set the target bitmap-registry DWORDs at +0x28/+0x2C. They are an
+    /// auxiliary reference point, not width/height. `sub_401EF0` seeds them
+    /// from CBG +0x1C/+0x1E when the CBG +0x1A presence flag is 1.
     fn set_bitmap_auxiliary_pair(&mut self, _bitmap: i32, _first: i32, _second: i32) -> bool {
         false
     }
 
-    /// Read the target bitmap descriptor DWORDs at +0x28/+0x2c.
+    /// Read the target bitmap-registry auxiliary reference point at
+    /// +0x28/+0x2C. Newly allocated/released slots default to -1/-1.
     fn query_bitmap_auxiliary_pair(&mut self, _bitmap: i32) -> Option<[i32; 2]> {
         None
     }
@@ -1381,6 +1383,11 @@ pub struct GraphEffectInvocation {
 pub struct GraphInputDescriptor {
     pub initial_group: i32,
     pub flags: [i32; 7],
+    /// Compact DCIPIcon item coordinates are relative to the owning Window's
+    /// valid-region left/top (sub_447C10 -> sub_42C2A0). Extended DCIPIconEx
+    /// item coordinates are used directly by sub_44A900. This is parser-known
+    /// descriptor-layout semantics, not an extra DWORD in guest memory.
+    pub compact_uses_valid_region_origin: bool,
     /// DCIPIcon pointer processing is enabled by the base constructor. The
     /// extended 40-byte descriptor can disable it with root+0x20 != 0
     /// (`sub_44A900`: DCIPIcon+0x88 = root[8] == 0).
@@ -1397,6 +1404,7 @@ impl Default for GraphInputDescriptor {
         Self {
             initial_group: 0,
             flags: [0; 7],
+            compact_uses_valid_region_origin: false,
             pointer_processing_enabled: true,
             groups: Vec::new(),
             regions: Vec::new(),
@@ -1424,10 +1432,12 @@ pub struct GraphInputGroup {
     /// current item in peer groups when this group becomes current.
     pub selection_exclusion_key: i32,
     /// DCIPIconEx source-group flags at extended group+0x3C. They are not
-    /// projected into the common 52-byte group record, but the extended
-    /// activation validator `sub_44C6F0` consults bit 0x02 before accepting
-    /// an item action. Base/compact DCIPIcon has no corresponding source field
-    /// and stores zero here.
+    /// projected into the common 52-byte group record. Extended vtable+0x48
+    /// (`sub_44C6F0`) consults bit 0x02 together with item+0xC0 bit 0x20 to
+    /// choose activation timing: both clear activates on MouseDown; either set
+    /// defers the same action until MouseRelease while the pointer remains on
+    /// the item. Base/compact DCIPIcon has no corresponding source field and
+    /// stores zero here.
     pub extended_flags: i32,
 }
 
@@ -1440,7 +1450,14 @@ pub struct GraphInputRegion {
     pub selected: bool,
     pub x: i32,
     pub y: i32,
+    /// Legacy host field name. For DCIPIconEx this is source item+0x10,
+    /// passed by sub_44A900 to the internal mode-5 Sprite as an origin/transform
+    /// parameter; it is NOT the materialized bitmap or Virtual hit width.
+    /// Compact descriptors store zero.
     pub width: i32,
+    /// Legacy host field name. For DCIPIconEx this is source item+0x14, the
+    /// paired mode-5 origin/transform parameter; it is NOT raster/hit height.
+    /// Compact descriptors store zero.
     pub height: i32,
     /// Base/idle bitmap resource. Compact DCIPIcon item offset +0x0C;
     /// extended DCIPIconEx item offset +0x20.
@@ -1456,9 +1473,17 @@ pub struct GraphInputRegion {
     /// both active (extended item offset +0x2C). Base DCIPIcon has no separate
     /// combined slot and stores -1 here.
     pub hover_selected_resource: i32,
-    /// Auxiliary item resource at compact +0x18 / extended +0x30. Its exact
-    /// rendering role is separate from the three state-selection slots above.
+    /// Explicit CDspObjVirtual hit-mask bitmap at compact +0x18 / extended
+    /// +0x30. Target sub_447C10/sub_44A900 resolve it and sub_41BC70 converts
+    /// native formats 0/1/2/3 into a 1-bit pointer-hit mask. Sentinel -2
+    /// explicitly clears/disables the mask; an unresolved resource leaves the
+    /// item's intrinsic rectangular Virtual hit area unmasked.
     pub mask_resource: i32,
+    /// DCIPIconEx source item +0x34. Target vtable+0x28 (`sub_44C110`)
+    /// rejects pointer-hit activation for this item while it is the group's
+    /// current selection when this value is nonzero. Compact DCIPIcon has no
+    /// corresponding source field and stores false here.
+    pub current_selection_hit_excluded: bool,
     pub flags: i32,
 }
 
@@ -6625,7 +6650,18 @@ impl Vm {
                 return Ok(value.clone());
             }
         }
-        Ok(Value::Int(self.read_int(ptr, width)? as i32))
+        // Target BP opcode 0x08 is sub_473680. Its width selectors load
+        // `char`, `__int16`, and `int` respectively before passing the value
+        // to sub_4450D0. The narrow loads are therefore sign-extended. Keep
+        // read_int() itself raw/unsigned because native structure readers use
+        // it for byte/word fields whose signedness is selector-specific.
+        let raw = self.read_int(ptr, width)?;
+        let value = match width {
+            0 => raw as u8 as i8 as i32,
+            1 => raw as u16 as i16 as i32,
+            _ => raw as i32,
+        };
+        Ok(Value::Int(value))
     }
 
     fn read_descriptor_values(&self, descriptor: Value, count: usize) -> VmResult<Vec<Value>> {
@@ -6709,6 +6745,7 @@ impl Vm {
         let mut descriptor = GraphInputDescriptor {
             initial_group: self.read_int(ptr.wrapping_add(8), 2)? as i32,
             flags,
+            compact_uses_valid_region_origin: false,
             // sub_44A900 copies the 40-byte root and stores
             // DCIPIcon+0x88 = (root+0x20 == 0).
             pointer_processing_enabled: self.read_int(ptr.wrapping_add(32), 2)? == 0,
@@ -6737,7 +6774,9 @@ impl Vm {
                 pointer_activation_enabled: self.read_int(group_ptr.wrapping_add(28), 2)? != 0,
                 selection_exclusion_key: self.read_int(group_ptr.wrapping_add(32), 2)? as i32,
                 // DCIPIconEx vtable+0x48 (`sub_44C6F0`) reads source group
-                // byte +0x3C bit 0x02 in addition to item+0xC0 bit 0x20.
+                // byte +0x3C bit 0x02 together with item+0xC0 bit 0x20. A
+                // set bit defers activation to MouseRelease; it does not
+                // disable the item.
                 extended_flags: self.read_int(group_ptr.wrapping_add(60), 2)? as i32,
             });
             tracing::debug!(
@@ -6767,6 +6806,11 @@ impl Vm {
                 let hover_selected_resource =
                     self.read_int(region_ptr.wrapping_add(44), 2)? as i32;
                 let mask_resource = self.read_int(region_ptr.wrapping_add(48), 2)? as i32;
+                // sub_44C110 reads extended source item+0x34 before the
+                // CDspObjVirtual hit query. A nonzero value excludes the
+                // group's already-current item from fresh pointer hits.
+                let current_selection_hit_excluded =
+                    self.read_int(region_ptr.wrapping_add(52), 2)? != 0;
                 let region_flags = self.read_int(region_ptr.wrapping_add(192), 2)? as i32;
                 tracing::debug!(
                     group,
@@ -6781,28 +6825,35 @@ impl Vm {
                     hover_resource,
                     hover_selected_resource,
                     mask_resource,
+                    current_selection_hit_excluded,
                     flags = format_args!("0x{region_flags:08X}"),
                     "read graph input region"
                 );
-                if (width > 0 && height > 0) || normal_resource >= 0 {
-                    descriptor.regions.push(GraphInputRegion {
-                        group: group as i32,
-                        index: index as i32,
-                        ordinal,
-                        enabled_depth,
-                        selected: index as i32 == selected_index,
-                        x,
-                        y,
-                        width,
-                        height,
-                        normal_resource,
-                        selected_resource,
-                        hover_resource,
-                        hover_selected_resource,
-                        mask_resource,
-                        flags: region_flags,
-                    });
-                }
+                // sub_44A900 copies every 196-byte source item into its
+                // internal descriptor before attempting bitmap resolution. A
+                // missing normal bitmap does not erase or renumber the logical
+                // item: the configure-time selected bitmap may be used instead,
+                // and a failed sub_407F20 merely leaves that item's live child
+                // pointer null. Preserve the complete item table here and let
+                // RuntimeTraceApi materialize only the children it can resolve.
+                descriptor.regions.push(GraphInputRegion {
+                    group: group as i32,
+                    index: index as i32,
+                    ordinal,
+                    enabled_depth,
+                    selected: index as i32 == selected_index,
+                    x,
+                    y,
+                    width,
+                    height,
+                    normal_resource,
+                    selected_resource,
+                    hover_resource,
+                    hover_selected_resource,
+                    mask_resource,
+                    current_selection_hit_excluded,
+                    flags: region_flags,
+                });
                 ordinal = ordinal.saturating_add(1);
             }
             // sub_44A900 invalidates the group's configure-time current item
@@ -6849,6 +6900,7 @@ impl Vm {
         let mut descriptor = GraphInputDescriptor {
             initial_group: self.read_int(ptr.wrapping_add(8), 2)? as i32,
             flags,
+            compact_uses_valid_region_origin: true,
             // Base DCIPIcon constructor sub_447990 initializes this[34]=1;
             // the 32-byte compact descriptor has no extended disable field.
             pointer_processing_enabled: true,
@@ -6907,6 +6959,7 @@ impl Vm {
                     hover_resource,
                     hover_selected_resource: -1,
                     mask_resource,
+                    current_selection_hit_excluded: false,
                     flags: region_flags,
                 });
                 ordinal = ordinal.saturating_add(1);
@@ -12966,6 +13019,37 @@ mod tests {
     }
 
     #[test]
+    fn load_sign_extends_target_byte_and_word_widths() {
+        let byte_ptr = 0x2200u32;
+        let word_ptr = 0x2210u32;
+        let mut vm = Vm::new();
+        let mut api = SchedulingApi::default();
+        vm.write_int(byte_ptr, 0, 0xff).unwrap();
+        vm.write_int(word_ptr, 1, 0xffff).unwrap();
+
+        vm.stack.push(Value::Ptr(byte_ptr));
+        vm.dispatch(
+            &test_instruction(0, 0x08, "load", vec![0x08, 0], vec![BpOperand::U8(0)]),
+            &mut api,
+        )
+        .unwrap();
+        assert_eq!(vm.stack.pop(), Some(Value::Int(-1)));
+
+        vm.stack.push(Value::Ptr(word_ptr));
+        vm.dispatch(
+            &test_instruction(2, 0x08, "load", vec![0x08, 1], vec![BpOperand::U8(1)]),
+            &mut api,
+        )
+        .unwrap();
+        assert_eq!(vm.stack.pop(), Some(Value::Int(-1)));
+
+        // cnfgwndsub._bp around decoded file offset 0x17F2 uses load(1)
+        // on a signed index. For -1 the target bitmap expression is
+        // 0x1000 + 0x2C6 + 0x2D - 1 == 0x12F2, not 0x112F2.
+        assert_eq!(0x1000_i32 + 0x2c6 + 0x2d - 1, 0x12f2);
+    }
+
+    #[test]
     fn string_pointer_arithmetic_exposes_shift_jis_bytes_to_load0() {
         let mut vm = Vm::new();
         let mut api = SchedulingApi::default();
@@ -13532,11 +13616,11 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_dimension_metadata_round_trips_through_group_92() {
+    fn bitmap_auxiliary_reference_point_round_trips_through_group_92() {
         let destination = 0x2680u32;
         let bitmap = 43u16;
         let program = BpProgram {
-            script_name: Some("bitmap-dimension-metadata".into()),
+            script_name: Some("bitmap-auxiliary-reference-point".into()),
             functions: Vec::new(),
             strings: Vec::new(),
             instructions: vec![
@@ -13552,14 +13636,14 @@ mod tests {
                     0x01,
                     "push_word",
                     vec![0x01],
-                    vec![BpOperand::U16(640)],
+                    vec![BpOperand::U16(740)],
                 ),
                 test_instruction(
                     0x16,
                     0x01,
                     "push_word",
                     vec![0x01],
-                    vec![BpOperand::U16(360)],
+                    vec![BpOperand::U16(205)],
                 ),
                 test_instruction(0x19, 0x92, "grp3", vec![0x92, 0x12], Vec::new()),
                 test_instruction(
@@ -13588,8 +13672,8 @@ mod tests {
         let report = vm.run(&program, &mut api, &VmRunOptions::default());
 
         assert_eq!(report.stop_reason, VmStopReason::Completed);
-        assert_eq!(vm.read_int(destination, 2).unwrap(), 640);
-        assert_eq!(vm.read_int(destination + 4, 2).unwrap(), 360);
+        assert_eq!(vm.read_int(destination, 2).unwrap(), 740);
+        assert_eq!(vm.read_int(destination + 4, 2).unwrap(), 205);
         assert_eq!(vm.stack, [Value::Int(1), Value::Int(1)]);
     }
 

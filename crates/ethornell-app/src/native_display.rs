@@ -105,7 +105,7 @@ impl Default for CDspObjLayout32 {
             unknown_08: 0,
             suppress_draw: 0,
             unknown_10: 0,
-            draw_enabled: 1,
+            draw_enabled: 0,
             sort_class: 0,
             priority: 0,
             sort_index: 0,
@@ -118,7 +118,9 @@ impl Default for CDspObjLayout32 {
             primary_offset_y: 0,
             secondary_offset_x: 0,
             secondary_offset_y: 0,
-            global_display_offset_enabled: 0,
+            // CDspObj::CDspObj (sub_41A400) calls sub_41ADF0(1).
+            // Individual objects may later change this through property 196.
+            global_display_offset_enabled: 1,
             fixed_position_x_16_16: 0,
             fixed_position_y_16_16: 0,
             fixed_position_z_16_16: 0,
@@ -216,7 +218,12 @@ pub(crate) struct BitmapRegistryEntryLayout32 {
     pub(crate) info_14: u32,                  // +0x18
     pub(crate) unknown_1c: u32,               // +0x1c
     pub(crate) transform_or_orientation: i32, // +0x20
-    pub(crate) unknown_24_to_47: [u8; 0x24],  // +0x24
+    pub(crate) unknown_24: u32,               // +0x24
+    /// CBG/script auxiliary reference point X; sub_401EF0/sub_402440.
+    pub(crate) auxiliary_x: i32,              // +0x28
+    /// CBG/script auxiliary reference point Y; sub_401EF0/sub_402440.
+    pub(crate) auxiliary_y: i32,              // +0x2c
+    pub(crate) unknown_30_to_47: [u8; 0x18],  // +0x30
 }
 
 impl Default for BitmapRegistryEntryLayout32 {
@@ -231,7 +238,10 @@ impl Default for BitmapRegistryEntryLayout32 {
             info_14: 0,
             unknown_1c: 0,
             transform_or_orientation: 0,
-            unknown_24_to_47: [0; 0x24],
+            unknown_24: 0,
+            auxiliary_x: -1,
+            auxiliary_y: -1,
+            unknown_30_to_47: [0; 0x18],
         }
     }
 }
@@ -419,8 +429,12 @@ mod tests {
     #[test]
     fn cdspobj_constructor_fixed_position_gates_match_target() {
         let native = CDspObjLayout32::default();
+        assert_eq!(native.enabled, 1);
+        assert_eq!(native.draw_enabled, 0);
         // CDspObj::CDspObj -> sub_41BEA0(1), sub_41BEB0(0, 0).
         assert_eq!(native.fixed_position_updates_integer_position, 1);
+        // CDspObj::CDspObj -> sub_41ADF0(1).
+        assert_eq!(native.global_display_offset_enabled, 1);
         assert_eq!(native.use_graph_center, 1);
         assert_eq!(native.fixed_position_rounding_enabled, 0);
         assert_eq!(native.fixed_position_rounding_mode, 0);
@@ -439,6 +453,10 @@ mod tests {
             offset_of!(BitmapRegistryEntryLayout32, transform_or_orientation),
             0x20
         );
+        assert_eq!(offset_of!(BitmapRegistryEntryLayout32, auxiliary_x), 0x28);
+        assert_eq!(offset_of!(BitmapRegistryEntryLayout32, auxiliary_y), 0x2c);
+        let bitmap = BitmapRegistryEntryLayout32::default();
+        assert_eq!((bitmap.auxiliary_x, bitmap.auxiliary_y), (-1, -1));
     }
 
     #[test]

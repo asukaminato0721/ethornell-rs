@@ -37,7 +37,7 @@ impl RuntimeTraceApi {
             }
             self.display_tree.register(handle, kind);
             self.graph_object_enabled.insert(handle, true);
-            self.graph_object_draw_enabled.insert(handle, true);
+            self.graph_object_draw_enabled.insert(handle, false);
             self.graph_object_layers.entry(handle).or_default();
             {
                 let properties = self.graph_object_properties.entry(handle).or_default();
@@ -48,7 +48,7 @@ impl RuntimeTraceApi {
                     .named_properties
                     .insert("target-object-mode".to_string(), initial_mode);
                 properties.native.enabled = 1;
-                properties.native.draw_enabled = 1;
+                properties.native.draw_enabled = 0;
             }
             // The concrete constructors pass a per-registry monotonically
             // increasing ECX value to CDspObj::CDspObj; it is not the reusable
@@ -113,6 +113,9 @@ impl RuntimeTraceApi {
     }
 
     fn graph90_set_mode(&mut self, object: i32, mode: i32) {
+        if mode != 5 {
+            self.graph_mode5_render_states.remove(&object);
+        }
         let properties = self.graph_object_properties.entry(object).or_default();
         properties
             .named_properties
@@ -124,6 +127,26 @@ impl RuntimeTraceApi {
             // changes mode, so this is intentionally one-way.
             properties.native.fixed_position_updates_integer_position = 0;
         }
+    }
+
+    /// Begins one of the target CDspObjSprite mode configuration paths.
+    ///
+    /// The native mode constructors rebuild the Sprite's mode-specific state
+    /// before applying the base CDspObj alpha.  In particular, mode 0
+    /// `sub_427410`, mode 2 `sub_427790`, and mode 5 `sub_427170` write
+    /// `Sprite+0x244 = -1` before the subsequent SetAlpha call.  Mode 1
+    /// `sub_4274A0` installs its new selector before `sub_426FA0` applies the
+    /// base alpha directly through `sub_41B620`.
+    ///
+    /// A stale portable `graph_transition_nodes` entry therefore must never
+    /// participate in the alpha setter for a new configuration.  Leaving it
+    /// alive makes an old selector-1 Sprite route `SetAlpha(256)` into the
+    /// transition value instead of the base transparency, producing the
+    /// visible one-frame `opaque -> transparent -> fade in` flash seen on
+    /// title images.
+    fn graph90_begin_sprite_configuration(&mut self, object: i32, mode: i32) {
+        self.graph_transition_nodes.remove(&object);
+        self.graph90_set_mode(object, mode);
     }
 
     fn graph90_require_transparency_parameter(
@@ -186,7 +209,7 @@ impl RuntimeTraceApi {
     }
 
     fn graph90_set_mask_alpha_recursive(&mut self, object: i32, mask_alpha: i32) {
-        let objects = self.display_tree.descendants_inclusive(object);
+        let objects = self.graph_native_descendants_inclusive(object);
         for &object in &objects {
             let properties = self.graph_object_properties.entry(object).or_default();
             properties.mask_alpha = mask_alpha;
@@ -203,7 +226,7 @@ impl RuntimeTraceApi {
     }
 
     pub(super) fn graph90_set_fixed_parameter_raw_recursive(&mut self, object: i32, fixed: i32) {
-        let objects = self.display_tree.descendants_inclusive(object);
+        let objects = self.graph_native_descendants_inclusive(object);
         let mut geometry_refresh = Vec::new();
         for &object in &objects {
             let properties = self.graph_object_properties.entry(object).or_default();
@@ -264,11 +287,44 @@ impl RuntimeTraceApi {
     }
 
     fn graph90_set_alpha_multiplier_recursive(&mut self, object: i32, multiplier: i32) {
-        let objects = self.display_tree.descendants_inclusive(object);
+        let objects = self.graph_native_descendants_inclusive(object);
         for &object in &objects {
-            let properties = self.graph_object_properties.entry(object).or_default();
-            properties.alpha_multiplier = multiplier;
-            properties.native.alpha_multiplier = multiplier;
+            let before = self
+                .graph_object_properties
+                .get(&object)
+                .map(|properties| {
+                    (
+                        properties.alpha_multiplier,
+                        properties.transparency_parameter(),
+                        properties.opacity(),
+                    )
+                })
+                .unwrap_or((256, 0, 1.0));
+            {
+                let properties = self.graph_object_properties.entry(object).or_default();
+                properties.alpha_multiplier = multiplier;
+                properties.native.alpha_multiplier = multiplier;
+            }
+            let after = self
+                .graph_object_properties
+                .get(&object)
+                .map(|properties| {
+                    (
+                        properties.alpha_multiplier,
+                        properties.transparency_parameter(),
+                        properties.opacity(),
+                    )
+                })
+                .unwrap_or((256, 0, 1.0));
+            tracing::info!(
+                object,
+                requested_multiplier = multiplier,
+                before = ?before,
+                after = ?after,
+                native_owner = ?self.graph_native_owners.get(&object),
+                display_parent = ?self.display_tree.parent(object),
+                "GraphObjectAlphaMultiplierChanged"
+            );
         }
         for object in objects {
             let _ = self.graph90_refresh_backf_primary(object);
@@ -1331,11 +1387,13 @@ impl RuntimeTraceApi {
                 properties.native.position_y as f32,
             ));
         let z = properties.native.priority as i32;
-        let enabled = self
-            .graph_object_enabled
-            .get(&object)
-            .copied()
-            .unwrap_or(true);
+        // `RuntimeGraphLayer::enabled` is a host/materialization-local gate.
+        // Native CDspObj visibility is evaluated dynamically by
+        // `object_enabled_for_layer()` from the separate +0x04 enabled and
+        // +0x14 draw-enabled fields. Caching either native gate here makes a
+        // bitmap replacement performed while hidden permanently latch the
+        // materialized layer off until some later rebuild.
+        let layer_enabled = true;
 
         self.display_tree
             .register(object, NativeDisplayKind::Sprite);
@@ -1361,7 +1419,7 @@ impl RuntimeTraceApi {
                 src_y: source.y,
                 opacity: 1.0,
                 z,
-                enabled,
+                enabled: layer_enabled,
                 transform_x: 0.0,
                 transform_y: 0.0,
                 transform_z: 0,
@@ -1380,7 +1438,7 @@ impl RuntimeTraceApi {
         layer.src_x = source.x;
         layer.src_y = source.y;
         layer.z = z;
-        layer.enabled = enabled;
+        layer.enabled = layer_enabled;
         true
     }
 
@@ -1639,6 +1697,9 @@ impl RuntimeTraceApi {
         let Some(mut raw_mode5) = NativeMode5NodeArgs::from_source_args(args) else {
             return false;
         };
+        // A failed rebuild must not leave renderer geometry from an earlier
+        // mode-5 configuration attached to the reusable sprite handle.
+        self.graph_mode5_render_states.remove(&raw_mode5.node_id);
         // Sprite property 0x40 replaces the constructor's integer base offset
         // pair; 0x41 replaces the base rotation and immediately rebuilds mode
         // 5 in the target. Keep the recorded constructor arguments immutable
@@ -1769,6 +1830,13 @@ impl RuntimeTraceApi {
             Some((geometry.x, geometry.y)),
         );
         if synced {
+            self.graph_mode5_render_states.insert(
+                mode5.node_id,
+                RuntimeMode5RenderState {
+                    local_affine_quad: geometry.local_affine_quad,
+                    linear_sampling: mode5.interpolation,
+                },
+            );
             if let Some(layer) = self.graph_layers.get_mut(&mode5.node_id) {
                 if let Some(cache_key) = mode5_cache {
                     layer.key = cache_key;
@@ -1778,10 +1846,21 @@ impl RuntimeTraceApi {
                 layer.scale_x = geometry.width / source.width.max(1.0);
                 layer.scale_y = geometry.height / source.height.max(1.0);
                 layer.rotation_degrees = geometry.rotation_degrees;
-                // The +0x5C/+0x60/+0x64 and +0x6C/+0x70/+0x74 vector
-                // banks were consumed by sub_41B4C0 before projection.
-                layer.transform_x = 0.0;
-                layer.transform_y = 0.0;
+                // Graph91:37/36 (+0x5C..+0x64 / +0x6C..+0x74) were
+                // consumed by sub_41B4C0 before projection. Graph90:37/36 are
+                // different fields: integer CDspObj offset banks at
+                // +0x38/+0x3C and +0x40/+0x44. sub_41B260 adds those *after*
+                // the projected ordinary position, so preserve them as the
+                // renderer translation on every mode-5 resync.
+                let native = self
+                    .graph_object_properties
+                    .get(&mode5.node_id)
+                    .map(|properties| properties.native)
+                    .unwrap_or_default();
+                layer.transform_x =
+                    native.primary_offset_x.saturating_add(native.secondary_offset_x) as f32;
+                layer.transform_y =
+                    native.primary_offset_y.saturating_add(native.secondary_offset_y) as f32;
                 layer.transform_z = 0;
             }
             let properties = self
@@ -2145,7 +2224,25 @@ impl RuntimeTraceApi {
                     return Some(Err(error));
                 }
                 self.graph90_set_offset_recursive(object, id, x, y);
-                tracing::debug!(object, x, y, selector = id, "GraphSetObjectOffset");
+                let native = self
+                    .graph_object_properties
+                    .get(&object)
+                    .map(|properties| properties.native)
+                    .unwrap_or_default();
+                let world_state = self.graph_layers.get(&object).map(|layer| {
+                    let (world_x, world_y, world_z) = self.layer_world_transform(object, layer);
+                    (world_x, world_y, world_z)
+                });
+                tracing::info!(
+                    object,
+                    x,
+                    y,
+                    selector = id,
+                    primary_offset = ?(native.primary_offset_x, native.primary_offset_y),
+                    secondary_offset = ?(native.secondary_offset_x, native.secondary_offset_y),
+                    ?world_state,
+                    "GraphSetObjectOffset"
+                );
                 ethornell_vm::Value::None
             }
             (0x90, 0x39) => {
@@ -2490,7 +2587,11 @@ impl RuntimeTraceApi {
                     512,
                     GRAPH90_CLASS_SPRITE,
                     NativeDisplayKind::Sprite,
-                    -1,
+                    // CDspObjSprite::CDspObjSprite (sub_4256C0) initializes
+                    // Sprite+0x134 / a2[77] to mode 0. A fresh Sprite must
+                    // therefore accept Graph90:57 primary replacement through
+                    // the mode-0 path even before a full 90:56 configure.
+                    0,
                 );
                 tracing::info!(sprite = handle, "GraphCreateSpriteObject");
                 ethornell_vm::Value::Int(handle)
@@ -2531,7 +2632,14 @@ impl RuntimeTraceApi {
                         512,
                         GRAPH90_CLASS_SPRITE,
                     ) {
-                        self.graph90_set_enabled(*handle, *enabled != 0);
+                        // Tayutama2_trial_TG.exe: 0x47C1F0 -> sub_462540
+                        // -> sub_43EE70. The latter dispatches Sprite
+                        // vtable+0x04, i.e. CDspObj::SetDrawEnabled
+                        // (sub_41AE00, field +0x14). This is the same virtual
+                        // used by generic Graph90:30 and by CDspObjKnob's
+                        // Graph90:D4 forwarding path. It is NOT the separate
+                        // CDspObj enabled field changed by Graph90:31.
+                        self.set_graph_object_draw_enabled(*handle, *enabled != 0);
                         self.graph90_record_call(*handle, id, &args);
                     }
                 }
@@ -2546,10 +2654,19 @@ impl RuntimeTraceApi {
                         512,
                         GRAPH90_CLASS_SPRITE,
                     ) {
-                        self.graph_object_properties
-                            .entry(*handle)
-                            .or_default()
-                            .format_resource = (*bitmap != -1).then_some(*bitmap);
+                        let properties = self.graph_object_properties.entry(*handle).or_default();
+                        // Target sub_43ED20 -> sub_427F80 stores an independent
+                        // auxiliary bitmap at Sprite+0x13C and generation at
+                        // +0x140. It never overwrites the mode's primary bitmap
+                        // at Sprite+0x150.
+                        properties.aux_resource = (*bitmap != -1).then_some(*bitmap);
+                        tracing::info!(
+                            sprite = *handle,
+                            bitmap = *bitmap,
+                            primary = ?properties.format_resource,
+                            aux = ?properties.aux_resource,
+                            "GraphSetSpriteAuxBitmap"
+                        );
                         self.graph90_record_call(*handle, id, &args);
                     }
                 }
@@ -2566,7 +2683,7 @@ impl RuntimeTraceApi {
                     )
                     && self.resource_image_region(args[3]).is_some()
                 {
-                    self.graph90_set_mode(args[0], 0);
+                    self.graph90_begin_sprite_configuration(args[0], 0);
                     self.graph90_set_common_state(
                         args[0],
                         Some((args[1], args[2])),
@@ -2578,13 +2695,16 @@ impl RuntimeTraceApi {
                         .entry(args[0])
                         .or_default()
                         .format_resource = Some(args[3]);
-                    self.graph_transition_nodes.remove(&args[0]);
                     let configured = self.graph90_sync_sprite_primary_layer(
                         args[0],
                         args[3],
                         Some((args[1] as f32, args[2] as f32)),
                     );
                     let layer = self.graph_layers.get(&args[0]);
+                    let effective_opacity = self
+                        .graph_object_properties
+                        .get(&args[0])
+                        .map(RuntimeGraphObjectProperties::opacity);
                     tracing::info!(
                         sprite = args[0],
                         x = args[1],
@@ -2592,6 +2712,7 @@ impl RuntimeTraceApi {
                         primary = args[3],
                         blend_mode = args[4],
                         alpha_parameter = args[5],
+                        ?effective_opacity,
                         priority = args[6],
                         configured,
                         layer_x = ?layer.map(|layer| layer.x),
@@ -2780,6 +2901,29 @@ impl RuntimeTraceApi {
                         .graph_layers
                         .get(object)
                         .is_some_and(|layer| self.should_draw_graph_layer(*object, layer));
+                    let bitmap_format = self.bitmap_formats.get(primary_bitmap).copied();
+                    let bitmap_alpha = self.graph_bitmap_image(*primary_bitmap).map(|image| {
+                        let nonzero = image
+                            .rgba
+                            .chunks_exact(4)
+                            .filter(|pixel| pixel[3] != 0)
+                            .count();
+                        let max = image
+                            .rgba
+                            .chunks_exact(4)
+                            .map(|pixel| pixel[3])
+                            .max()
+                            .unwrap_or_default();
+                        (nonzero, max)
+                    });
+                    let effective_opacity = self
+                        .graph_object_properties
+                        .get(object)
+                        .map(RuntimeGraphObjectProperties::opacity);
+                    let ignore_source_alpha = self
+                        .graph_layers
+                        .get(object)
+                        .is_some_and(|layer| self.graph_layer_ignores_source_alpha(*object, layer));
                     tracing::info!(
                         object = *object,
                         mode,
@@ -2789,10 +2933,15 @@ impl RuntimeTraceApi {
                         bitmap_valid,
                         replaced,
                         ?layer_state,
+                        native_position = ?self.graph_native_base_position(*object),
                         owner = ?self.graph_native_owners.get(object),
                         parent = ?self.display_tree.parent(*object),
                         chain_drawable,
                         draw_eligible,
+                        ?bitmap_format,
+                        ?bitmap_alpha,
+                        ?effective_opacity,
+                        ignore_source_alpha,
                         "GraphReplaceSpritePrimaryBitmap"
                     );
                     if replaced {
@@ -2812,7 +2961,7 @@ impl RuntimeTraceApi {
                         GRAPH90_CLASS_SPRITE,
                     )
                 {
-                    self.graph90_set_mode(args[0], 1);
+                    self.graph90_begin_sprite_configuration(args[0], 1);
                     self.graph90_set_common_state(
                         args[0],
                         Some((args[1], args[2])),
@@ -2878,7 +3027,7 @@ impl RuntimeTraceApi {
                         GRAPH90_CLASS_SPRITE,
                     )
                 {
-                    self.graph90_set_mode(args[0], 2);
+                    self.graph90_begin_sprite_configuration(args[0], 2);
                     self.graph90_set_common_state(
                         args[0],
                         Some((args[1], args[2])),
@@ -2907,7 +3056,6 @@ impl RuntimeTraceApi {
                             .named_properties
                             .insert("mode2-raster-mode-flag".to_string(), args[9]);
                     }
-                    self.graph_transition_nodes.remove(&args[0]);
                     let configured = self.graph90_sync_mode2_primary_layer(&args);
                     let layer = self.graph_layers.get(&args[0]);
                     tracing::info!(
@@ -2946,7 +3094,7 @@ impl RuntimeTraceApi {
                         GRAPH90_CLASS_SPRITE,
                     )
                 {
-                    self.graph90_set_mode(args[0], 3);
+                    self.graph90_begin_sprite_configuration(args[0], 3);
                     self.graph90_set_common_state(
                         args[0],
                         Some((args[1], args[2])),
@@ -2966,7 +3114,6 @@ impl RuntimeTraceApi {
                     properties
                         .named_properties
                         .insert("mode3-fixed-parameter".to_string(), args[6]);
-                    self.graph_transition_nodes.remove(&args[0]);
                     self.graph90_sync_mode3_primary_layer(&args);
                     self.graph90_record_call(args[0], id, &args);
                 }
@@ -2982,7 +3129,7 @@ impl RuntimeTraceApi {
                         GRAPH90_CLASS_SPRITE,
                     )
                 {
-                    self.graph90_set_mode(args[0], 4);
+                    self.graph90_begin_sprite_configuration(args[0], 4);
                     self.graph90_set_common_state(
                         args[0],
                         Some((args[1], args[2])),
@@ -3003,7 +3150,6 @@ impl RuntimeTraceApi {
                     properties
                         .named_properties
                         .insert("mode4-record-pointer".to_string(), args[6]);
-                    self.graph_transition_nodes.remove(&args[0]);
                     self.graph90_sync_mode4_primary_layer(&args);
                     self.graph90_record_call(args[0], id, &args);
                 }
@@ -3019,7 +3165,7 @@ impl RuntimeTraceApi {
                         GRAPH90_CLASS_SPRITE,
                     )
                 {
-                    self.graph90_set_mode(args[0], 5);
+                    self.graph90_begin_sprite_configuration(args[0], 5);
                     self.graph90_set_fixed_common_state(
                         args[0],
                         args[1],
@@ -3058,7 +3204,6 @@ impl RuntimeTraceApi {
                             value,
                         );
                     }
-                    self.graph_transition_nodes.remove(&args[0]);
                     let configured = self.graph90_sync_mode5_primary_layer(&args);
                     let primary_size = self
                         .resource_image_region(args[4])
@@ -3109,6 +3254,34 @@ impl RuntimeTraceApi {
                                 .get("mode5-cache-max-alpha")
                                 .copied()
                         });
+                    let property_40 = self
+                        .graph_object_properties
+                        .get(&args[0])
+                        .and_then(|properties| properties.properties.get(&0x40).copied());
+                    let global_offset_gate = self
+                        .graph_object_properties
+                        .get(&args[0])
+                        .map(|properties| properties.native.global_display_offset_enabled)
+                        .unwrap_or_default();
+                    let world_state = self.graph_layers.get(&args[0]).map(|layer| {
+                        let (x, y, z) = self.layer_world_transform(args[0], layer);
+                        (x, y, z)
+                    });
+                    let origin_offset = self
+                        .graph_object_properties
+                        .get(&args[0])
+                        .map(|properties| {
+                            (
+                                properties
+                                    .named_properties
+                                    .get("mode5-origin-offset-x")
+                                    .copied(),
+                                properties
+                                    .named_properties
+                                    .get("mode5-origin-offset-y")
+                                    .copied(),
+                            )
+                        });
                     tracing::info!(
                         sprite = args[0],
                         x_16_16 = args[1],
@@ -3118,6 +3291,18 @@ impl RuntimeTraceApi {
                         secondary = args[5],
                         transition_value = args[6],
                         secondary_parameter = args[7],
+                        constructor_base_x = args[8],
+                        constructor_base_y = args[9],
+                        rotation_16_16 = args[10],
+                        perspective = args[11],
+                        project_position = args[12],
+                        transform_parameter_3 = args[13],
+                        ?property_40,
+                        graph_center = ?self.graph_config.center,
+                        global_display_offset = ?self.graph_global_offset,
+                        global_offset_gate,
+                        ?origin_offset,
+                        ?world_state,
                         ?primary_size,
                         alpha_parameter = args[15],
                         priority = args[16],
@@ -3147,7 +3332,7 @@ impl RuntimeTraceApi {
                         GRAPH90_CLASS_SPRITE,
                     )
                 {
-                    self.graph90_set_mode(args[0], 6);
+                    self.graph90_begin_sprite_configuration(args[0], 6);
                     self.graph90_set_fixed_common_state(
                         args[0],
                         args[1],
@@ -3183,7 +3368,6 @@ impl RuntimeTraceApi {
                             value,
                         );
                     }
-                    self.graph_transition_nodes.remove(&args[0]);
                     let configured = self.graph90_sync_mode6_primary_layer(&args);
                     let primary_size = self
                         .resource_image_region(args[4])

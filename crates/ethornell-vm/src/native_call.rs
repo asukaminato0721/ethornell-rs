@@ -4028,17 +4028,17 @@ const GRAPH92_GET_TEXT_OUTPUT_PAIR_PARAMETERS: &[NativeParameterSpec] = &[
 const GRAPH92_RENDER_TEXT_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "target",
-        kind: "bitmap/text target handle",
-        description: "Destination validated before native rendering.",
+        kind: "writable bitmap handle",
+        description: "Destination bitmap descriptor validated before native rasterization.",
     },
     NativeParameterSpec {
         name: "x",
         kind: "in/out i32",
-        description: "Initial X and returned cursor basis.",
+        description: "Initial X; target publishes the resulting cursor X through the output pair.",
     },
     NativeParameterSpec {
         name: "y",
-        kind: "i32",
+        kind: "in/out i32",
         description: "Initial Y and second output-pair component.",
     },
     NativeParameterSpec {
@@ -4047,44 +4047,44 @@ const GRAPH92_RENDER_TEXT_PARAMETERS: &[NativeParameterSpec] = &[
         description: "Primary text converted by sub_48DF50.",
     },
     NativeParameterSpec {
-        name: "argument_04",
-        kind: "i32",
-        description: "Native render operand.",
+        name: "packed_rgb",
+        kind: "packed 0xRRGGBB",
+        description: "Primary text color; zero is a valid black color.",
     },
     NativeParameterSpec {
         name: "argument_05",
         kind: "i32",
-        description: "Native render operand.",
+        description: "Native render operand forwarded to sub_434BA0.",
     },
     NativeParameterSpec {
         name: "auxiliary_text",
-        kind: "script string",
+        kind: "nullable script string",
         description: "Second pointer converted by sub_48DF50.",
     },
     NativeParameterSpec {
-        name: "argument_07",
-        kind: "i32",
-        description: "Native render operand.",
+        name: "secondary_packed_rgb",
+        kind: "packed 0xRRGGBB/i32",
+        description: "Secondary native text/style color operand.",
     },
     NativeParameterSpec {
         name: "argument_08",
         kind: "i32",
-        description: "Native render operand.",
-    },
-    NativeParameterSpec {
-        name: "argument_09",
-        kind: "i32",
-        description: "Native render operand.",
-    },
-    NativeParameterSpec {
-        name: "argument_10",
-        kind: "i32",
-        description: "Native render operand.",
+        description: "Native validation/render operand.",
     },
     NativeParameterSpec {
         name: "font_size",
+        kind: "i32 pixels",
+        description: "Source argument 9; paired with horizontal scale by sub_4035A0.",
+    },
+    NativeParameterSpec {
+        name: "horizontal_scale_percent",
+        kind: "i32 percent",
+        description: "Source argument 10 paired with font_size by sub_4035A0.",
+    },
+    NativeParameterSpec {
+        name: "argument_11",
         kind: "i32",
-        description: "Target native font-size operand.",
+        description: "Native render operand; this is not the font-size argument.",
     },
     NativeParameterSpec {
         name: "argument_12",
@@ -4093,8 +4093,8 @@ const GRAPH92_RENDER_TEXT_PARAMETERS: &[NativeParameterSpec] = &[
     },
     NativeParameterSpec {
         name: "character_spacing",
-        kind: "i32",
-        description: "Portable advance approximation input.",
+        kind: "i32 pixels",
+        description: "Character advance spacing forwarded into the target text layout path.",
     },
     NativeParameterSpec {
         name: "argument_14",
@@ -4102,29 +4102,29 @@ const GRAPH92_RENDER_TEXT_PARAMETERS: &[NativeParameterSpec] = &[
         description: "Native render operand.",
     },
     NativeParameterSpec {
-        name: "style_0",
-        kind: "i32",
-        description: "Input to sub_434E30.",
+        name: "style_mode",
+        kind: "i32 0..2",
+        description: "First sub_434E30 style field; zero clears the style block.",
     },
     NativeParameterSpec {
-        name: "packed_rgb",
-        kind: "packed RGB",
-        description: "Text color operand.",
+        name: "style_x_percent",
+        kind: "i32 0..100",
+        description: "Second sub_434E30 style field.",
     },
     NativeParameterSpec {
-        name: "style_2",
-        kind: "i32",
-        description: "Input to sub_434E30.",
+        name: "style_y_percent",
+        kind: "i32 0..100",
+        description: "Third sub_434E30 style field.",
     },
     NativeParameterSpec {
-        name: "style_3",
+        name: "style_color_or_parameter",
         kind: "i32",
-        description: "Input to sub_434E30.",
+        description: "Fourth sub_434E30 style field.",
     },
     NativeParameterSpec {
-        name: "style_4",
-        kind: "i32",
-        description: "Input to sub_434E30.",
+        name: "style_alpha_or_concentration",
+        kind: "i32 0..256",
+        description: "Fifth sub_434E30 style field.",
     },
     NativeParameterSpec {
         name: "ignored",
@@ -5542,34 +5542,34 @@ const GRAPH90_CONFIGURE_SPRITE_TRANSFORM_MODE5_PARAMETERS: &[NativeParameterSpec
         description: "Stored beside the optional secondary bitmap, or forced to -1 when absent.",
     },
     NativeParameterSpec {
-        name: "fixed_parameter_x",
-        kind: "i32 converted to 16.16",
-        description: "Mode-5 fixed-point field.",
+        name: "bitmap_origin_x",
+        kind: "i32 source coordinate converted to 16.16",
+        description: "Source-space X origin/anchor stored at CDspObjSprite+0x284. sub_4258D0 passes it to sub_417730/sub_416750.",
     },
     NativeParameterSpec {
-        name: "fixed_parameter_y",
-        kind: "i32 converted to 16.16",
-        description: "Mode-5 fixed-point field.",
+        name: "bitmap_origin_y",
+        kind: "i32 source coordinate converted to 16.16",
+        description: "Source-space Y origin/anchor stored at CDspObjSprite+0x288. This field is independent of bitmap-registry +0x28/+0x2C; any script use of the CBG reference point reaches it explicitly through the bitmap query/configuration path.",
     },
     NativeParameterSpec {
-        name: "transform_parameter_0",
-        kind: "i32 target transform field",
-        description: "Mode-5 transform input.",
+        name: "rotation_16_16",
+        kind: "signed 16.16 degrees",
+        description: "Rotation stored at CDspObjSprite+0x28C and consumed by sub_429220 and sub_416750.",
     },
     NativeParameterSpec {
-        name: "transform_parameter_1",
-        kind: "i32 target transform field",
-        description: "Mode-5 transform input.",
+        name: "perspective",
+        kind: "positive i32 projection distance",
+        description: "Projection distance stored at CDspObjSprite+0x278; sub_41AAA0 combines it with Z to derive the 16.16 scale.",
     },
     NativeParameterSpec {
-        name: "transform_parameter_2",
-        kind: "i32 target transform field",
-        description: "Mode-5 transform input.",
+        name: "project_position",
+        kind: "bool i32",
+        description: "CDspObjSprite+0x27C gate. Nonzero makes sub_429AF0 perspective-project X/Y by the Z-derived scale before resolving ordinary object position.",
     },
     NativeParameterSpec {
-        name: "transform_parameter_3",
-        kind: "i32 target transform field",
-        description: "Mode-5 transform input.",
+        name: "interpolation",
+        kind: "bool i32",
+        description: "CDspObjSprite+0x280 sampling selector passed by case-5 drawing to sub_417730: 0 selects nearest (sub_418280), nonzero selects bilinear (sub_417C50).",
     },
     NativeParameterSpec {
         name: "blend_mode",
@@ -8725,7 +8725,7 @@ const GRAPH91_EXTENDED_ICON_CONFIGURE_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "descriptor",
         kind: "readable BP pointer",
-        description: "Extended 40/64/196-byte root/group/item tree. Root +0x14 suppresses physical action bits, +0x18 selects action-map mode 0..7, and +0x20 nonzero disables pointer processing. Group +0x0C current item, +0x14 selection enable, +0x18 pointer-selection enable, +0x1C held mouse-left action reinjection, +0x20 exclusion key, +0x3C flags (bit 0x02 blocks activation). Item +0x20 normal, +0x24 hover, +0x28 selected, +0x2C hover+selected, +0x30 auxiliary, +0xC0 flags (bit 0x20 blocks activation).",
+        description: "Extended 40/64/196-byte root/group/item tree. Root +0x14 suppresses physical action bits, +0x18 selects action-map mode 0..7, and +0x20 nonzero disables pointer processing. Group +0x0C current item, +0x14 selection enable, +0x18 pointer-selection enable, +0x1C held mouse-left action reinjection, +0x20 exclusion key, +0x3C flags (bit 0x02 selects release-time activation). Item +0x20 normal, +0x24 hover, +0x28 selected, +0x2C hover+selected, +0x30 auxiliary, +0xC0 flags (bit 0x20 also selects release-time activation). When either timing bit is set, sub_44C6F0 returns false on MouseDown; sub_448690 stores the hit in DCIPIcon+0x90 and activates on MouseRelease if the pointer remains over the same item. These bits do not disable the item.",
     },
 ];
 const GRAPH91_EXTENDED_ICON_ITEM_STATE_PARAMETERS: &[NativeParameterSpec] = &[
@@ -9130,14 +9130,14 @@ const GRAPH92_BITMAP_AUXILIARY_PAIR_PARAMETERS: &[NativeParameterSpec] = &[
         description: "Descriptor whose auxiliary DWORD pair is updated.",
     },
     NativeParameterSpec {
-        name: "first",
+        name: "reference_x",
         kind: "i32",
-        description: "Descriptor DWORD at target offset +0x28.",
+        description: "Auxiliary reference-point X stored at target bitmap-registry offset +0x28.",
     },
     NativeParameterSpec {
-        name: "second",
+        name: "reference_y",
         kind: "i32",
-        description: "Descriptor DWORD at target offset +0x2C.",
+        description: "Auxiliary reference-point Y stored at target bitmap-registry offset +0x2C.",
     },
 ];
 const GRAPH92_REPLACE_BITMAP_COLOR_PARAMETERS: &[NativeParameterSpec] = &[
@@ -9165,7 +9165,7 @@ const GRAPH92_GET_BITMAP_AUXILIARY_PAIR_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "destination_pair",
         kind: "BP pointer to 2 DWORDs",
-        description: "Receives descriptor offsets +0x28 and +0x2C.",
+        description: "Receives auxiliary reference-point X/Y from bitmap-registry offsets +0x28/+0x2C.",
     },
     NativeParameterSpec {
         name: "bitmap",
@@ -14457,7 +14457,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: NO_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target handler 0x004894B0 posts WM_CLOSE to the parent window.",
+        notes: "Target handler 0x004894B0 calls PostMessageA(hWndParent, WM_CLOSE, 0, 0). Portable frontends defer the host close request until the current scheduler pass returns, then apply the Sys80:68 native-close-mode gate so intercepted closes enter sysmsg._bp as [2,0,0] instead of quitting immediately.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::SYS_TERMINATE_INTERPRETER,
@@ -15084,7 +15084,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_LOAD_BITMAP_PARAMETERS,
         returns: "procedure completion",
         scheduling: NativeSchedulingEffect::WaitProcedure,
-        notes: "Target uses a synchronous cache hit path or installs CProcLoadBitmap and returns native scheduler status 2.",
+        notes: "Target uses a synchronous cache hit path or installs CProcLoadBitmap and returns native scheduler status 2. CBG native bitmap format is selected from bpp plus header subtype by sub_401C10; decoded 24-bpp CBGs become format 1 through the sub_469EE0 subtype-7 rewrite and sub_407DA0 normalization. Cache/preload paths preserve the recovered native format when pixels are later bound to a bitmap handle.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CREATE_BITMAP,
@@ -15148,7 +15148,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_BLIT_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_479C70 validates both handles and selector/parameter ranges before sub_402720 clips and blits. Source order is (destination, x, y, source, mode, parameter). Missing destination/source and incompatible formats enter the target VM error path; formats 1 and 2 are mutually compatible. For same-format selector 128, sub_40AF50 -> sub_40ADF0 performs a raw clipped pixel replacement rather than source-over. For format-2 selector 1, sub_40B200 performs straight-alpha source-over and normalizes RGB by the resulting alpha coverage.",
+        notes: "sub_479C70 validates both handles and selector/parameter ranges before sub_402720 clips and blits. Source order is (destination, x, y, source, mode, parameter). Missing destination/source and incompatible formats enter the target VM error path; formats 1 and 2 are mutually compatible. For selector 128, sub_40AF50 uses sub_40ADF0 for same-format raw clipped replacement; format-1 RGB copied into format-2 preserves RGB and forces alpha to 255 rather than treating the format-1 fourth byte as source alpha. For format-2 selector 1, sub_40B200 performs straight-alpha source-over and normalizes RGB by the resulting alpha coverage.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SYNTHESIZE_BITMAP,
@@ -15356,7 +15356,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_SET_OBJECT_HIT_MASK_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target builds or clears the CDspObj hit mask and reports distinct missing-object/missing-bitmap errors.",
+        notes: "Target sub_47B4B0 -> sub_462050 -> sub_443A40 builds or clears CDspObj's independent 1-bit hit mask through sub_41BC70 and reports distinct missing-object/missing-bitmap errors. This hit-mask slot is separate from every Sprite/Background primary display bitmap and must not replace the rendered resource.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_HIT_TEST_OBJECT_AT_POINTER,
@@ -15512,7 +15512,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_SPRITE_ENABLED,
-        symbol: "Graph90_54_SetSpriteEnabled",
+        symbol: "Graph90_54_SetSpriteDrawEnabled",
         parameters: GRAPH90_SET_SPRITE_ENABLED_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
@@ -15524,7 +15524,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_SET_SPRITE_AUX_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47C230/sub_462520 installs or clears the sprite auxiliary bitmap and validates descriptor format.",
+        notes: "Target sub_47C230 -> sub_462520 -> sub_43ED20 -> sub_427F80 installs or clears the independent CDspObjSprite auxiliary bitmap at Sprite+0x13C (generation +0x140), accepting native bitmap formats 2/3. It does not overwrite the mode primary bitmap at Sprite+0x150; successful changes invalidate/redraw an already-drawable Sprite.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CONFIGURE_SPRITE_SINGLE_BITMAP,
@@ -15532,7 +15532,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CONFIGURE_SPRITE_SINGLE_BITMAP_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47C2D0/sub_462370 configures sprite mode 0 with one bitmap and common display state.",
+        notes: "Target sub_47C2D0/sub_462370 -> sub_43E690/sub_426F50 configures sprite mode 0 with one bitmap and common display state. sub_427410 rebuilds the mode first and writes Sprite+0x244=-1 before sub_426F50 invokes virtual SetAlpha, so the supplied alpha_parameter always becomes base CDspObj transparency rather than being routed through a stale mode-1 transition selector. Title fade-in calls use alpha_parameter=256 as an already-invisible initial state before their later control animates transparency toward zero.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_REPLACE_SPRITE_BITMAP,
@@ -15580,7 +15580,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CONFIGURE_SPRITE_TRANSFORM_MODE5_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47CC10/sub_462460 configures sprite mode 5. The first three values are signed 16.16 X/Y/Z written through CDspObj vtable+60, not raster pixels. sub_427AA0 builds projected bounds; sub_429AF0 derives the ordinary pixel position from display_width/2,display_height/2 or the validated Graph90:06 centre (when CDspObj+0x100 is enabled), plus the resolved fixed-point vector; sub_4281E0 then subtracts the mode-5 raster-origin offsets before drawing. With a secondary bitmap, sub_428E70 resolves both same-format descriptors and sub_40C0F0 materializes the dual-bitmap cache used by case-5 drawing; the renderer must not draw only the primary. secondary_parameter==3 couples CDspObjSprite::SetFixedParameter (sub_428470) to transition +0x240: the unsigned high word of CDspObj+0xB8 becomes the current 0..=256 transition value and the cache is rebuilt. The remaining fields select transform state, blend, transparency, and priority.",
+        notes: "Target sub_47CC10/sub_462460 configures sprite mode 5. The first three values are signed 16.16 X/Y/Z written through CDspObj vtable+60, not raster pixels. args 8/9 are the source-space bitmap origin, arg 10 is signed 16.16-degree rotation, arg 11 is the perspective distance, arg 12 gates perspective projection of X/Y, and arg 13 selects nearest (0) versus bilinear (nonzero) sampling. sub_427AA0/sub_429220 build only the inclusive raster bounding rectangle; case 5 of sub_4258D0 clips that rectangle, adds Sprite+0x2A4/+0x2A8 fractional object position, and sub_417730/sub_416750 inverse-map each destination pixel into the source bitmap. Therefore a renderer must not stretch/rotate the raster bbox as an ordinary quad. sub_429AF0 derives the ordinary pixel position from display_width/2,display_height/2 or the validated Graph90:06 centre, and sub_4281E0 subtracts the raster-origin offsets. With a secondary bitmap, sub_428E70/sub_40C0F0 materialize the same-format dual-bitmap cache. secondary_parameter==3 couples CDspObjSprite::SetFixedParameter to transition +0x240.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CONFIGURE_SPRITE_TRANSFORM_MODE6,
@@ -15700,7 +15700,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CREATE_WINDOW_OBJECT_PARAMETERS,
         returns: "0xB0000000-tagged window handle; target errors on invalid dimensions or exhausted 16-slot pool",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47DAC0 -> sub_4405B0 constructs CDspObjWindow. Values below 32 are multiplied by 32; final dimensions are bounded to width<=1920 and height<=32768. sub_42AE20 uses CDspObj sort_class=3 and the window registry supplies a monotonic construction index at CDspObj+0x20, independent of the reusable 0xB0000000 handle slot.",
+        notes: "Target sub_47DAC0 -> sub_4405B0 constructs CDspObjWindow. Values below 32 are multiplied by 32; final dimensions are bounded to width<=1920 and height<=32768. sub_42AE20 uses CDspObj sort_class=3 and the window registry supplies a monotonic construction index at CDspObj+0x20, independent of the reusable 0xB0000000 handle slot. Before returning, sub_42AE20 calls sub_41B600(window, 1) and sub_41B620(window, 0): a new Window is draw-enabled with zero transparency and does not require Graph90:84 to become drawable.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_RELEASE_WINDOW_OBJECT,
@@ -15748,7 +15748,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_SET_WINDOW_VALID_REGION_PARAMETERS,
         returns: "void; target errors when the inclusive rectangle exceeds the window",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target sub_47DE90 builds (x,y,x+width-1,y+height-1); sub_42B900 validates and stores the four coordinates at CDspObjWindow+416..+428.",
+        notes: "Target sub_47DE90 builds the inclusive rectangle (x,y,x+width-1,y+height-1); sub_42B900 validates and stores it at CDspObjWindow+0x1A0..+0x1AC. It is a Window valid/content rectangle, not a bitmap source crop. sub_42C2A0 returns the same fields and compact DCIPIcon sub_447C10 adds their left/top to compact item offsets.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_GET_WINDOW_VALID_REGION,
@@ -15924,7 +15924,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_ICON_LAYOUT_PARAMETERS,
         returns: "status 0,1,2,3",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target validates the window, copies a compact nested DCIPIcon descriptor, and applies it immediately.",
+        notes: "Target validates the window, copies a compact nested DCIPIcon descriptor, and applies it immediately. sub_447C10 queries sub_42C2A0 and creates each compact child Sprite at (window_valid.left + item.x, window_valid.top + item.y); hover/selected bitmap changes must preserve that resolved position.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_APPLY_ICON_INPUT_LAYOUT_EX,
@@ -15932,7 +15932,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_ICON_LAYOUT_PARAMETERS,
         returns: "status 0,1,2,3",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target uses the extended 40-byte root, 64-byte groups and 196-byte item records.",
+        notes: "Target uses the extended 40-byte root, 64-byte groups and 196-byte item records. Extended constructor sub_44A900 uses item x/y directly and, unlike compact sub_447C10, does not add the Window valid-region origin.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CREATE_ICON_INPUT_PROCESSOR,
@@ -15948,7 +15948,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_ICON_PROCESSOR_HANDLE_PARAMETER,
         returns: "one when released",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target resolves and removes the dynamic registry object.",
+        notes: "Target sub_46C4F0 resolves and removes exactly one dynamic processor object. Base destruction reaches DCIPIcon::~DCIPIcon/sub_447B10, which releases that processor's own per-item child/Virtual table and window attachment through sub_44A050 and sub_41AC40. The table belongs to the processor, not globally to the referenced Window, so releasing one of two processors sharing a Window must preserve the other's children. Newly constructed LoadProgramEx CThreads first execute on the next scheduler pass; only explicit status-3 thread switches are immediate, so presentation filtering must not be implemented by eagerly running new CThreads in their creation pass.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CONFIGURE_ICON_INPUT_PROCESSOR,
@@ -15956,7 +15956,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CONFIGURE_ICON_PROCESSOR_PARAMETERS,
         returns: "status 0..=4",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "Target rejects invalid handles and the extended variant, parses the compact descriptor, then configures the base DCIPIcon object.",
+        notes: "Target rejects invalid handles and the extended variant, parses the compact descriptor, then configures the base DCIPIcon object. sub_447C10 keeps a processor-owned 20-byte live-item table. For each resolvable configure-time normal/selected bitmap it creates a CDspObjVirtual hit wrapper, sizes it through sub_41AB10 from the sub_407F20 bitmap descriptor width/height, and attaches it at Window-valid-origin + item x/y. sub_4495C0 hit-tests that Virtual final rectangle directly; renderer clipping is not an extra hit gate. Multiple DCIPIcon processors referencing one Window keep independent child tables. Compact root +0x14 becomes DCIPIcon+0x48 (physical-input suppression mask) and +0x18 becomes DCIPIcon+0x4C (action-map selector & 7). During sub_4485A0/sub_448690, sub_46DF00 obtains input through destructive sub_46DB40 descriptor reads; an icon-owned action-1 MouseDown is therefore consumed before a later CProcDspMsg input query and must not be replayed as a message-advance edge.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_GET_ICON_INPUT_STATE,
@@ -16092,7 +16092,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_CREATE_KNOB_PARAMETERS,
         returns: "0xF0000000 tagged knob handle",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_463400 allocates one of 32 CDspObjKnob slots, rejects owned/virtual targets and sub_4636A0 inserts the knob into priority order. sub_420EC0 uses CDspObj sort_class=10 (base key clamps classes >=8 to 7) and a monotonic knob construction index; CDspObjKnob::vtable+0x1C (sub_421090) delegates the manager sort key to the controlled target rather than using its own base key.",
+        notes: "sub_463400/sub_442100 resolve any valid target CDspObj and allocate one of 32 CDspObjKnob slots; the target may already belong to a member chain and multiple Knobs may reference it. sub_420EC0 stores only a raw target pointer at Knob+0x134, copies target mask-alpha/transparency/priority, queries the target rectangle through vtable+0x20 and initializes the Knob range to that exact width/height through sub_421200, inherits the target raw vtable+0x30 position, and aligns the target through sub_421430. The target is not a Knob member. sub_4636A0 inserts the Knob into priority order; vtable+0x1C/sub_421090 delegates the live sort key to the controlled target.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_RELEASE_KNOB_OBJECT,
@@ -16108,7 +16108,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_KNOB_ENABLED_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_4422B0 invokes the knob enable virtual and invalidates on state change.",
+        notes: "sub_4422B0 reaches CDspObjKnob vtable+4/sub_4210E0. It changes draw visibility and forwards the identical value to the controlled display object; this is not the separate CDspObj enabled field.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_KNOB_BASE_POSITION,
@@ -16116,7 +16116,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_KNOB_PAIR_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_442320 invokes the generic display-object position virtual on CDspObjKnob.",
+        notes: "sub_442320 invokes Knob vtable+0x2C/sub_421110 -> sub_41B1B0; virtual +0x28 dispatch then enters sub_421120, updating the Knob base and moving the controlled target through the target position virtual to base plus the current logical slider offset.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_KNOB_POSITION,
@@ -16124,7 +16124,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_KNOB_PAIR_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_421430 validates logical coordinates, applies precision scaling and moves the controlled target.",
+        notes: "sub_421430 validates logical coordinates, applies the 16.16 precision/range mapping, reads the Knob raw base through vtable+0x30, and invokes the controlled target vtable+0x2C at base plus the pixel offset. The target native display-object state must be updated, not just renderer layer coordinates.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_GET_KNOB_POSITION,
@@ -16156,7 +16156,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_KNOB_HANDLE_PARAMETERS,
         returns: "i32 event delta",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_442490 calls sub_421570, clears all four event fields and returns the vertical component only when the event-kind field is nonzero.",
+        notes: "sub_442490 calls sub_421570 and clears all four event fields. Mouse-wheel sub_421520 records dy=+/-1 on every watched step and marks event-kind nonzero only when sub_421430 rejects the step at a range boundary, so DA returns only the unconsumed boundary delta.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_TAKE_CHANGED_KNOB_HANDLE,
@@ -16164,7 +16164,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: NO_PARAMETERS,
         returns: "knob handle or zero",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_463970 scans the ordered knob records, clears changed flags and returns the last flagged handle.",
+        notes: "sub_463970 scans the ordered knob records, clears changed flags and returns the last user-moved handle; drag movement through sub_421300 marks the manager record changed.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_SET_KNOB_RELATIVE_MODE,
@@ -16188,7 +16188,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_KNOB_HANDLE_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_4638E0 resolves the knob and prepends its native object pointer to the watch list.",
+        notes: "sub_4638E0 resolves the Knob and prepends a new watch node without deduplicating. WM_MOUSEWHEEL sub_463920 uses the first watch node, maps positive wheel delta to logical -1 and negative delta to +1, and calls sub_421520.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_UNWATCH_KNOB_OBJECT,
@@ -16196,7 +16196,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH90_KNOB_HANDLE_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_463890 removes the resolved knob from the watch list.",
+        notes: "sub_463890 removes only the first watch-list node whose resolved Knob pointer matches, so duplicate registrations require matching removals.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH90_CREATE_GROUP_OBJECT,
@@ -16370,18 +16370,18 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_CONFIGURE_WAVE_TABLE, symbol: "Graph92_01_ConfigureWaveTable", parameters: GRAPH92_CONFIGURE_WAVE_TABLE_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485550 -> sub_409C60 builds attenuated lead/full/trail sine cycles in the last row of each block." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_GENERATE_RADIAL_VECTOR_MAP, symbol: "Graph92_10_GenerateRadialVectorMap", parameters: GRAPH92_RADIAL_VECTOR_MAP_PARAMETERS, returns: "void; target raises status 1/3/9 for invalid descriptor, format, or mode", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485620 writes normalized signed radial vectors and a distance-derived phase to a format-6 map." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_GENERATE_AXIS_VECTOR_MAP, symbol: "Graph92_11_GenerateAxisVectorMap", parameters: GRAPH92_AXIS_VECTOR_MAP_PARAMETERS, returns: "void; target raises status 1/3/10 for invalid descriptor, format, or mode", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485720 writes one of four fixed vector/phase-axis fields to a format-6 map." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH92_SET_BITMAP_AUXILIARY_PAIR, symbol: "Graph92_12_SetBitmapAuxiliaryPair", parameters: GRAPH92_BITMAP_AUXILIARY_PAIR_PARAMETERS, returns: "i32 boolean", scheduling: NativeSchedulingEffect::Continue, notes: "0x004857F0 -> sub_402440 stores descriptor DWORDs +0x28/+0x2C; these values are not bitmap dimensions." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH92_SET_BITMAP_AUXILIARY_PAIR, symbol: "Graph92_12_SetBitmapAuxiliaryPair", parameters: GRAPH92_BITMAP_AUXILIARY_PAIR_PARAMETERS, returns: "i32 boolean", scheduling: NativeSchedulingEffect::Continue, notes: "0x004857F0 -> sub_402440 stores bitmap-registry DWORDs +0x28/+0x2C. They are an auxiliary reference point, not dimensions; sub_401EF0 initializes the same pair from CBG +0x1C/+0x1E when CBG +0x1A == 1." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_REPLACE_BITMAP_COLOR, symbol: "Graph92_13_ReplaceBitmapColor", parameters: GRAPH92_REPLACE_BITMAP_COLOR_PARAMETERS, returns: "status 0/1/2", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485830 -> sub_4024A0 performs exact native color replacement on format-1/2 four-byte pixels with special zero-alpha matching." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_PRELOAD_BITMAP_RESOURCE, symbol: "Graph92_14_PreloadBitmapResource", parameters: GRAPH92_PRELOAD_BITMAP_PARAMETERS, returns: "through DCProcPreloadBmp", scheduling: NativeSchedulingEffect::WaitProcedure, notes: "0x00485870 allocates DCProcPreloadBmp and returns scheduler status 2. Only the first converted string reaches the preload core in this build." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_CANCEL_PENDING_BITMAP_PRELOADS, symbol: "Graph92_15_CancelPendingBitmapPreloads", parameters: NO_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485900 -> sub_4504F0 removes every pending DCProcPreloadBmp node." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH92_GET_BITMAP_AUXILIARY_PAIR, symbol: "Graph92_16_GetBitmapAuxiliaryPair", parameters: GRAPH92_GET_BITMAP_AUXILIARY_PAIR_PARAMETERS, returns: "i32 boolean", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485910 -> sub_402470 writes descriptor DWORDs +0x28/+0x2C to caller BP memory." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH92_GET_BITMAP_AUXILIARY_PAIR, symbol: "Graph92_16_GetBitmapAuxiliaryPair", parameters: GRAPH92_GET_BITMAP_AUXILIARY_PAIR_PARAMETERS, returns: "i32 boolean", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485910 -> sub_402470 writes the bitmap-registry auxiliary reference point at +0x28/+0x2C to caller BP memory; a freshly allocated slot contains -1/-1." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_READ_BITMAP_PIXEL_VALUE, symbol: "Graph92_17_ReadBitmapPixelValue", parameters: GRAPH92_READ_BITMAP_PIXEL_VALUE_PARAMETERS, returns: "status 0/1/2/3", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485950 clears the destination DWORD then copies the native pixel's exact one-to-four bytes; format-6 is rejected." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH_CONVERT_BITMAP_TO_ALPHA_DESCRIPTOR, symbol: "Graph92_18_ConvertBitmapToAlphaDescriptor", parameters: GRAPH_CONVERT_BITMAP_TO_ALPHA_DESCRIPTOR_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "0x004859A0 -> sub_408320 creates or updates the first descriptor from the second. Format-1 uses RGB luma; format-2 uses luma multiplied by source alpha." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_INVERT_ALPHA_BITMAP, symbol: "Graph92_19_InvertAlphaBitmap", parameters: GRAPH92_INVERT_ALPHA_BITMAP_PARAMETERS, returns: "i32 boolean", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485A30 accepts only format-3 and inverts every byte in place." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_COMPOSE_BITMAP_ALPHA_AT_OFFSET, symbol: "Graph92_1A_ComposeBitmapAlphaAtOffset", parameters: GRAPH92_COMPOSE_ALPHA_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485A60 intersects translated rectangles, derives or blends alpha from format-2 sources, and clears destination alpha outside the overlap." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_DRAW_BITMAP_TEXT_MEASURE, symbol: "Graph92_1C_DrawBitmapTextAndMeasureAdvance", parameters: GRAPH92_BITMAP_TEXT_MEASURE_PARAMETERS, returns: "largest line advance", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485BA0 draws immediate text through the target native font subsystem and returns measured advance without wrapping." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_DRAW_WRAPPED_BITMAP_TEXT, symbol: "Graph92_1D_DrawWrappedBitmapTextAndCountLines", parameters: GRAPH92_BITMAP_TEXT_WRAP_PARAMETERS, returns: "wrapped line count", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485D50 is the wrapping variant of the immediate bitmap text renderer." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH92_DRAW_BITMAP_TEXT, symbol: "Graph92_1E_DrawBitmapText", parameters: GRAPH92_DRAW_BITMAP_TEXT_PARAMETERS, returns: "text advance", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485F10 draws colored immediate text to a bitmap and returns its advance." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH92_DRAW_BITMAP_TEXT, symbol: "Graph92_1E_DrawBitmapText", parameters: GRAPH92_DRAW_BITMAP_TEXT_PARAMETERS, returns: "text advance", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485F10 -> sub_4039E0 -> sub_403840 renders colored text directly into the selected bitmap descriptor and returns the accumulated glyph advance through the native output slot. It does not create a display-tree text node. Portable rendering now mutates bitmap pixels so subsequent GraphCompositeBitmap calls receive the glyphs." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_LOAD_EXTERNAL_BMP, symbol: "Graph92_1F_LoadExternalBmp", parameters: GRAPH92_LOAD_EXTERNAL_BMP_PARAMETERS, returns: "0 on success or negative parser/load status", scheduling: NativeSchedulingEffect::Continue, notes: "0x00486090 searches the resource/filesystem path and parses an uncompressed BMP into the supplied destination descriptor; it does not consume raw BP image bytes." },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH_SET_MESSAGE_INPUT_SCOPE,
@@ -16414,7 +16414,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
         parameters: GRAPH91_DISPLAY_OFFSET_PARAMETERS,
         returns: "void",
         scheduling: NativeSchedulingEffect::Continue,
-        notes: "sub_4806D0 calls sub_461E40 then sub_442EC0 and stores the two process-global CDspObj offsets. They are not an unconditional renderer translation: sub_41C0E0 adds them to an object's composite position only when that CDspObj's +0x48 gate is nonzero; generic property selector 196 (0xC4) controls that gate.",
+        notes: "sub_4806D0 calls sub_461E40 then sub_442EC0 and stores the two process-global CDspObj offsets. They are not an unconditional renderer translation: sub_41C0E0 adds them to an object's composite position only when that CDspObj's +0x48 gate is nonzero. CDspObj::CDspObj (sub_41A400) initializes that gate through sub_41ADF0(1); generic property selector 196 (0xC4) may change it afterward.",
     },
     NativeOpcodeSpec {
         opcode: opcodes::GRAPH91_SET_SCRIPT_BITMAP_CONTEXT_BINDING_ENABLED,
@@ -16647,13 +16647,13 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_SET_TEXT_SCALE_DIVISOR, symbol: "Graph91_99_SetTextScaleDivisor", parameters: GRAPH91_TEXT_SCALE_DIVISOR_PARAMETERS, returns: "i32 boolean", scheduling: NativeSchedulingEffect::Continue, notes: "0x004848E0 stores (value + 0xFFFF) / value in dword_5076B0 and rejects zero." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_SET_TEXT_GLOBAL_PROPERTY, symbol: "Graph91_9A_SetTextGlobalProperty", parameters: GRAPH91_TEXT_GLOBAL_PROPERTY_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484910 accepts exactly selectors 0 and 0x80000000..0x80000002; selector 0x80000001 requires a nonnegative value." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_MEASURE_TEXT, symbol: "Graph91_9B_MeasureText", parameters: GRAPH91_TEXT_MEASURE_PARAMETERS, returns: "i32 status and one BP output DWORD", scheduling: NativeSchedulingEffect::Continue, notes: "0x004849B0 reaches sub_403BA0/sub_434F00 and writes one measured value through the first source-order pointer." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH91_DRAW_TEXT, symbol: "Graph91_9C_DrawText", parameters: GRAPH91_DRAW_TEXT_PARAMETERS, returns: "updated coordinate/status", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484A30 invokes the default-style immediate text renderer." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH91_DRAW_TEXT_WITH_STYLE_MODE, symbol: "Graph91_9D_DrawTextWithStyleMode", parameters: GRAPH91_DRAW_TEXT_STYLE_PARAMETERS, returns: "updated coordinate/status", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484C40 adds a style-mode flag selecting default versus zeroed style state." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH91_DRAW_TEXT, symbol: "Graph91_9C_DrawText", parameters: GRAPH91_DRAW_TEXT_PARAMETERS, returns: "updated X/coordinate value", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484A30 selects source argument 0 as the destination bitmap, then sub_403B10 -> sub_434BA0 -> sub_434C50 rasterizes the supplied text directly into that bitmap. Source arguments 1/2 are X/Y, 3 is text, 7/8 are glyph size/horizontal scale, 11 is character spacing, and 13 is packed RGB; remaining font/style fields are forwarded to the native renderer. No persistent display/text node is created. Portable rendering now commits glyph pixels before later bitmap composition." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH91_DRAW_TEXT_WITH_STYLE_MODE, symbol: "Graph91_9D_DrawTextWithStyleMode", parameters: GRAPH91_DRAW_TEXT_STYLE_PARAMETERS, returns: "updated X/coordinate value", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484C40 has the same direct bitmap renderer ABI as Graph91:9C plus source argument 14 as a style-mode selector. Zero uses sub_433570 default style state; nonzero builds a zeroed/alternate style through sub_434E30 before the same sub_403B10 -> sub_434BA0 -> sub_434C50 pixel path. No display-tree text node is created." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_EXTRACT_TEXT_LABELS, symbol: "Graph91_9E_ExtractTextLabels", parameters: GRAPH91_TEXT_LABEL_PARAMETERS, returns: "i32 record count", scheduling: NativeSchedulingEffect::Continue, notes: "sub_437EE0 extracts nonempty case-insensitive <l> payloads into zero-filled 128-byte records and truncates each payload to 95 encoded bytes." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_STRIP_TEXT_MARKUP, symbol: "Graph91_9F_StripTextMarkup", parameters: GRAPH91_STRIP_MARKUP_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "sub_438070 removes tags beginning with an ASCII letter or slash while preserving malformed/non-tag less-than characters." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_CREATE_EXTENDED_ICON_INPUT_PROCESSOR, symbol: "Graph91_B8_CreateExtendedIconInputProcessor", parameters: GRAPH91_EXTENDED_ICON_CREATE_PARAMETERS, returns: "input processor handle or 0", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484EF0 calls sub_46C630(window, 1), which constructs the 0xD8-byte DCIPIconEx variant." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH91_CONFIGURE_EXTENDED_ICON_INPUT_PROCESSOR, symbol: "Graph91_BA_ConfigureExtendedIconInputProcessor", parameters: GRAPH91_EXTENDED_ICON_CONFIGURE_PARAMETERS, returns: "i32 status 0/1/2/3/4", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484F20 -> sub_46CB60/sub_44A900 validates the extended variant and parses 40-byte roots, 64-byte groups and 196-byte item records. Each drawable item is a CDspObjVirtual created by sub_42AC50 and attached to the owning window through sub_41AB40. CDspObjVirtual::IsEnabled (sub_42AD30) delegates to its parent window. Configuration only materializes child state: rendering and pointer hit-testing remain gated by the complete parent Window visibility chain (including Enabled and effective opacity), so a preloaded descriptor cannot expose or activate controls while its owning Window is hidden." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH91_SET_EXTENDED_ICON_INPUT_ITEM_STATE, symbol: "Graph91_BB_SetExtendedIconInputItemState", parameters: GRAPH91_EXTENDED_ICON_ITEM_STATE_PARAMETERS, returns: "i32 status 0/1/2/3/4", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484F60 -> sub_46CCA0/sub_44B460 updates one configured extended item and refreshes its child display object when active." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH91_CONFIGURE_EXTENDED_ICON_INPUT_PROCESSOR, symbol: "Graph91_BA_ConfigureExtendedIconInputProcessor", parameters: GRAPH91_EXTENDED_ICON_CONFIGURE_PARAMETERS, returns: "i32 status 0/1/2/3/4", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484F20 -> sub_46CB60/sub_44A900 validates the extended variant and parses 40-byte roots, 64-byte groups and 196-byte item records. Each resolvable item gets a processor-owned CDspObjVirtual from sub_42AC50. sub_41AB10 sizes that Virtual from the configure-time bitmap descriptor returned by sub_407F20, not from extended item +0x10/+0x14 w/h; sub_41AB40 attaches it at item x/y. sub_4495C0 hit-tests the Virtual's final vtable+0x24 rectangle directly and does not add a renderer clip test. The live child table belongs to the processor rather than the Window, so multiple processors sharing one Window remain independent and releasing one cannot erase another's controls. DCIPIconEx vtable+0x48 is sub_44C6F0: group source +0x3C bit 0x02 or item source +0xC0 bit 0x20 changes action 1 from press-time to release-time activation. sub_448690 stores the pending live-item index in DCIPIcon+0x90 and activates only if MouseRelease occurs while the pointer still resolves to that same item. CDspObjVirtual::IsEnabled (sub_42AD30) delegates to its parent Window." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH91_SET_EXTENDED_ICON_INPUT_ITEM_STATE, symbol: "Graph91_BB_SetExtendedIconInputItemState", parameters: GRAPH91_EXTENDED_ICON_ITEM_STATE_PARAMETERS, returns: "i32 status 0/1/2/3/4", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484F60 -> sub_46CCA0 -> sub_44B460 resolves the live item record and calls sub_42C060, which applies CDspObj::SetEnabled (sub_41AD60) to that item's materialized child Sprite, then invalidates the owning DCIPIconEx. state=0 therefore removes that child from drawing/hit eligibility; nonzero re-enables it. The state belongs to the live child and is reset when sub_44A900 rebuilds the descriptor children." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_REGISTER_KEY_ASSIGNMENT_TABLE, symbol: "Graph91_BF_RegisterKeyAssignmentTable", parameters: GRAPH91_KEY_ASSIGNMENT_PARAMETERS, returns: "void; invalid IDs raise a script error", scheduling: NativeSchedulingEffect::Continue, notes: "0x00484FB0 -> sub_447BB0 accepts IDs 4..7 and copies exactly 24 DWORDs." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_GET_ACTIVE_KNOB_HANDLE, symbol: "Graph91_DB_GetActiveKnobHandle", parameters: NO_PARAMETERS, returns: "active 0xF0000000 Knob handle or 0", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485020 -> sub_4639A0/sub_463820 returns the current active input node created by the Graph90:D0 Knob path." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH91_OPEN_DIRECTSHOW_MOVIE, symbol: "Graph91_F0_OpenDirectShowMovie", parameters: GRAPH91_MOVIE_OPEN_PARAMETERS, returns: "i32 status 0..4", scheduling: NativeSchedulingEffect::Continue, notes: "0x00485040 resolves the movie path, constructs DCMovieRenderer, sets loop and volume, and binds it to one of 0x4000 bitmap slots." },
@@ -16722,7 +16722,7 @@ const DOCUMENTED_OPCODES: &[NativeOpcodeSpec] = &[
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_DRAW_FORMATTED_TEXT, symbol: "Graph92_91_DrawFormattedText", parameters: GRAPH92_DRAW_FORMATTED_TEXT_PARAMETERS, returns: "void or script error", scheduling: NativeSchedulingEffect::Continue, notes: "sub_486500 renders formatted text directly into the resolved text object through sub_42B710 and refreshes it." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_CONFIGURE_TEXT_BITMAP_SLOT, symbol: "Graph92_98_ConfigureTextBitmapSlot", parameters: GRAPH92_CONFIGURE_TEXT_BITMAP_SLOT_PARAMETERS, returns: "void or script error", scheduling: NativeSchedulingEffect::Continue, notes: "sub_486650 -> sub_432E40 configures one fixed slot by copying/cropping a source descriptor, or releases it when source is -1." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_GET_TEXT_OUTPUT_PAIR, symbol: "Graph92_9B_GetTextOutputPair", parameters: GRAPH92_GET_TEXT_OUTPUT_PAIR_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "sub_434410 accepts selector 256 and writes the two cursor/output globals. The VM owns both DWORD writes." },
-    NativeOpcodeSpec { opcode: opcodes::GRAPH92_RENDER_TEXT, symbol: "Graph92_9C_RenderText", parameters: GRAPH92_RENDER_TEXT_PARAMETERS, returns: "updated x/cursor i32", scheduling: NativeSchedulingEffect::Continue, notes: "sub_4867D0 converts two text pointers, validates the target/style tuple, calls sub_403B10/sub_434BA0, updates the two output globals, and returns the modified x value." },
+    NativeOpcodeSpec { opcode: opcodes::GRAPH92_RENDER_TEXT, symbol: "Graph92_9C_RenderText", parameters: GRAPH92_RENDER_TEXT_PARAMETERS, returns: "updated x/cursor i32", scheduling: NativeSchedulingEffect::Continue, notes: "sub_4867D0 pops source args 20..0, builds style state from args 15..19, resolves font size/scale from source args 9/10, then sub_403B10/sub_434BA0/sub_434C50 rasterizes directly into the destination bitmap and publishes output X/Y. Portable rendering now mutates bitmap pixels; advanced GDI style/font details remain partial." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_CONFIGURE_FONT_OVERRIDE, symbol: "Graph92_9D_ConfigureFontOverride", parameters: GRAPH92_CONFIGURE_FONT_OVERRIDE_PARAMETERS, returns: "status 0..=3 or -1", scheduling: NativeSchedulingEffect::Continue, notes: "sub_437FA0 validates a native font through sub_42EAB0 and stores face, height, italic and two additional creation fields. Exact GDI validation remains platform-specific." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_DRAIN_TEXT_FRAGMENT_RECORDS, symbol: "Graph92_9E_DrainTextFragmentRecords", parameters: GRAPH92_DRAIN_TEXT_FRAGMENT_RECORDS_PARAMETERS, returns: "record count 0..=16", scheduling: NativeSchedulingEffect::Continue, notes: "sub_437EB0 copies count * 128 bytes then clears the global table. Each record is 96 zero-padded text bytes followed by x/y DWORDs at offsets 120/124." },
     NativeOpcodeSpec { opcode: opcodes::GRAPH92_SET_TEXT_RENDER_OVERRIDE, symbol: "Graph92_9F_SetTextRenderOverride", parameters: GRAPH92_SET_TEXT_RENDER_OVERRIDE_PARAMETERS, returns: "void", scheduling: NativeSchedulingEffect::Continue, notes: "sub_486B60 -> sub_463370 -> sub_438050 stores the scalar in dword_507650." },
