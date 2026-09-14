@@ -14,3 +14,8 @@ cargo run -p ethornell-cli -- run --game /path/to/sun_flower
 
 `--game` locates the resource archives. `ETHORNELL_NATIVE_ROOT` locates loose
 files and user data, and defaults to the current working directory.
+
+For a GBK Chinese translation, also set `ETHORNELL_TEXT_ENCODING=gbk`.
+This selects the encoding of text buffers passed to the graphics API, including
+dialogue and speaker names. The default is Shift-JIS (`cp932`). It does not
+change the encoding of resource names or BP system strings.

@@ -7440,6 +7440,16 @@ impl RuntimeEngine {
     ) -> Self {
         let program = ethornell_script::parse_bp_program(Some(script.to_string()), bytes);
         let mut vm = ethornell_vm::Vm::new();
+        if let Ok(label) = std::env::var("ETHORNELL_TEXT_ENCODING") {
+            match label.trim().to_ascii_lowercase().as_str() {
+                "gbk" | "cp936" | "windows-936" => {
+                    vm.set_graph_text_encoding(encoding_rs::GBK);
+                    tracing::info!(encoding = "GBK", "game display text encoding configured");
+                }
+                "shift_jis" | "shift-jis" | "sjis" | "cp932" => {}
+                _ => tracing::warn!(%label, "unsupported ETHORNELL_TEXT_ENCODING; using Shift-JIS"),
+            }
+        }
         vm.start(&program);
         Self {
             vm,

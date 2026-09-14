@@ -2058,6 +2058,7 @@ fn placeholder_loaded_program(
 #[derive(Debug, Default)]
 pub struct Vm {
     trace_id: u64,
+    graph_text_encoding: Option<&'static encoding_rs::Encoding>,
     pub stack: Vec<Value>,
     operand_slots: Vec<Value>,
     operand_slots_synced_len: usize,
@@ -2273,6 +2274,12 @@ impl Vm {
 
     pub fn advance_time_ms(&mut self, milliseconds: u64) {
         self.timing.advance(milliseconds);
+    }
+
+    /// Select the code page of text passed to native graph drawing calls.
+    /// Resource names and BP system strings retain their original encoding.
+    pub fn set_graph_text_encoding(&mut self, encoding: &'static encoding_rs::Encoding) {
+        self.graph_text_encoding = Some(encoding);
     }
 
     pub fn run<A>(
@@ -7264,8 +7271,16 @@ impl Vm {
     }
 
     fn read_c_string(&self, ptr: u32) -> VmResult<String> {
+        self.read_c_string_with_encoding(ptr, encoding_rs::SHIFT_JIS)
+    }
+
+    fn read_c_string_with_encoding(
+        &self,
+        ptr: u32,
+        encoding: &'static encoding_rs::Encoding,
+    ) -> VmResult<String> {
         let bytes = self.read_c_string_bytes(ptr)?;
-        let (text, _, _) = encoding_rs::SHIFT_JIS.decode(&bytes);
+        let (text, _, _) = encoding.decode(&bytes);
         Ok(text.into_owned())
     }
 
@@ -10540,7 +10555,17 @@ impl Vm {
                 continue;
             };
             let original = self.stack[index].clone();
-            let text = self.value_as_text_descriptor_string(original.clone())?;
+            let encoding = if matches!(
+                (group, id),
+                (0x90, 0x90)
+                    | (0x91, 0x91 | 0x93 | 0x9C | 0x9D)
+                    | (0x92, 0x1C | 0x1D | 0x1E | 0x1F | 0x90 | 0x91 | 0x9C)
+            ) {
+                self.graph_text_encoding.unwrap_or(encoding_rs::SHIFT_JIS)
+            } else {
+                encoding_rs::SHIFT_JIS
+            };
+            let text = self.value_as_text_descriptor_string(original.clone(), encoding)?;
             if std::env::var_os("TRACE_RESOURCE_ARGS").is_some() {
                 let ptr = match original {
                     Value::Int(value) if value != 0 => Some(value as u32),
@@ -10640,10 +10665,18 @@ impl Vm {
     }
 
     fn value_as_string_lossy(&self, value: Value) -> VmResult<String> {
+        self.value_as_string_with_encoding(value, encoding_rs::SHIFT_JIS)
+    }
+
+    fn value_as_string_with_encoding(
+        &self,
+        value: Value,
+        encoding: &'static encoding_rs::Encoding,
+    ) -> VmResult<String> {
         match value {
             Value::Str(text) => Ok(text),
-            Value::Ptr(ptr) => self.read_c_string(ptr),
-            Value::Int(value) => match self.read_c_string(value as u32) {
+            Value::Ptr(ptr) => self.read_c_string_with_encoding(ptr, encoding),
+            Value::Int(value) => match self.read_c_string_with_encoding(value as u32, encoding) {
                 _ if self
                     .mem_values
                     .get(&Self::value_key(value as u32))
@@ -10703,8 +10736,12 @@ impl Vm {
         }
     }
 
-    fn value_as_text_descriptor_string(&self, value: Value) -> VmResult<String> {
-        let direct = self.value_as_string_lossy(value.clone())?;
+    fn value_as_text_descriptor_string(
+        &self,
+        value: Value,
+        encoding: &'static encoding_rs::Encoding,
+    ) -> VmResult<String> {
+        let direct = self.value_as_string_with_encoding(value.clone(), encoding)?;
         if is_plausible_text_payload(&direct) {
             return Ok(direct);
         }
@@ -10730,7 +10767,7 @@ impl Vm {
                         self.trace_text_descriptor_hit(ptr, offset, nested, &text, "nested_shadow");
                         return Ok(text);
                     }
-                    if let Ok(text) = self.read_c_string(nested) {
+                    if let Ok(text) = self.read_c_string_with_encoding(nested, encoding) {
                         if is_plausible_text_payload(&text) {
                             self.trace_text_descriptor_hit(
                                 ptr,
@@ -10756,7 +10793,7 @@ impl Vm {
                         );
                         return Ok(text);
                     }
-                    if let Ok(text) = self.read_c_string(nested) {
+                    if let Ok(text) = self.read_c_string_with_encoding(nested, encoding) {
                         if is_plausible_text_payload(&text) {
                             self.trace_text_descriptor_hit(
                                 ptr,
@@ -10781,7 +10818,7 @@ impl Vm {
             let Some(addr) = ptr.checked_add_signed(offset) else {
                 continue;
             };
-            if let Ok(text) = self.read_c_string(addr) {
+            if let Ok(text) = self.read_c_string_with_encoding(addr, encoding) {
                 if is_plausible_text_payload(&text) {
                     self.trace_text_descriptor_hit(ptr, offset, addr, &text, "cstr");
                     return Ok(text);
@@ -14302,6 +14339,59 @@ mod tests {
             .calls
             .keys()
             .any(|key| key.starts_with("script:0xFF:0x40:")));
+    }
+
+    #[test]
+    fn graph_text_decodes_gbk_memory_before_validating_the_payload() {
+        let mut vm = Vm::new();
+        vm.set_graph_text_encoding(encoding_rs::GBK);
+        let pointer = 0x2021_8ac7;
+        // GBK bytes can be invalid Shift-JIS or valid but unrelated halfwidth
+        // characters. Both require the selected code page, not error fallback.
+        for (group, id, count, from_top, bytes, expected) in [
+            (
+                0x92,
+                0x90,
+                15,
+                13,
+                &b"\xa1\xa1\xcf\xf2\xc8\xd5\xbf\xfb\xa1\xa3"[..],
+                "　向日葵。",
+            ),
+            (0x92, 0x1c, 10, 6, &b"\xd3\xbd"[..], "咏"),
+            (0x90, 0x90, 6, 4, &b"\xeb\xca\xb0\xd7"[..], "胧白"),
+        ] {
+            let start = Vm::memory_addr(pointer) as usize;
+            vm.memory
+                .resize(vm.memory.len().max(start + bytes.len() + 1), 0);
+            vm.memory[start..start + bytes.len()].copy_from_slice(bytes);
+            vm.memory[start + bytes.len()] = 0;
+            vm.stack = vec![Value::Int(0); count];
+            let index = count - 1 - from_top;
+            vm.stack[index] = Value::Int(pointer as i32);
+
+            vm.normalize_graph_string_args(group, id).unwrap();
+
+            assert_eq!(vm.stack[index], Value::Str(expected.into()));
+            assert_eq!(&vm.memory[start..start + bytes.len()], bytes);
+        }
+    }
+
+    #[test]
+    fn graph_text_code_page_preserves_system_resource_names_and_unicode_values() {
+        let mut vm = Vm::new();
+        vm.set_graph_text_encoding(encoding_rs::GBK);
+        vm.write_c_string(0x3000, "日本語").unwrap();
+        vm.stack = vec![
+            Value::Int(1),
+            Value::Str("data.arc".into()),
+            Value::Ptr(0x3000),
+        ];
+        vm.normalize_graph_string_args(0x90, 0x10).unwrap();
+        assert_eq!(vm.stack[2], Value::Str("日本語".into()));
+
+        vm.stack = vec![Value::Str("已解码的文字".into())];
+        vm.normalize_graph_string_args(0x92, 0x1f).unwrap();
+        assert_eq!(vm.stack[0], Value::Str("已解码的文字".into()));
     }
 
     #[test]
