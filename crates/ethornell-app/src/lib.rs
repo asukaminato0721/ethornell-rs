@@ -125,6 +125,47 @@ const INPUT_DESCRIPTOR_MOUSE_LEFT: i32 = 1;
 const INPUT_DESCRIPTOR_ENTER: i32 = 13;
 const INPUT_DESCRIPTOR_MOUSE_WHEEL_UP: i32 = 14;
 const INPUT_DESCRIPTOR_MOUSE_WHEEL_DOWN: i32 = 15;
+const DEFAULT_GAME_ID: &str = "Tayutama2TV";
+
+fn detect_game_id_from_bootstrap(program: &ethornell_script::BpProgram) -> Option<String> {
+    for (index, instruction) in program.instructions.iter().enumerate() {
+        if instruction.known_call != Some("GetGameId") {
+            continue;
+        }
+
+        let following = program.instructions.iter().skip(index + 1).take(6);
+        let mut candidate = None;
+        for instruction in following {
+            if instruction.opcode_name == "streq" {
+                if candidate.is_some() {
+                    return candidate;
+                }
+                break;
+            }
+            if let [ethornell_script::BpOperand::String(value)] = instruction.operands.as_slice() {
+                if !value.is_empty() {
+                    candidate = Some(value.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn configured_game_id(manager: &ResourceManager) -> (String, &'static str) {
+    if let Ok(game_id) = std::env::var("ETHORNELL_GAME_ID") {
+        return (game_id, "ETHORNELL_GAME_ID");
+    }
+
+    if let Ok(bytes) = manager.read_decoded_from_archive("system.arc", "ipl._bp") {
+        let program = ethornell_script::parse_bp_program(Some("system.arc:ipl._bp".into()), &bytes);
+        if let Some(game_id) = detect_game_id_from_bootstrap(&program) {
+            return (game_id, "system.arc:ipl._bp");
+        }
+    }
+
+    (DEFAULT_GAME_ID.into(), "fallback")
+}
 
 pub struct AppConfig {
     pub game_root: GameRoot,
@@ -760,9 +801,8 @@ impl RuntimeTraceApi {
     }
 
     fn new_with_native_root(manager: ResourceManager, native_root: PathBuf) -> Self {
-        let game_id =
-            std::env::var("ETHORNELL_GAME_ID").unwrap_or_else(|_| "Tayutama2TV".into());
-        tracing::info!(%game_id, "configured native game identifier");
+        let (game_id, source) = configured_game_id(&manager);
+        tracing::info!(%game_id, source, "configured native game identifier");
         Self {
             manager,
             native_root,
@@ -7755,16 +7795,62 @@ mod input_tests {
     use super::text::{ruby_draw_runs, RuntimeTextNode};
     use super::text_anim::RuntimeRubySpan;
     use super::{
-        input_class_state_for_descriptor, input_state_for_descriptor, DecodedImage,
+        detect_game_id_from_bootstrap, input_class_state_for_descriptor,
+        input_state_for_descriptor, DecodedImage,
         SurfaceControlOwner, BACK_F_SECONDARY_LAYER_ID,
         INPUT_DESCRIPTOR_DOWN, INPUT_DESCRIPTOR_ENTER, INPUT_DESCRIPTOR_LEFT,
         INPUT_DESCRIPTOR_MOUSE_LEFT, INPUT_DESCRIPTOR_RIGHT, INPUT_DESCRIPTOR_UP,
         NATIVE_SCREEN_BITMAP,
     };
+    use ethornell_script::{BpInstruction, BpOpcode, BpOperand, BpProgram};
     use ethornell_vm::{
         GraphApi, GraphIconRecord, GraphInputDescriptor, GraphInputGroup, GraphInputRegion, SysApi,
         Value,
     };
+
+    fn game_id_instruction(
+        opcode_name: &str,
+        known_call: Option<&'static str>,
+        operands: Vec<BpOperand>,
+    ) -> BpInstruction {
+        BpInstruction {
+            offset: 0,
+            opcode: BpOpcode::Unknown(0),
+            opcode_hex: String::new(),
+            opcode_name: opcode_name.into(),
+            operands,
+            known_call,
+            raw: Vec::new(),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn game_id_is_detected_from_bootstrap_comparison() {
+        let program = BpProgram {
+            script_name: Some("system.arc:ipl._bp".into()),
+            functions: Vec::new(),
+            strings: Vec::new(),
+            instructions: vec![
+                game_id_instruction("push_string", None, vec![BpOperand::String("decoy".into())]),
+                game_id_instruction("sys1", Some("GetGameId"), Vec::new()),
+                game_id_instruction("push_base_offset", None, Vec::new()),
+                game_id_instruction(
+                    "push_string",
+                    None,
+                    vec![BpOperand::String("AmairoChocolate".into())],
+                ),
+                game_id_instruction("streq", None, Vec::new()),
+            ],
+            labels: std::collections::HashMap::new(),
+            warnings: Vec::new(),
+        };
+
+        assert_eq!(
+            detect_game_id_from_bootstrap(&program).as_deref(),
+            Some("AmairoChocolate")
+        );
+    }
 
     fn test_call_frame(
         group: u8,

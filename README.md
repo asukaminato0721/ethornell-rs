@@ -2,9 +2,10 @@
 
 `ethornell-rs` is a reimplementation of the Ethornell / BURIKO General Interpreter (a.k.a. "BGI") visual novel engine.
 
-The native game identifier defaults to `Tayutama2TV`. Set `ETHORNELL_GAME_ID`
-to the identifier expected by another game's bootstrap script; a mismatch can
-terminate the script before it draws anything. For 向日葵の教会と長い夏休み:
+The runtime detects the native game identifier from the comparison in
+`system.arc:ipl._bp`. Set `ETHORNELL_GAME_ID` only to override that detected
+value. If detection is unavailable, the identifier falls back to `Tayutama2TV`.
+For example:
 
 ```sh
 ETHORNELL_GAME_ID=HimawariNoKyoukaiToNagaiNatsuyasumi \
