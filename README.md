@@ -3,18 +3,14 @@
 `ethornell-rs` is a reimplementation of the Ethornell / BURIKO General Interpreter (a.k.a. "BGI") visual novel engine.
 
 The runtime detects the native game identifier from the comparison in
-`system.arc:ipl._bp`. Set `ETHORNELL_GAME_ID` only to override that detected
-value. If detection is unavailable, the identifier falls back to `Tayutama2TV`.
-For example:
+`system.arc:ipl._bp`. If detection is unavailable, the identifier falls back to
+`Tayutama2TV`. For example:
 
 ```sh
-ETHORNELL_GAME_ID=HimawariNoKyoukaiToNagaiNatsuyasumi \
-ETHORNELL_NATIVE_ROOT=/path/to/sun_flower \
 cargo run -p ethornell-cli -- run --game /path/to/sun_flower
 ```
 
-`--game` locates the resource archives. `ETHORNELL_NATIVE_ROOT` locates loose
-files and user data, and defaults to the current working directory.
+`--game` locates the resource archives, loose files, and user data.
 
 For a GBK Chinese translation, also set `ETHORNELL_TEXT_ENCODING=gbk`.
 This selects the encoding of text buffers passed to the graphics API, including

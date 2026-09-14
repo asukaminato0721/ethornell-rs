@@ -250,7 +250,8 @@ fn native_knob_logical_from_pixel(pixel: f32, extent: i32, bounds: i32, target_s
             let step = native_knob_step(extent, available);
             let round_bias = available / (2 * extent - 2);
             ((((i64::from(pixel + round_bias)) << 16) / step)
-                .clamp(0, i64::from(native_knob_limit(extent, bounds, target_size)))) as i32
+                .clamp(0, i64::from(native_knob_limit(extent, bounds, target_size))))
+                as i32
         }
     }
 }
@@ -328,14 +329,20 @@ mod tests {
         // 406-pixel content range. cnfgclrwnd._bp uses 257 vertical logical
         // positions for the color slider. Keep both endpoint mappings stable.
         let horizontal_available = 406 - 40;
-        assert_eq!(native_knob_offset(100, 101, 406, 40.0), horizontal_available as f32);
+        assert_eq!(
+            native_knob_offset(100, 101, 406, 40.0),
+            horizontal_available as f32
+        );
         assert_eq!(
             native_knob_logical_from_pixel(horizontal_available as f32, 101, 406, 40.0),
             100
         );
 
         let vertical_available = 212 - 20;
-        assert_eq!(native_knob_offset(256, 257, 212, 20.0), vertical_available as f32);
+        assert_eq!(
+            native_knob_offset(256, 257, 212, 20.0),
+            vertical_available as f32
+        );
         assert_eq!(
             native_knob_logical_from_pixel(vertical_available as f32, 257, 212, 20.0),
             256
@@ -352,5 +359,4 @@ mod tests {
         assert!(state.x > 0);
         assert!(state.changed);
     }
-
 }

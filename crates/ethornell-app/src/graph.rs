@@ -771,10 +771,8 @@ pub(crate) fn crossfade_decoded_images_straight_alpha(
             continue;
         }
         for channel in 0..3 {
-            let mixed = u64::from(primary.rgba[offset + channel])
-                * u64::from(primary_coverage)
-                + u64::from(secondary.rgba[offset + channel])
-                    * u64::from(secondary_coverage);
+            let mixed = u64::from(primary.rgba[offset + channel]) * u64::from(primary_coverage)
+                + u64::from(secondary.rgba[offset + channel]) * u64::from(secondary_coverage);
             rgba[offset + channel] = (mixed / u64::from(total_coverage)).min(255) as u8;
         }
         rgba[offset + 3] = ((total_coverage >> 8).min(255)) as u8;
@@ -1086,15 +1084,15 @@ impl NativeMode5NodeArgs {
         // after sub_427AA0 shifts the script's integer values by 16.
         let mut offset_x_16_16 = self.anchor_x.wrapping_shl(16);
         let mut offset_y_16_16 = self.anchor_y.wrapping_shl(16);
-        offset_x_16_16 = offset_x_16_16
-            .wrapping_add(mul_progress(dynamic.offset_delta_x_16_16, progress));
-        offset_y_16_16 = offset_y_16_16
-            .wrapping_add(mul_progress(dynamic.offset_delta_y_16_16, progress));
+        offset_x_16_16 =
+            offset_x_16_16.wrapping_add(mul_progress(dynamic.offset_delta_x_16_16, progress));
+        offset_y_16_16 =
+            offset_y_16_16.wrapping_add(mul_progress(dynamic.offset_delta_y_16_16, progress));
 
         let curve_weight = crate::animation::target_curve_fixed_16(dynamic.curve, progress);
         let rotation = self.rotation.wrapping_add(
-            (((i128::from(dynamic.rotation_delta_16_16) * i128::from(curve_weight)) >> 16)
-                as i64) as i32,
+            (((i128::from(dynamic.rotation_delta_16_16) * i128::from(curve_weight)) >> 16) as i64)
+                as i32,
         );
 
         let scale_x_delta = mul_progress(dynamic.scale_delta_x_16_16, progress);
@@ -1133,10 +1131,8 @@ impl NativeMode5NodeArgs {
         let width = image_width as f64;
         let height = image_height as f64;
         let adjusted_width =
-            width * (f64::from(dynamic.width_adjust_16_16.wrapping_add(0x10000)))
-                / 65_536.0;
-        let offset_x = (adjusted_width - width) * 0.5
-            + f64::from(offset_x_16_16) / 65_536.0;
+            width * (f64::from(dynamic.width_adjust_16_16.wrapping_add(0x10000))) / 65_536.0;
+        let offset_x = (adjusted_width - width) * 0.5 + f64::from(offset_x_16_16) / 65_536.0;
         let offset_y = f64::from(offset_y_16_16) / 65_536.0;
         let radians = f64::from(rotation) * std::f64::consts::PI / 11_796_480.0;
         let (sin, cos) = radians.sin_cos();
@@ -1147,10 +1143,22 @@ impl NativeMode5NodeArgs {
         let bottom = offset_y * sy;
         let top = offset_y - height + 1.0;
         let corners = [
-            (left * sx * cos - bottom * sin, left * sx * sin + bottom * cos),
-            (right * sx * cos - bottom * sin, right * sx * sin + bottom * cos),
-            (left * sx * cos - top * sy * sin, left * sx * sin + top * sy * cos),
-            (right * sx * cos - top * sy * sin, right * sx * sin + top * sy * cos),
+            (
+                left * sx * cos - bottom * sin,
+                left * sx * sin + bottom * cos,
+            ),
+            (
+                right * sx * cos - bottom * sin,
+                right * sx * sin + bottom * cos,
+            ),
+            (
+                left * sx * cos - top * sy * sin,
+                left * sx * sin + top * sy * cos,
+            ),
+            (
+                right * sx * cos - top * sy * sin,
+                right * sx * sin + top * sy * cos,
+            ),
         ];
         let mut min_x = 1_000_000_000.0_f64;
         let mut max_x = -1_000_000_000.0_f64;
@@ -1218,16 +1226,8 @@ impl NativeMode5NodeArgs {
             let source_dx = (source_x - anchor_x) * sx;
             let source_dy = (source_y - anchor_y) * sy;
             [
-                (origin_offset_x
-                    + fractional_x
-                    + source_dx * cos
-                    + source_dy * sin
-                    + 0.5) as f32,
-                (origin_offset_y
-                    + fractional_y
-                    - source_dx * sin
-                    + source_dy * cos
-                    + 0.5) as f32,
+                (origin_offset_x + fractional_x + source_dx * cos + source_dy * sin + 0.5) as f32,
+                (origin_offset_y + fractional_y - source_dx * sin + source_dy * cos + 0.5) as f32,
             ]
         };
         // The native rasterizer addresses destination pixels by integer pixel
@@ -1406,13 +1406,11 @@ mod tests {
     use super::{
         backf_mask_weight, blend_decoded_image_parameter, blit_decoded_image,
         blit_decoded_image_format1_to_format2, blit_decoded_image_parameter,
-        crossfade_decoded_images, native_draw_order,
-        scale_decoded_image_fixed,
+        crossfade_decoded_images, native_draw_order, scale_decoded_image_fixed,
         NativeMode5DynamicState, NativeMode5NodeArgs, RuntimeGraphDrawItem,
         RuntimeGraphObjectProperties, RuntimeGraphResource,
     };
     use ethornell_image::DecodedImage;
-
 
     #[test]
     fn mode5_arg13_selects_native_sampling_path() {
@@ -1420,13 +1418,17 @@ mod tests {
         args[0] = 1;
         args[4] = 2;
         args[13] = 0;
-        assert!(!NativeMode5NodeArgs::from_source_args(&args)
-            .expect("mode-5 args")
-            .interpolation);
+        assert!(
+            !NativeMode5NodeArgs::from_source_args(&args)
+                .expect("mode-5 args")
+                .interpolation
+        );
         args[13] = 1;
-        assert!(NativeMode5NodeArgs::from_source_args(&args)
-            .expect("mode-5 args")
-            .interpolation);
+        assert!(
+            NativeMode5NodeArgs::from_source_args(&args)
+                .expect("mode-5 args")
+                .interpolation
+        );
     }
 
     #[test]
@@ -1446,17 +1448,35 @@ mod tests {
         };
         let dynamic = NativeMode5DynamicState::default();
         let geometry = mode5.screen_geometry_mode5_exact(
-            1480.0, 820.0, 1280.0, 720.0, (640, 246), true, dynamic,
+            1480.0,
+            820.0,
+            1280.0,
+            720.0,
+            (640, 246),
+            true,
+            dynamic,
         );
         assert_eq!((geometry.object_x, geometry.object_y), (640.0, 246.0));
 
         let fallback = mode5.screen_geometry_mode5_exact(
-            1480.0, 820.0, 1280.0, 720.0, (-1, -1), true, dynamic,
+            1480.0,
+            820.0,
+            1280.0,
+            720.0,
+            (-1, -1),
+            true,
+            dynamic,
         );
         assert_eq!((fallback.object_x, fallback.object_y), (640.0, 360.0));
 
         let gated = mode5.screen_geometry_mode5_exact(
-            1480.0, 820.0, 1280.0, 720.0, (640, 246), false, dynamic,
+            1480.0,
+            820.0,
+            1280.0,
+            720.0,
+            (640, 246),
+            false,
+            dynamic,
         );
         assert_eq!((gated.object_x, gated.object_y), (640.0, 360.0));
     }
@@ -1539,7 +1559,10 @@ mod tests {
             NativeMode5DynamicState::default(),
         );
         assert_eq!((first.object_x, first.object_y), (640.0, 560.0));
-        assert_eq!((first.origin_offset_x, first.origin_offset_y), (888.0, 246.0));
+        assert_eq!(
+            (first.origin_offset_x, first.origin_offset_y),
+            (888.0, 246.0)
+        );
         assert_eq!((first.x, first.y), (-248.0, 314.0));
         let first_pixel =
             source_center_destination(first.local_affine_quad, 1480.0, 820.0, 0.0, 0.0);
@@ -1576,7 +1599,10 @@ mod tests {
             NativeMode5DynamicState::default(),
         );
         assert_eq!((second.object_x, second.object_y), (640.0, 460.0));
-        assert_eq!((second.origin_offset_x, second.origin_offset_y), (1480.0, 410.0));
+        assert_eq!(
+            (second.origin_offset_x, second.origin_offset_y),
+            (1480.0, 410.0)
+        );
         assert_eq!((second.x, second.y), (-840.0, 50.0));
         let second_pixel =
             source_center_destination(second.local_affine_quad, 1480.0, 820.0, 0.0, 0.0);
@@ -1657,10 +1683,7 @@ mod tests {
         };
 
         blit_decoded_image_format1_to_format2(&mut destination, &source, 0, 0);
-        assert_eq!(
-            destination.rgba,
-            vec![10, 20, 30, 255, 40, 50, 60, 255]
-        );
+        assert_eq!(destination.rgba, vec![10, 20, 30, 255, 40, 50, 60, 255]);
     }
 
     #[test]

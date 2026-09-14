@@ -196,8 +196,7 @@ impl TextRuntime {
                 self.next_glyph_remaining_ms = self.glyph_delay_ms;
             }
             if self.revealed_glyphs < self.reveal_boundaries.len() {
-                self.next_glyph_remaining_ms =
-                    self.next_glyph_remaining_ms.saturating_sub(budget);
+                self.next_glyph_remaining_ms = self.next_glyph_remaining_ms.saturating_sub(budget);
             } else {
                 self.next_glyph_remaining_ms = 0;
             }
@@ -257,7 +256,10 @@ pub(crate) fn parse_message_markup(text: &str) -> (String, Vec<RuntimeRubySpan>)
 
 pub(crate) fn parse_message_markup_styled(text: &str) -> ParsedMessageMarkup {
     // Form-feed is a native message wait marker, not a printable glyph.
-    let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\x0c', "");
+    let text = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\x0c', "");
     let mut out = String::with_capacity(text.len());
     let mut ruby_spans = Vec::new();
     let mut style_spans = Vec::new();
@@ -565,8 +567,6 @@ mod tests {
         runtime.set_glyph_delay_ms(33);
         assert_eq!(runtime.duration_ms(), 99);
     }
-
-
 
     #[test]
     fn glyph_delay_uses_real_milliseconds_not_render_frames() {

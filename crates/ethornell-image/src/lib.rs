@@ -408,12 +408,65 @@ mod tests {
         };
 
         assert_eq!(base.native_bitmap_format(), Some(2));
-        assert_eq!(CbgMetadata { image_subtype: 4, ..base.clone() }.native_bitmap_format(), Some(4));
-        assert_eq!(CbgMetadata { image_subtype: 5, ..base.clone() }.native_bitmap_format(), Some(5));
-        assert_eq!(CbgMetadata { image_subtype: 7, ..base.clone() }.native_bitmap_format(), Some(1));
-        assert_eq!(CbgMetadata { bpp: 24, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(1));
-        assert_eq!(CbgMetadata { bpp: 8, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(3));
-        assert_eq!(CbgMetadata { bpp: 16, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(0));
-        assert_eq!(CbgMetadata { bpp: 48, image_subtype: 0, ..base.clone() }.native_bitmap_format(), Some(6));
+        assert_eq!(
+            CbgMetadata {
+                image_subtype: 4,
+                ..base.clone()
+            }
+            .native_bitmap_format(),
+            Some(4)
+        );
+        assert_eq!(
+            CbgMetadata {
+                image_subtype: 5,
+                ..base.clone()
+            }
+            .native_bitmap_format(),
+            Some(5)
+        );
+        assert_eq!(
+            CbgMetadata {
+                image_subtype: 7,
+                ..base.clone()
+            }
+            .native_bitmap_format(),
+            Some(1)
+        );
+        assert_eq!(
+            CbgMetadata {
+                bpp: 24,
+                image_subtype: 0,
+                ..base.clone()
+            }
+            .native_bitmap_format(),
+            Some(1)
+        );
+        assert_eq!(
+            CbgMetadata {
+                bpp: 8,
+                image_subtype: 0,
+                ..base.clone()
+            }
+            .native_bitmap_format(),
+            Some(3)
+        );
+        assert_eq!(
+            CbgMetadata {
+                bpp: 16,
+                image_subtype: 0,
+                ..base.clone()
+            }
+            .native_bitmap_format(),
+            Some(0)
+        );
+        assert_eq!(
+            CbgMetadata {
+                bpp: 48,
+                image_subtype: 0,
+                ..base.clone()
+            }
+            .native_bitmap_format(),
+            Some(6)
+        );
     }
 }

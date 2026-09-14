@@ -179,12 +179,14 @@ impl NativeBackgroundState {
                     )) => true,
                     _ => false,
                 };
-                let mask_current = self
-                    .backf
-                    .is_some_and(|state| match state.mask_resource_binding {
-                        Some((handle, generation)) => current_generation(handle) == Some(generation),
-                        None => true,
-                    });
+                let mask_current =
+                    self.backf
+                        .is_some_and(|state| match state.mask_resource_binding {
+                            Some((handle, generation)) => {
+                                current_generation(handle) == Some(generation)
+                            }
+                            None => true,
+                        });
                 secondary_current && mask_current
             }
             _ => true,

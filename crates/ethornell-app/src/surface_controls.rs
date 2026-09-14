@@ -31,9 +31,9 @@ impl SurfaceControlRegistry {
         surface: i32,
         descriptor: &GraphInputDescriptor,
     ) -> bool {
-        self.sets.get(&owner).is_some_and(|set| {
-            set.surface == surface && set.descriptor == *descriptor
-        })
+        self.sets
+            .get(&owner)
+            .is_some_and(|set| set.surface == surface && set.descriptor == *descriptor)
     }
 
     /// Number of materialized native-control layers attached to `surface`
@@ -100,11 +100,7 @@ impl SurfaceControlRegistry {
         self.sets.values().any(|set| set.layers.contains(&layer))
     }
 
-    pub(crate) fn contains_layer_for_owner(
-        &self,
-        owner: SurfaceControlOwner,
-        layer: i32,
-    ) -> bool {
+    pub(crate) fn contains_layer_for_owner(&self, owner: SurfaceControlOwner, layer: i32) -> bool {
         self.sets
             .get(&owner)
             .is_some_and(|set| set.layers.contains(&layer))

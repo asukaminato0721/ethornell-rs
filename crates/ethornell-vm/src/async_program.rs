@@ -321,27 +321,28 @@ impl Vm {
         // follows that same flat-list order instead of pumping every child in a
         // fixed for-loop.
         let requested_start = self.scheduler_switch_target.take();
-        let mut cursor = match requested_start {
-            Some(thread_id) if thread_id == 0 || thread_id == self.thread.thread_id() => {
-                // Status 3 selected the root CThread; `run_loaded` executes it
-                // immediately after returning from this child scheduler.
-                self.refresh_thread_links();
-                return;
-            }
-            Some(thread_id) => {
-                let Some(index) = self.async_tasks.iter().position(|task| {
-                    !task.completed && task.vm.thread.thread_id() == thread_id
-                }) else {
-                    // Native sub_444B90 returns null for an unknown id and the
-                    // outer list walk terminates instead of falling back to the
-                    // first thread.
+        let mut cursor =
+            match requested_start {
+                Some(thread_id) if thread_id == 0 || thread_id == self.thread.thread_id() => {
+                    // Status 3 selected the root CThread; `run_loaded` executes it
+                    // immediately after returning from this child scheduler.
                     self.refresh_thread_links();
                     return;
-                };
-                index
-            }
-            None => 0,
-        };
+                }
+                Some(thread_id) => {
+                    let Some(index) = self.async_tasks.iter().position(|task| {
+                        !task.completed && task.vm.thread.thread_id() == thread_id
+                    }) else {
+                        // Native sub_444B90 returns null for an unknown id and the
+                        // outer list walk terminates instead of falling back to the
+                        // first thread.
+                        self.refresh_thread_links();
+                        return;
+                    };
+                    index
+                }
+                None => 0,
+            };
         let mut scheduler_hops = 0usize;
         const MAX_SCHEDULER_HOPS_PER_PASS: usize = 4096;
 

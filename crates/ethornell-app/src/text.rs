@@ -238,19 +238,10 @@ impl RuntimeTraceApi {
             // display-tree text node: glyphs are committed immediately to the
             // selected bitmap.
             let shift = if args.len() == 15 { 1 } else { 0 };
-            let target = args
-                .get(13 + shift)
-                .map(value_to_i32)
-                .unwrap_or_default();
+            let target = args.get(13 + shift).map(value_to_i32).unwrap_or_default();
             if target != -1 && self.graph_surfaces.contains_key(&target) {
-                let x = args
-                    .get(12 + shift)
-                    .map(value_to_i32)
-                    .unwrap_or_default();
-                let y = args
-                    .get(11 + shift)
-                    .map(value_to_i32)
-                    .unwrap_or_default();
+                let x = args.get(12 + shift).map(value_to_i32).unwrap_or_default();
+                let y = args.get(11 + shift).map(value_to_i32).unwrap_or_default();
                 let size = args
                     .get(6 + shift)
                     .map(value_to_i32)
@@ -261,10 +252,7 @@ impl RuntimeTraceApi {
                     .map(value_to_i32)
                     .filter(|scale| *scale > 0)
                     .unwrap_or(100);
-                let spacing = args
-                    .get(2 + shift)
-                    .map(value_to_i32)
-                    .unwrap_or_default();
+                let spacing = args.get(2 + shift).map(value_to_i32).unwrap_or_default();
                 let packed_color = args
                     .get(shift)
                     .map(value_to_i32)

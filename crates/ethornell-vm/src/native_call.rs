@@ -1579,8 +1579,7 @@ pub mod opcodes {
     /// Compatibility alias for callers built against the earlier provisional
     /// name. Opcode 0x90:0x57 is a primary-bitmap replacement, not an
     /// offscreen-render operation.
-    pub const GRAPH90_RENDER_SPRITE_TO_BITMAP: NativeOpcode =
-        GRAPH90_REPLACE_SPRITE_BITMAP;
+    pub const GRAPH90_RENDER_SPRITE_TO_BITMAP: NativeOpcode = GRAPH90_REPLACE_SPRITE_BITMAP;
     /// Target sub_47C470/sub_462390 configures an existing CDspObjSprite as mode 1. It does not allocate a generic transition node.
     pub const GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP: NativeOpcode = NativeOpcode {
         group: 0x90,
@@ -4695,24 +4694,88 @@ const GRAPH90_START_OBJECT_CONTROL_PARAMETERS: &[NativeParameterSpec] = &[
     },
 ];
 const GRAPH90_START_OBJECT_CONTROL_EX_PARAMETERS: &[NativeParameterSpec] = &[
-    NativeParameterSpec { name: "object", kind: "display object handle", description: "CProcCtrlDspObj target object captured by sub_431D10." },
-    NativeParameterSpec { name: "target_alpha", kind: "0..=256", description: "Terminal transparency parameter." },
-    NativeParameterSpec { name: "duration_ms", kind: "milliseconds", description: "Base CProcCtrlDspObj duration; zero is normalized to one millisecond." },
-    NativeParameterSpec { name: "update_denominator", kind: "i32", description: "Sampling interval denominator used by sub_431D90." },
-    NativeParameterSpec { name: "update_numerator", kind: "i32", description: "Sampling interval numerator/enable used by sub_431D90." },
-    NativeParameterSpec { name: "input_enabled", kind: "boolean", description: "Enables CProcCtrlDspObj input-interrupt handling." },
-    NativeParameterSpec { name: "input_descriptor", kind: "input descriptor", description: "Packed target input scope used by CProcCtrlDspObj::Tick." },
+    NativeParameterSpec {
+        name: "object",
+        kind: "display object handle",
+        description: "CProcCtrlDspObj target object captured by sub_431D10.",
+    },
+    NativeParameterSpec {
+        name: "target_alpha",
+        kind: "0..=256",
+        description: "Terminal transparency parameter.",
+    },
+    NativeParameterSpec {
+        name: "duration_ms",
+        kind: "milliseconds",
+        description: "Base CProcCtrlDspObj duration; zero is normalized to one millisecond.",
+    },
+    NativeParameterSpec {
+        name: "update_denominator",
+        kind: "i32",
+        description: "Sampling interval denominator used by sub_431D90.",
+    },
+    NativeParameterSpec {
+        name: "update_numerator",
+        kind: "i32",
+        description: "Sampling interval numerator/enable used by sub_431D90.",
+    },
+    NativeParameterSpec {
+        name: "input_enabled",
+        kind: "boolean",
+        description: "Enables CProcCtrlDspObj input-interrupt handling.",
+    },
+    NativeParameterSpec {
+        name: "input_descriptor",
+        kind: "input descriptor",
+        description: "Packed target input scope used by CProcCtrlDspObj::Tick.",
+    },
 ];
 const GRAPH90_START_NODE_CONTROL_PARAMETERS: &[NativeParameterSpec] = &[
-    NativeParameterSpec { name: "object", kind: "display object handle", description: "CProcCtrlDspObj target object captured by sub_431D50." },
-    NativeParameterSpec { name: "target_x", kind: "i32 pixels", description: "Terminal object X position." },
-    NativeParameterSpec { name: "target_y", kind: "i32 pixels", description: "Terminal object Y position." },
-    NativeParameterSpec { name: "position_curve", kind: "curve selector", description: "Position interpolation selector consumed by the CProcCtrlDspObj updater." },
-    NativeParameterSpec { name: "target_alpha", kind: "0..=256", description: "Terminal transparency parameter." },
-    NativeParameterSpec { name: "duration_ms", kind: "milliseconds", description: "Base CProcCtrlDspObj duration; zero is normalized to one millisecond." },
-    NativeParameterSpec { name: "update_denominator", kind: "i32", description: "Sampling denominator; this selector passes update_numerator=0." },
-    NativeParameterSpec { name: "input_enabled", kind: "boolean", description: "Enables CProcCtrlDspObj input-interrupt handling." },
-    NativeParameterSpec { name: "input_descriptor", kind: "input descriptor", description: "Packed target input scope used by CProcCtrlDspObj::Tick." },
+    NativeParameterSpec {
+        name: "object",
+        kind: "display object handle",
+        description: "CProcCtrlDspObj target object captured by sub_431D50.",
+    },
+    NativeParameterSpec {
+        name: "target_x",
+        kind: "i32 pixels",
+        description: "Terminal object X position.",
+    },
+    NativeParameterSpec {
+        name: "target_y",
+        kind: "i32 pixels",
+        description: "Terminal object Y position.",
+    },
+    NativeParameterSpec {
+        name: "position_curve",
+        kind: "curve selector",
+        description: "Position interpolation selector consumed by the CProcCtrlDspObj updater.",
+    },
+    NativeParameterSpec {
+        name: "target_alpha",
+        kind: "0..=256",
+        description: "Terminal transparency parameter.",
+    },
+    NativeParameterSpec {
+        name: "duration_ms",
+        kind: "milliseconds",
+        description: "Base CProcCtrlDspObj duration; zero is normalized to one millisecond.",
+    },
+    NativeParameterSpec {
+        name: "update_denominator",
+        kind: "i32",
+        description: "Sampling denominator; this selector passes update_numerator=0.",
+    },
+    NativeParameterSpec {
+        name: "input_enabled",
+        kind: "boolean",
+        description: "Enables CProcCtrlDspObj input-interrupt handling.",
+    },
+    NativeParameterSpec {
+        name: "input_descriptor",
+        kind: "input descriptor",
+        description: "Packed target input scope used by CProcCtrlDspObj::Tick.",
+    },
 ];
 const GRAPH90_START_NODE_CONTROL_EX_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec { name: "arg0", kind: "control argument", description: "Source-order control argument 0; exact field name remains unrecovered while constructor placement and procedure class are confirmed." },
@@ -4769,15 +4832,51 @@ const GRAPH90_START_SPLINE_OBJECT_CONTROL_PARAMETERS: &[NativeParameterSpec] = &
     NativeParameterSpec { name: "input_descriptor", kind: "input descriptor", description: "Packed target input scope used by CProcCtrlDspObj::Tick." },
 ];
 const GRAPH90_START_SHAKE_OBJECT_CONTROL_PARAMETERS: &[NativeParameterSpec] = &[
-    NativeParameterSpec { name: "object", kind: "display object handle", description: "CProcShakeDspObj target CDspObj." },
-    NativeParameterSpec { name: "mode", kind: "0..5", description: "Shake axis/phase mode validated by sub_43C8A0." },
-    NativeParameterSpec { name: "amplitude", kind: "i32", description: "Initial shake amplitude." },
-    NativeParameterSpec { name: "frequency_hz", kind: "positive i32", description: "Wave frequency; sample_rate_hz must be at least this value." },
-    NativeParameterSpec { name: "cycles", kind: "positive i32", description: "Number of envelope cycles." },
-    NativeParameterSpec { name: "decay_percent", kind: "i32", description: "Per-cycle amplitude decay percentage." },
-    NativeParameterSpec { name: "sample_rate_hz", kind: "positive i32", description: "Native CProcedure update/sample rate." },
-    NativeParameterSpec { name: "input_enabled", kind: "boolean", description: "Enables CProcCtrlDspObj input-interrupt handling." },
-    NativeParameterSpec { name: "input_descriptor", kind: "input descriptor", description: "Packed target input scope used by CProcCtrlDspObj::Tick." },
+    NativeParameterSpec {
+        name: "object",
+        kind: "display object handle",
+        description: "CProcShakeDspObj target CDspObj.",
+    },
+    NativeParameterSpec {
+        name: "mode",
+        kind: "0..5",
+        description: "Shake axis/phase mode validated by sub_43C8A0.",
+    },
+    NativeParameterSpec {
+        name: "amplitude",
+        kind: "i32",
+        description: "Initial shake amplitude.",
+    },
+    NativeParameterSpec {
+        name: "frequency_hz",
+        kind: "positive i32",
+        description: "Wave frequency; sample_rate_hz must be at least this value.",
+    },
+    NativeParameterSpec {
+        name: "cycles",
+        kind: "positive i32",
+        description: "Number of envelope cycles.",
+    },
+    NativeParameterSpec {
+        name: "decay_percent",
+        kind: "i32",
+        description: "Per-cycle amplitude decay percentage.",
+    },
+    NativeParameterSpec {
+        name: "sample_rate_hz",
+        kind: "positive i32",
+        description: "Native CProcedure update/sample rate.",
+    },
+    NativeParameterSpec {
+        name: "input_enabled",
+        kind: "boolean",
+        description: "Enables CProcCtrlDspObj input-interrupt handling.",
+    },
+    NativeParameterSpec {
+        name: "input_descriptor",
+        kind: "input descriptor",
+        description: "Packed target input scope used by CProcCtrlDspObj::Tick.",
+    },
 ];
 const GRAPH90_SET_OBJECT_DRAW_ENABLED_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
@@ -5331,7 +5430,8 @@ const GRAPH90_REPLACE_SPRITE_BITMAP_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "primary_bitmap",
         kind: "bitmap handle",
-        description: "New primary bitmap; supported current modes rebuild their geometry around this bitmap.",
+        description:
+            "New primary bitmap; supported current modes rebuild their geometry around this bitmap.",
     },
 ];
 const GRAPH90_CONFIGURE_SPRITE_DUAL_BITMAP_PARAMETERS: &[NativeParameterSpec] = &[
@@ -6459,7 +6559,8 @@ const GRAPH90_ICON_CURRENT_GROUP_OUTPUT_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "output",
         kind: "writable BP pointer to i32",
-        description: "Receives DCIPIcon+0x3C: -1 for no current group, otherwise a descriptor group index.",
+        description:
+            "Receives DCIPIcon+0x3C: -1 for no current group, otherwise a descriptor group index.",
     },
     NativeParameterSpec {
         name: "processor",
@@ -8923,7 +9024,8 @@ const GRAPH90_GROUP_ENABLED_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "enabled",
         kind: "bool/i32",
-        description: "Recursive CDspObj draw-enable gate (+0x14), propagated to current group members.",
+        description:
+            "Recursive CDspObj draw-enable gate (+0x14), propagated to current group members.",
     },
 ];
 const GRAPH90_CONFIGURE_GROUP_PARAMETERS: &[NativeParameterSpec] = &[
@@ -9165,7 +9267,8 @@ const GRAPH92_GET_BITMAP_AUXILIARY_PAIR_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
         name: "destination_pair",
         kind: "BP pointer to 2 DWORDs",
-        description: "Receives auxiliary reference-point X/Y from bitmap-registry offsets +0x28/+0x2C.",
+        description:
+            "Receives auxiliary reference-point X/Y from bitmap-registry offsets +0x28/+0x2C.",
     },
     NativeParameterSpec {
         name: "bitmap",
@@ -18461,7 +18564,10 @@ pub enum NativeProcedureStart {
     /// Object-specific CProcCtrlDspObj installation.  The target procedure
     /// owns one CDspObj; waiting on a selector-global "any animation" flag
     /// lets unrelated animations stall or prematurely release this CThread.
-    GraphControl { object_id: i32, control_id: u64 },
+    GraphControl {
+        object_id: i32,
+        control_id: u64,
+    },
 }
 
 impl NativeCallFrame {
