@@ -807,11 +807,7 @@ impl RuntimeTraceApi {
         ));
     }
 
-    pub(crate) fn start_native_message(
-        &mut self,
-        text: String,
-        target_surface: Option<i32>,
-    ) -> i32 {
+    pub(crate) fn window_text_state(&self, target_surface: Option<i32>) -> TextState {
         let mut state = self.text_state.clone();
         if let Some(surface) = target_surface.and_then(|id| self.graph_surfaces.get(&id)) {
             let cursor = self
@@ -821,16 +817,32 @@ impl RuntimeTraceApi {
                 .unwrap_or_default();
             state.x = cursor.cursor_x as f32;
             state.y = cursor.cursor_y as f32;
-            state.width = (surface.viewport_width - state.x).max(1.0);
-            state.height = (surface.viewport_height - state.y).max(1.0);
+            state.width = (surface.valid_right as f32 + 1.0 - state.x).max(1.0);
+            state.height = (surface.valid_bottom as f32 + 1.0 - state.y).max(1.0);
             if cursor.font_size > 0 {
                 state.font_size = cursor.font_size as f32;
             }
-            if cursor.scale_percent > 0 {
-                state.line_height =
-                    (state.font_size * cursor.scale_percent as f32 / 100.0).max(1.0);
-            }
+            state.line_height =
+                (state.font_size * (100 + surface.line_spacing_percent) as f32 / 100.0).max(1.0);
         }
+        state
+    }
+
+    pub(crate) fn reset_window_text_cursor(&mut self, target: i32) {
+        if let Some(surface) = self.graph_surfaces.get(&target) {
+            let offset = self.graph_defaults.text_layout.boundary_offset;
+            let state = self.surface_text_states.entry(target).or_default();
+            state.cursor_x = surface.valid_left.saturating_add(offset);
+            state.cursor_y = surface.valid_top;
+        }
+    }
+
+    pub(crate) fn start_native_message(
+        &mut self,
+        text: String,
+        target_surface: Option<i32>,
+    ) -> i32 {
+        let state = self.window_text_state(target_surface);
         let parsed = parse_and_wrap_styled_message(&text, &state);
         // The target wrapper installs CProcDspMsg even for an empty or
         // control-only string. In particular, a lone 0x0A is a zero-delay

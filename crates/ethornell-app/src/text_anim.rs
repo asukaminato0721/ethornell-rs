@@ -256,7 +256,8 @@ pub(crate) fn parse_message_markup(text: &str) -> (String, Vec<RuntimeRubySpan>)
 }
 
 pub(crate) fn parse_message_markup_styled(text: &str) -> ParsedMessageMarkup {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    // Form-feed is a native message wait marker, not a printable glyph.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\x0c', "");
     let mut out = String::with_capacity(text.len());
     let mut ruby_spans = Vec::new();
     let mut style_spans = Vec::new();

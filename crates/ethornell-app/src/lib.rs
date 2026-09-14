@@ -423,6 +423,7 @@ struct NativeControlInputLatch {
 struct RuntimeTraceApi {
     manager: ResourceManager,
     native_root: PathBuf,
+    game_id: String,
     text_state: TextState,
     text_runtime: TextRuntime,
     graph_defaults: GraphRuntimeDefaults,
@@ -759,9 +760,13 @@ impl RuntimeTraceApi {
     }
 
     fn new_with_native_root(manager: ResourceManager, native_root: PathBuf) -> Self {
+        let game_id =
+            std::env::var("ETHORNELL_GAME_ID").unwrap_or_else(|_| "Tayutama2TV".into());
+        tracing::info!(%game_id, "configured native game identifier");
         Self {
             manager,
             native_root,
+            game_id,
             text_state: TextState::default(),
             text_runtime: TextRuntime::default(),
             graph_defaults: GraphRuntimeDefaults::default(),
@@ -1309,7 +1314,7 @@ impl RuntimeTraceApi {
             return true;
         }
 
-        if bitmap > 0 {
+        if bitmap >= 0 {
             let format = self.bitmap_formats.get(&bitmap).copied().unwrap_or(2);
             self.store_runtime_bitmap(bitmap, image, format);
             return true;
@@ -1328,7 +1333,7 @@ impl RuntimeTraceApi {
         horizontal_scale_percent: f32,
         color: [f32; 4],
     ) -> Option<(i32, i32)> {
-        if bitmap <= 0 {
+        if bitmap < 0 {
             return None;
         }
         let mut image = self.graph_bitmap_image(bitmap)?;
@@ -1561,9 +1566,19 @@ impl RuntimeTraceApi {
         archive_name: &str,
         resource_name: &str,
     ) -> bool {
+        self.load_graph_image_resource_target(Some(target_id), archive_name, resource_name)
+    }
+
+    // A missing target means cache only; bitmap slot zero is a valid script target.
+    fn load_graph_image_resource_target(
+        &mut self,
+        target_id: Option<i32>,
+        archive_name: &str,
+        resource_name: &str,
+    ) -> bool {
         let key = format!("{archive_name}:{resource_name}");
         if self.graph_images.contains_key(&key) {
-            if target_id != 0 {
+            if let Some(target_id) = target_id {
                 let dimensions = self
                     .graph_images
                     .get(&key)
@@ -1582,7 +1597,7 @@ impl RuntimeTraceApi {
                 surface.resource_id = Some(target_id);
                 self.graph_surfaces.insert(target_id, surface);
             }
-            trace_graph!(self, "load image #{target_id} {key} (cached)");
+            trace_graph!(self, "load image #{target_id:?} {key} (cached)");
             return true;
         }
         let Some(entry) = find_runtime_resource(&self.manager, archive_name, resource_name) else {
@@ -1624,6 +1639,11 @@ impl RuntimeTraceApi {
                     metadata.embedded_point(),
                     Some((metadata.bpp, metadata.image_subtype)),
                 )
+            } else if bytes.starts_with(b"BM") {
+                let Ok(native_format) = ethornell_image::bmp_native_bitmap_format(&bytes) else {
+                    return false;
+                };
+                (native_format, None, None)
             } else {
                 // Portable PNG/JPEG/raw-image compatibility resources have no
                 // target CBG subtype to recover. Keep the historical RGBA
@@ -1631,12 +1651,17 @@ impl RuntimeTraceApi {
                 (2, None, None)
             };
 
-        let Ok(image) = decode_image(&bytes) else {
-            trace_graph!(
-                self,
-                "load resource {archive_name}:{resource_name} (not image)"
-            );
-            return false;
+        let image = match decode_image(&bytes) {
+            Ok(image) => image,
+            Err(err) => {
+                tracing::warn!(
+                    archive = archive_name,
+                    resource = resource_name,
+                    %err,
+                    "bitmap decode failed"
+                );
+                return false;
+            }
         };
         self.graph_image_formats
             .insert(key.clone(), native_bitmap_format);
@@ -1646,7 +1671,7 @@ impl RuntimeTraceApi {
             self.graph_image_auxiliary_pairs.remove(&key);
         }
         tracing::info!(
-            target = target_id,
+            target = ?target_id,
             archive = archive_name,
             resource = resource_name,
             width = image.width,
@@ -1659,11 +1684,11 @@ impl RuntimeTraceApi {
         );
         trace_graph!(
             self,
-            "load image #{target_id} {key} -> {}x{} format={native_bitmap_format} cbg={cbg_format_trace:?} aux={auxiliary_pair:?}",
+            "load image #{target_id:?} {key} -> {}x{} format={native_bitmap_format} cbg={cbg_format_trace:?} aux={auxiliary_pair:?}",
             image.width,
             image.height
         );
-        if target_id != 0 {
+        if let Some(target_id) = target_id {
             self.graph_resources
                 .insert(target_id, RuntimeGraphResource::whole(key.clone()));
             self.bitmap_dimensions
@@ -1686,14 +1711,14 @@ impl RuntimeTraceApi {
         let Some((archive, resource)) = key.split_once(':') else {
             return false;
         };
-        self.load_graph_image_resource(0, archive, resource)
+        self.load_graph_image_resource_target(None, archive, resource)
     }
 
     fn ensure_title_atlas_images(&mut self) {
         for resource_name in ["SGTitle000000", "SGTitle000001", "SGTitle000003"] {
             let key = format!("sysgrp.arc:{resource_name}");
             if !self.graph_images.contains_key(&key) {
-                self.load_graph_image_resource(0, "sysgrp.arc", resource_name);
+                self.load_graph_image_resource_target(None, "sysgrp.arc", resource_name);
             }
         }
     }
@@ -5216,7 +5241,7 @@ impl RuntimeTraceApi {
     }
 
     fn copy_graph_backing(&mut self, source: i32, destination: i32) {
-        if source == 0 || destination == 0 || source == destination {
+        if source == destination {
             return;
         }
         if let Some(dimensions) = self.bitmap_dimensions.get(&source).copied() {
@@ -5244,9 +5269,6 @@ impl RuntimeTraceApi {
     }
 
     fn clone_graph_bitmap(&mut self, source: i32, destination: i32) -> bool {
-        if source == 0 || destination == 0 {
-            return false;
-        }
         if source == destination {
             return self.graph_bitmap_image(source).is_some();
         }
@@ -7425,6 +7447,16 @@ impl RuntimeEngine {
     ) -> Self {
         let program = ethornell_script::parse_bp_program(Some(script.to_string()), bytes);
         let mut vm = ethornell_vm::Vm::new();
+        if let Ok(label) = std::env::var("ETHORNELL_TEXT_ENCODING") {
+            match label.trim().to_ascii_lowercase().as_str() {
+                "gbk" | "cp936" | "windows-936" => {
+                    vm.set_graph_text_encoding(encoding_rs::GBK);
+                    tracing::info!(encoding = "GBK", "game display text encoding configured");
+                }
+                "shift_jis" | "shift-jis" | "sjis" | "cp932" => {}
+                _ => tracing::warn!(%label, "unsupported ETHORNELL_TEXT_ENCODING; using Shift-JIS"),
+            }
+        }
         vm.start(&program);
         Self {
             vm,
@@ -12727,6 +12759,73 @@ mod input_tests {
     }
 
     #[test]
+    fn bitmap_zero_load_clone_and_cache_only_lookup_preserve_pixels() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let pixels = DecodedImage {
+            width: 2,
+            height: 1,
+            rgba: vec![255; 8],
+        };
+        api.store_graph_image("cached.arc:portrait".into(), pixels.clone());
+        api.graph_image_formats
+            .insert("cached.arc:portrait".into(), 2);
+        api.store_graph_image(
+            "cached.arc:other".into(),
+            DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![0; 4],
+            },
+        );
+        assert!(api.load_graph_image_resource(0, "cached.arc", "portrait"));
+        assert_eq!(api.graph_bitmap_image(0).unwrap().rgba, pixels.rgba);
+        assert!(api.load_graph_image_key("cached.arc:other"));
+        assert_eq!(api.bitmap_dimensions.get(&0), Some(&(2, 1)));
+        assert!(api.clone_graph_bitmap(0, 1));
+        assert_eq!(api.graph_bitmap_image(1).unwrap().rgba, pixels.rgba);
+        assert!(api.load_graph_image_resource(0, "cached.arc", "other"));
+        assert!(api.clone_graph_bitmap(1, 0));
+        assert_eq!(api.graph_bitmap_image(0).unwrap().rgba, pixels.rgba);
+    }
+
+    #[test]
+    fn clearing_message_window_preserves_font_and_restores_valid_origin() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = api.alloc_window_surface(1280, 206).unwrap();
+        let surface = api.graph_surfaces.get_mut(&window).unwrap();
+        surface.valid_left = 118;
+        surface.valid_top = 58;
+        surface.valid_right = 1162;
+        surface.valid_bottom = 186;
+        surface.line_spacing_percent = 34;
+        api.graph_defaults.text_layout.boundary_offset = 0;
+        let cursor = api.surface_text_states.entry(window).or_default();
+        cursor.cursor_x = 900;
+        cursor.cursor_y = 100;
+        cursor.font_size = 28;
+        cursor.font = 7;
+        let mut stack = vec![Value::Int(window)];
+        call_graph(&mut api, 0x92, 0x8e, &mut stack).unwrap();
+        let state = api.window_text_state(Some(window));
+        assert_eq!(
+            (state.x, state.y, state.width, state.height),
+            (118.0, 58.0, 1045.0, 129.0)
+        );
+        assert_eq!(state.font_size, 28.0);
+        assert!((state.line_height - 37.52).abs() < 0.001);
+        assert_eq!(api.surface_text_states[&window].font, 7);
+        api.start_native_message("字幕".into(), Some(window));
+        api.tick_text(1000);
+        let target = api.text_runtime.target_node.unwrap();
+        assert_eq!(api.start_native_message("\x0c".into(), Some(window)), 0);
+        assert_eq!(api.text_nodes[&target].text, "字幕");
+    }
+
+    #[test]
     fn graph90_11_replaces_stale_same_handle_bitmap_storage() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -15741,6 +15840,10 @@ impl RuntimeTraceApi {
 }
 
 impl ethornell_vm::SysApi for RuntimeTraceApi {
+    fn game_id(&self) -> &str {
+        &self.game_id
+    }
+
     fn seed_native_crt_rng(&mut self, seed: u32) {
         RuntimeTraceApi::seed_native_crt_rng(self, seed);
     }
@@ -17959,7 +18062,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0xe8) => {
                 let ptr = stack.pop();
-                tracing::info!(?ptr, value = "Tayutama2TV", "GetGameId");
+                tracing::info!(?ptr, value = self.game_id, "GetGameId");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0xfd) => {
@@ -19586,6 +19689,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             surface.valid_right = x.saturating_add(width).saturating_sub(1);
                             surface.valid_bottom = y.saturating_add(height).saturating_sub(1);
                         }
+                        self.reset_window_text_cursor(window);
                         trace_graph!(
                             self,
                             "window #{window} valid-region=({x},{y}) {width}x{height}"
@@ -20794,17 +20898,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let args = pop_args(stack, 11);
                 let text = args.get(9).and_then(value_to_string);
                 let target = args.get(10).map(value_to_i32).unwrap_or_default();
-                let inferred = infer_text_state(&args);
-                if inferred.width > 0.0 && inferred.height > 0.0 {
-                    self.text_state = inferred;
-                }
+                let state = self.window_text_state(Some(target));
                 if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
                     // sub_486500 and the message procedure both enter
                     // sub_42B710, so direct formatted draws must preserve the
                     // same ruby spans and kinsoku wrapping as 92:90.
-                    let parsed = text::parse_and_wrap_styled_message(text, &self.text_state);
-                    let x = self.text_state.x;
-                    let y = self.text_state.y;
+                    let parsed = text::parse_and_wrap_styled_message(text, &state);
+                    let x = state.x;
+                    let y = state.y;
                     self.store_bitmap_text_run(
                         target,
                         RuntimeTextNode {
@@ -20815,10 +20916,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             target_surface: Some(target),
                             x,
                             y,
-                            size: self.text_state.font_size,
-                            line_height: self.text_state.line_height,
+                            size: state.font_size,
+                            line_height: state.line_height,
                             formatted_layout: true,
-                            color: self.text_state.color,
+                            color: state.color,
                             z: target,
                             ruby_spans: parsed.ruby_spans,
                             style_spans: parsed.style_spans,
@@ -20911,8 +21012,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x92, 0x8e) => {
                 let target = pop_int_value(stack).unwrap_or_default();
-                self.surface_text_states
-                    .insert(target, SurfaceTextState::default());
+                self.reset_window_text_cursor(target);
+                self.clear_bitmap_text(target);
                 self.surface_text_buffers.insert(target, String::new());
                 if self.native_message_surface_target == Some(target) {
                     self.reset_native_message_text();
@@ -22265,29 +22366,6 @@ fn runtime_file_attributes(manager: &ResourceManager, file: &str) -> i32 {
         attrs |= 0x80;
     }
     attrs
-}
-
-fn infer_text_state(args: &[ethornell_vm::Value]) -> TextState {
-    let mut state = TextState::default();
-    let ints: Vec<i32> = args
-        .iter()
-        .filter_map(|value| match value {
-            ethornell_vm::Value::Int(v) => Some(*v),
-            ethornell_vm::Value::Ptr(v) => Some(*v as i32),
-            _ => None,
-        })
-        .collect();
-    if let Some(size) = ints.iter().rev().copied().find(|v| (8..=96).contains(v)) {
-        state.font_size = size as f32;
-        state.line_height = state.font_size + 6.0;
-    }
-    if let Some((x, y, width, height)) = infer_text_rect(&ints) {
-        state.x = x as f32;
-        state.y = y as f32;
-        state.width = width as f32;
-        state.height = height as f32;
-    }
-    state
 }
 
 fn infer_text_color(args: &[ethornell_vm::Value]) -> Option<[f32; 4]> {

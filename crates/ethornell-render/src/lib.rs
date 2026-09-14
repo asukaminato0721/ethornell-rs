@@ -1125,6 +1125,7 @@ const SYSTEM_CJK_FONT_CANDIDATES: &[&str] = &[
     "/Library/Fonts/Arial Unicode.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "C:/Windows/Fonts/msgothic.ttc",
     "C:/Windows/Fonts/msyh.ttc",
 ];
