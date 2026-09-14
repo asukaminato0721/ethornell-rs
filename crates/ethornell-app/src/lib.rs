@@ -22793,16 +22793,6 @@ fn run_headless(
                 .total_native_calls
                 .wrapping_sub(previous_native_calls);
             previous_native_calls = runtime.api.total_native_calls;
-            // Temporary trace acceleration while diagnosing the scenario string source.
-            if std::env::var_os("ETHORNELL_FAST_TRACE").is_some()
-                && frame % 60 != 0
-                && snapshot_frame != Some(frame)
-            {
-                if runtime.api.quit_requested || runtime.vm.halted {
-                    break;
-                }
-                continue;
-            }
             // Headless differs from the window frontend only at final
             // presentation: every logical frame still traverses the shared
             // render tree and produces a complete offscreen framebuffer.

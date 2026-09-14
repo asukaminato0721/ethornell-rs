@@ -7358,17 +7358,6 @@ impl Vm {
     }
 
     fn copy_c_string_pointer(&mut self, dst: u32, src: u32) -> VmResult<()> {
-        if std::env::var_os("TRACE_STRCPY").is_some()
-            && Self::value_key(dst) == Self::value_key(0x1200_5275)
-        {
-            tracing::warn!(
-                dst = format_args!("0x{dst:08X}"),
-                src = format_args!("0x{src:08X}"),
-                source_value = ?self.mem_values.get(&Self::value_key(src)).map(value_summary),
-                source_dump = %self.memory_preview(src, 96),
-                "TRACE_STRCPY"
-            );
-        }
         if let Some(Value::Str(text)) = self.mem_values.get(&Self::value_key(src)).cloned() {
             return self.write_c_string(dst, &text);
         }
@@ -9779,10 +9768,12 @@ impl Vm {
             }
             (0x80, 0x45) => Value::None,
             (0x80, 0x80) => {
-                self.push_value(Value::Int(0));
-                self.push_value(Value::Int(0));
-                Value::Int(0)
+                let result = self.load_global_user_data(api)?;
+                self.push_value(Value::Int(result.window_x));
+                self.push_value(Value::Int(result.window_y));
+                Value::Int(result.status)
             }
+            (0x80, 0x81) => Value::Int(i32::from(self.save_global_user_data(api))),
             (0x80, 0x88) => self.sys80_88_create_or_resize_read_flag_table()?,
             (0x80, 0x89) => self.sys80_89_set_read_flag_bit()?,
             (0x80, 0xd0) => {
