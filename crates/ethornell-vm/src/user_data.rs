@@ -555,8 +555,10 @@ fn next_sdc_random(state: &mut u32) -> u8 {
         .wrapping_add(state.wrapping_mul(0x015a))
         .wrapping_add(low_product >> 16)
         & 0xffff;
-    let next_low = (low_product as u16).wrapping_add(1);
-    *state = (next_high << 16) | u32::from(next_low);
+    // Match the native 32-bit add.  A carry from 0xffff + 1 belongs in the
+    // high word and must not be discarded before the halves are combined.
+    let next_low = (low_product & 0xffff).wrapping_add(1);
+    *state = (next_high << 16).wrapping_add(next_low);
     (next_high & 0x7fff) as u8
 }
 
@@ -606,6 +608,14 @@ fn read_sjis_c_string(bytes: &[u8], cursor: &mut usize) -> VmResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdc_random_preserves_low_word_carry() {
+        let mut state = 0x0000_ebe3;
+
+        assert_eq!(next_sdc_random(&mut state), 0xdd);
+        assert_eq!(state, 0x18de_0000);
+    }
 
     #[test]
     fn sdc_literal_encoder_round_trips() {

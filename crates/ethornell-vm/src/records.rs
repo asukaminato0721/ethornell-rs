@@ -173,8 +173,11 @@ impl Vm {
                 .wrapping_add(state.wrapping_mul(0x015a))
                 .wrapping_add(low_product >> 16)
                 & 0xffff;
-            let next_low = (low_product as u16).wrapping_add(1);
-            state = (next_high << 16) | u32::from(next_low);
+            // The target adds one to the zero-extended low product before it
+            // combines both halves.  Preserve the carry into the high word;
+            // truncating first desynchronizes some otherwise valid SDC files.
+            let next_low = (low_product & 0xffff).wrapping_add(1);
+            state = (next_high << 16).wrapping_add(next_low);
             let random = (next_high & 0x7fff) as u8;
             *byte = byte.wrapping_sub(random);
         }

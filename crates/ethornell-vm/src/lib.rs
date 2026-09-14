@@ -8647,8 +8647,8 @@ impl Vm {
                 }
             }
             (0x81, 0x35) => {
-                let _context = self.pop_ptr()?;
                 let path = self.pop_string_lossy()?;
+                let _context = self.pop_ptr()?;
                 let size = api
                     .load_file_bytes("", &path)
                     .or_else(|| std::fs::read(&path).ok())
@@ -16509,6 +16509,22 @@ mod tests {
         assert_eq!(vm.stack, [Value::Int(0)]);
         assert!(vm.thread.current_procedure().is_none());
         assert_eq!(vm.thread.status(), 0);
+    }
+
+    #[test]
+    fn sys81_35_uses_target_context_then_path_argument_order() {
+        let mut vm = Vm::new();
+        let mut api = FileBytesApi {
+            bytes: b"save data".to_vec(),
+        };
+        vm.stack
+            .extend([Value::Int(0), Value::Str("sample.bin".into())]);
+
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut api, 0x81, 0x35).unwrap(),
+            Some(Value::Int(9))
+        );
+        assert!(vm.stack.is_empty());
     }
 
     #[test]

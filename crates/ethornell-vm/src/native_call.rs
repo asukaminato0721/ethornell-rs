@@ -11219,14 +11219,14 @@ const SYS81_32_PARAMETERS: &[NativeParameterSpec] = &[
 
 const SYS81_35_PARAMETERS: &[NativeParameterSpec] = &[
     NativeParameterSpec {
-        name: "context",
-        kind: "pointer/reserved",
-        description: "Popped but ignored by the target wrapper.",
-    },
-    NativeParameterSpec {
         name: "path",
         kind: "Shift-JIS path",
         description: "Resource name.",
+    },
+    NativeParameterSpec {
+        name: "context",
+        kind: "pointer/reserved",
+        description: "Popped after the path and ignored by the target wrapper.",
     },
 ];
 
