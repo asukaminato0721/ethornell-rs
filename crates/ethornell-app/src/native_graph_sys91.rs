@@ -800,9 +800,9 @@ impl RuntimeTraceApi {
                 let offset = self.graph_defaults.text_layout.boundary_offset as f32;
                 let reached = self.graph_surfaces.get(&window).is_some_and(|surface| {
                     if surface.message_variant == 1 {
-                        state.cursor_y as f32 == surface.viewport_y + offset
+                        state.cursor_y as f32 == surface.valid_top as f32 + offset
                     } else {
-                        state.cursor_x as f32 == surface.viewport_x + offset
+                        state.cursor_x as f32 == surface.valid_left as f32 + offset
                     }
                 });
                 ethornell_vm::Value::Int(i32::from(reached))
