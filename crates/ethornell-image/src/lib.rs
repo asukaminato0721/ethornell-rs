@@ -12,6 +12,7 @@ pub enum ImageFormat {
     RawBgiImage,
     Png,
     Jpeg,
+    Bmp,
     Unknown,
 }
 
@@ -92,6 +93,8 @@ pub fn detect_image_format(buf: &[u8]) -> ImageFormat {
         ImageFormat::Png
     } else if buf.starts_with(b"\xff\xd8\xff") {
         ImageFormat::Jpeg
+    } else if buf.starts_with(b"BM") {
+        ImageFormat::Bmp
     } else if looks_like_raw_bgi_image(buf) {
         ImageFormat::RawBgiImage
     } else {
@@ -103,7 +106,7 @@ pub fn decode_image(data: &[u8]) -> Result<DecodedImage> {
     match detect_image_format(data) {
         ImageFormat::CompressedBg => decode_cbg(data),
         ImageFormat::RawBgiImage => decode_raw_bgi_image(data),
-        ImageFormat::Png | ImageFormat::Jpeg => decode_standard_image(data),
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Bmp => decode_standard_image(data),
         format => Err(EthornellError::UnsupportedFormat(format!(
             "image decode unsupported for {format:?}"
         ))),
@@ -151,6 +154,18 @@ fn decode_standard_image(data: &[u8]) -> Result<DecodedImage> {
         width,
         height,
         rgba: image.into_raw(),
+    })
+}
+
+/// Map standard BMP storage to the runtime's opaque RGB / alpha RGBA formats.
+pub fn bmp_native_bitmap_format(data: &[u8]) -> Result<i32> {
+    use image::ImageDecoder;
+    let decoder = image::codecs::bmp::BmpDecoder::new(Cursor::new(data))
+        .map_err(|err| EthornellError::UnsupportedFormat(format!("BMP header: {err}")))?;
+    Ok(if decoder.color_type().has_alpha() {
+        2
+    } else {
+        1
     })
 }
 
@@ -301,6 +316,47 @@ mod tests {
     #[test]
     fn detects_unknown_image() {
         assert_eq!(detect_image_format(b"hello"), ImageFormat::Unknown);
+    }
+
+    #[test]
+    fn decodes_bottom_up_rgb_bmp_with_row_padding_as_an_opaque_background() {
+        let mut data = vec![0u8; 70];
+        data[..2].copy_from_slice(b"BM");
+        data[2..6].copy_from_slice(&70u32.to_le_bytes());
+        data[10..14].copy_from_slice(&54u32.to_le_bytes());
+        data[14..18].copy_from_slice(&40u32.to_le_bytes());
+        data[18..22].copy_from_slice(&2i32.to_le_bytes());
+        data[22..26].copy_from_slice(&2i32.to_le_bytes());
+        data[26..28].copy_from_slice(&1u16.to_le_bytes());
+        data[28..30].copy_from_slice(&24u16.to_le_bytes());
+        data[34..38].copy_from_slice(&16u32.to_le_bytes());
+        // BGR rows, bottom first, each padded to a multiple of four bytes.
+        data[54..].copy_from_slice(&[255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0]);
+
+        assert_eq!(detect_image_format(&data), ImageFormat::Bmp);
+        assert_eq!(bmp_native_bitmap_format(&data).unwrap(), 1);
+        let image = decode_image(&data).unwrap();
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(
+            image.rgba,
+            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+        );
+        assert!(decode_image(&data[..54]).is_err());
+    }
+
+    #[test]
+    fn alpha_bmp_keeps_rgba_format_and_transparency() {
+        let mut data = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(1, 1, vec![10, 20, 30, 40]).unwrap(),
+        )
+        .write_to(&mut data, image::ImageFormat::Bmp)
+        .unwrap();
+        assert_eq!(bmp_native_bitmap_format(data.get_ref()).unwrap(), 2);
+        assert_eq!(
+            decode_image(data.get_ref()).unwrap().rgba,
+            vec![10, 20, 30, 40]
+        );
     }
 
     #[test]

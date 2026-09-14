@@ -366,6 +366,11 @@ pub struct ShortcutInstallerWorkflowRequest {
 }
 
 pub trait SysApi {
+    /// Identifier supplied by the game's native executable (Sys80:E8).
+    fn game_id(&self) -> &str {
+        "Tayutama2TV"
+    }
+
     fn call_sys(&mut self, call: &mut NativeCallFrame) -> VmResult<Value>;
 
     /// Keep the Microsoft CRT rand() state shared with host-native subsystems
@@ -10011,7 +10016,7 @@ impl Vm {
             }
             (0x80, 0xe8) => {
                 let ptr = self.pop_ptr()?;
-                self.write_c_string(ptr, "Tayutama2TV")?;
+                self.write_c_string(ptr, api.game_id())?;
                 Value::None
             }
             (0x80, 0xe9) => {
@@ -12178,6 +12183,7 @@ mod tests {
 
     #[derive(Default)]
     struct SchedulingApi {
+        game_id: Option<String>,
         host_sys_calls: usize,
         system_events: std::collections::VecDeque<[i32; 3]>,
         bitmap_dimensions: std::collections::BTreeMap<i32, (u32, u32)>,
@@ -12236,6 +12242,10 @@ mod tests {
     }
 
     impl SysApi for SchedulingApi {
+        fn game_id(&self) -> &str {
+            self.game_id.as_deref().unwrap_or("Tayutama2TV")
+        }
+
         fn call_sys(&mut self, _call: &mut NativeCallFrame) -> super::VmResult<Value> {
             self.host_sys_calls += 1;
             Ok(Value::None)
@@ -14770,6 +14780,26 @@ mod tests {
             vm.stack.is_empty(),
             "zero-output native handlers must not alter BP stack depth"
         );
+    }
+
+    #[test]
+    fn native_game_id_writes_host_identifier_without_a_stack_result() {
+        let mut vm = Vm::new();
+        let mut api = SchedulingApi {
+            game_id: Some("HimawariNoKyoukaiToNagaiNatsuyasumi".into()),
+            ..Default::default()
+        };
+        let destination = 0x3000;
+        vm.stack.extend([Value::Int(42), Value::Ptr(destination)]);
+
+        vm.dispatch(
+            &test_instruction(0x10, 0x80, "sys1", vec![0x80, 0xe8], Vec::new()),
+            &mut api,
+        )
+        .unwrap();
+
+        assert_eq!(vm.read_c_string(destination).unwrap(), api.game_id());
+        assert_eq!(vm.stack, vec![Value::Int(42)]);
     }
 
     #[test]

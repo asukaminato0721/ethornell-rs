@@ -423,6 +423,7 @@ struct NativeControlInputLatch {
 struct RuntimeTraceApi {
     manager: ResourceManager,
     native_root: PathBuf,
+    game_id: String,
     text_state: TextState,
     text_runtime: TextRuntime,
     graph_defaults: GraphRuntimeDefaults,
@@ -759,9 +760,13 @@ impl RuntimeTraceApi {
     }
 
     fn new_with_native_root(manager: ResourceManager, native_root: PathBuf) -> Self {
+        let game_id =
+            std::env::var("ETHORNELL_GAME_ID").unwrap_or_else(|_| "Tayutama2TV".into());
+        tracing::info!(%game_id, "configured native game identifier");
         Self {
             manager,
             native_root,
+            game_id,
             text_state: TextState::default(),
             text_runtime: TextRuntime::default(),
             graph_defaults: GraphRuntimeDefaults::default(),
@@ -1624,6 +1629,11 @@ impl RuntimeTraceApi {
                     metadata.embedded_point(),
                     Some((metadata.bpp, metadata.image_subtype)),
                 )
+            } else if bytes.starts_with(b"BM") {
+                let Ok(native_format) = ethornell_image::bmp_native_bitmap_format(&bytes) else {
+                    return false;
+                };
+                (native_format, None, None)
             } else {
                 // Portable PNG/JPEG/raw-image compatibility resources have no
                 // target CBG subtype to recover. Keep the historical RGBA
@@ -1631,12 +1641,17 @@ impl RuntimeTraceApi {
                 (2, None, None)
             };
 
-        let Ok(image) = decode_image(&bytes) else {
-            trace_graph!(
-                self,
-                "load resource {archive_name}:{resource_name} (not image)"
-            );
-            return false;
+        let image = match decode_image(&bytes) {
+            Ok(image) => image,
+            Err(err) => {
+                tracing::warn!(
+                    archive = archive_name,
+                    resource = resource_name,
+                    %err,
+                    "bitmap decode failed"
+                );
+                return false;
+            }
         };
         self.graph_image_formats
             .insert(key.clone(), native_bitmap_format);
@@ -15741,6 +15756,10 @@ impl RuntimeTraceApi {
 }
 
 impl ethornell_vm::SysApi for RuntimeTraceApi {
+    fn game_id(&self) -> &str {
+        &self.game_id
+    }
+
     fn seed_native_crt_rng(&mut self, seed: u32) {
         RuntimeTraceApi::seed_native_crt_rng(self, seed);
     }
@@ -17959,7 +17978,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0xe8) => {
                 let ptr = stack.pop();
-                tracing::info!(?ptr, value = "Tayutama2TV", "GetGameId");
+                tracing::info!(?ptr, value = self.game_id, "GetGameId");
                 return Ok(ethornell_vm::Value::None);
             }
             (0x80, 0xfd) => {
