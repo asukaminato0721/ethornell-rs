@@ -388,9 +388,9 @@ fn capture_draw_item(
     // auxiliary layer that merely shares the same owner.
     let mode5_render_state = api.graph_mode5_render_states.get(&layer_id).copied();
     let destination_quad = mode5_render_state.map(|state| {
-        state.local_affine_quad.map(|[local_x, local_y]| {
-            [item_x + local_x, item_y + local_y]
-        })
+        state
+            .local_affine_quad
+            .map(|[local_x, local_y]| [item_x + local_x, item_y + local_y])
     });
     let mut draw_clip = api
         .layer_display_clip(layer)
@@ -793,11 +793,7 @@ fn point_in_clip(x: i32, y: i32, clip: Option<crate::graph::RuntimeClipRect>) ->
     })
 }
 
-fn composite_runtime_item(
-    dst: &mut DecodedImage,
-    src: &DecodedImage,
-    item: &RuntimeGraphDrawItem,
-) {
+fn composite_runtime_item(dst: &mut DecodedImage, src: &DecodedImage, item: &RuntimeGraphDrawItem) {
     if let Some(quad) = item.destination_quad {
         composite_affine_mode5(
             dst,
@@ -846,11 +842,7 @@ fn composite_affine_mode5(
     linear_sampling: bool,
     ignore_source_alpha: bool,
 ) {
-    if src.width == 0
-        || src.height == 0
-        || src_width <= 0.0
-        || src_height <= 0.0
-        || opacity <= 0.0
+    if src.width == 0 || src.height == 0 || src_width <= 0.0 || src_height <= 0.0 || opacity <= 0.0
     {
         return;
     }
@@ -864,12 +856,18 @@ fn composite_affine_mode5(
         return;
     }
 
-    let min_x = quad.iter().map(|point| point[0]).fold(f32::INFINITY, f32::min);
+    let min_x = quad
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::INFINITY, f32::min);
     let max_x = quad
         .iter()
         .map(|point| point[0])
         .fold(f32::NEG_INFINITY, f32::max);
-    let min_y = quad.iter().map(|point| point[1]).fold(f32::INFINITY, f32::min);
+    let min_y = quad
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::INFINITY, f32::min);
     let max_y = quad
         .iter()
         .map(|point| point[1])
@@ -950,9 +948,7 @@ fn sample_mode5_bilinear(src: &DecodedImage, x: f32, y: f32) -> Option<[u8; 4]> 
     for channel in 0..4 {
         let top = p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx;
         let bottom = p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx;
-        out[channel] = (top * (1.0 - fy) + bottom * fy)
-            .floor()
-            .clamp(0.0, 255.0) as u8;
+        out[channel] = (top * (1.0 - fy) + bottom * fy).floor().clamp(0.0, 255.0) as u8;
     }
     Some(out)
 }
@@ -962,7 +958,11 @@ fn source_pixel_or_none(src: &DecodedImage, x: i32, y: i32) -> Option<[u8; 4]> {
         return None;
     }
     let index = ((y as u32 * src.width + x as u32) * 4) as usize;
-    Some(src.rgba[index..index + 4].try_into().expect("RGBA source pixel"))
+    Some(
+        src.rgba[index..index + 4]
+            .try_into()
+            .expect("RGBA source pixel"),
+    )
 }
 
 fn source_pixel_or_zero(src: &DecodedImage, x: i32, y: i32) -> [u8; 4] {
@@ -1055,10 +1055,7 @@ mod native_compositor_tests {
             width: 2,
             height: 2,
             rgba: vec![
-                255, 0, 0, 255,
-                0, 255, 0, 255,
-                0, 0, 255, 255,
-                255, 255, 255, 255,
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
             ],
         };
         let mut destination = DecodedImage {

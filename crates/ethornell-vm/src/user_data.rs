@@ -186,6 +186,13 @@ impl Vm {
     }
 
     pub(crate) fn save_global_user_data<A: SysApi>(&mut self, api: &mut A) -> bool {
+        // The first 1 KiB of the target's global allocation is also the BP
+        // common-memory configuration block.  Keep the serialized mirror in
+        // step with writes made by the script before producing BGI.gdb.
+        let config_len = GLOBAL_CONFIG_SIZE
+            .min(self.global_config.len())
+            .min(self.memory.len());
+        self.global_config[..config_len].copy_from_slice(&self.memory[..config_len]);
         let encoded = encode_sdc(&self.serialize_global_data(), 0);
         api.write_file_bytes("BGI.gdb", &encoded)
     }
@@ -273,6 +280,10 @@ impl Vm {
             self.global_config.resize(GLOBAL_CONFIG_SIZE, 0);
         }
         self.global_config[..GLOBAL_CONFIG_SIZE].copy_from_slice(&raw[32..0x420]);
+        let config = self.global_config[..GLOBAL_CONFIG_SIZE].to_vec();
+        let destination = self.resolve_write_range(0, config.len())?;
+        self.memory[destination].copy_from_slice(&config);
+        self.clear_shadow_values(0, config.len());
         self.global_user_data
             .copy_from_slice(&raw[0x424..RAW_FIXED_SIZE]);
 
@@ -555,8 +566,10 @@ fn next_sdc_random(state: &mut u32) -> u8 {
         .wrapping_add(state.wrapping_mul(0x015a))
         .wrapping_add(low_product >> 16)
         & 0xffff;
-    let next_low = (low_product as u16).wrapping_add(1);
-    *state = (next_high << 16) | u32::from(next_low);
+    // Match the native 32-bit add.  A carry from 0xffff + 1 belongs in the
+    // high word and must not be discarded before the halves are combined.
+    let next_low = (low_product & 0xffff).wrapping_add(1);
+    *state = (next_high << 16).wrapping_add(next_low);
     (next_high & 0x7fff) as u8
 }
 
@@ -608,6 +621,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sdc_random_preserves_low_word_carry() {
+        let mut state = 0x0000_ebe3;
+
+        assert_eq!(next_sdc_random(&mut state), 0xdd);
+        assert_eq!(state, 0x18de_0000);
+    }
+
+    #[test]
     fn sdc_literal_encoder_round_trips() {
         let raw = (0..4097).map(|value| value as u8).collect::<Vec<_>>();
         for seed in [0, 1, 999] {
@@ -647,6 +668,7 @@ mod tests {
     #[test]
     fn global_payload_round_trips_memory_names_and_flags() {
         let mut vm = Vm::new();
+        vm.global_config[134] = 42;
         vm.global_user_data[123..127].copy_from_slice(&[1, 2, 3, 4]);
         vm.resource_names = vec!["BG0001".into(), "face".into()];
         vm.read_flags
@@ -657,6 +679,7 @@ mod tests {
         let mut restored = Vm::new();
         let result = restored.install_global_data(&raw).unwrap();
         assert_eq!(result.status, 0);
+        assert_eq!(restored.memory[134], 42);
         assert_eq!(&restored.global_user_data[123..127], &[1, 2, 3, 4]);
         assert_eq!(
             restored.resource_names,

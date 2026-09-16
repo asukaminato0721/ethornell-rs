@@ -1393,7 +1393,10 @@ impl RuntimeTraceApi {
             _ => return,
         };
         let sort_index = {
-            let next = self.graph_native_constructor_serials.entry(kind).or_default();
+            let next = self
+                .graph_native_constructor_serials
+                .entry(kind)
+                .or_default();
             let current = *next;
             *next = current.wrapping_add(1);
             current
@@ -1623,9 +1626,8 @@ impl RuntimeTraceApi {
         } else {
             // Ordinary branch uses vtable+0x30 / sub_41B240: raw +0x30/+0x34,
             // not sub_41B260's composite position and not renderer raster x/y.
-            let (master_x, master_y) = self
-                .graph_native_base_position(master)
-                .unwrap_or_else(|| {
+            let (master_x, master_y) =
+                self.graph_native_base_position(master).unwrap_or_else(|| {
                     let (x, y) = self.graph_object_position(master);
                     (x.round() as i32, y.round() as i32)
                 });
@@ -1640,9 +1642,7 @@ impl RuntimeTraceApi {
         // a second renderer-time ancestor transform.
         self.display_tree
             .set_local_position(slave, x as f32, y as f32);
-        let (absolute_x, absolute_y) = self
-            .graph_native_base_position(slave)
-            .unwrap_or_default();
+        let (absolute_x, absolute_y) = self.graph_native_base_position(slave).unwrap_or_default();
         self.trace_graph(format!(
             "graph91 attach master=#{master} slave=#{slave} offset=({x},{y}) fixed={fixed_attach} native_base=({absolute_x},{absolute_y})"
         ));
@@ -2202,10 +2202,7 @@ impl RuntimeTraceApi {
             );
             self.display_tree
                 .register(handle, NativeDisplayKind::Landscape);
-            self.graph90_initialize_native_constructor_sort(
-                handle,
-                NativeDisplayKind::Landscape,
-            );
+            self.graph90_initialize_native_constructor_sort(handle, NativeDisplayKind::Landscape);
             self.graph_object_enabled.insert(handle, true);
         }
         handle

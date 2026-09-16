@@ -27,12 +27,12 @@ pub(crate) struct CDspObjLayout32 {
     /// Signed additive bias used by sub_41B0C0; Graph property 0x8100
     /// writes this field through sub_41BF10.
     pub(crate) sort_bias: i32, // +0x24
-    pub(crate) unknown_28: u32,         // +0x28
-    pub(crate) unknown_2c: u32,         // +0x2c
-    pub(crate) position_x: i32,         // +0x30
-    pub(crate) position_y: i32,         // +0x34
-    pub(crate) primary_offset_x: i32,   // +0x38
-    pub(crate) primary_offset_y: i32,   // +0x3c
+    pub(crate) unknown_28: u32, // +0x28
+    pub(crate) unknown_2c: u32, // +0x2c
+    pub(crate) position_x: i32, // +0x30
+    pub(crate) position_y: i32, // +0x34
+    pub(crate) primary_offset_x: i32, // +0x38
+    pub(crate) primary_offset_y: i32, // +0x3c
     pub(crate) secondary_offset_x: i32, // +0x40
     pub(crate) secondary_offset_y: i32, // +0x44
     /// Per-object global-display-offset gate. sub_41ADF0 writes this DWORD;
@@ -220,9 +220,9 @@ pub(crate) struct BitmapRegistryEntryLayout32 {
     pub(crate) transform_or_orientation: i32, // +0x20
     pub(crate) unknown_24: u32,               // +0x24
     /// CBG/script auxiliary reference point X; sub_401EF0/sub_402440.
-    pub(crate) auxiliary_x: i32,              // +0x28
+    pub(crate) auxiliary_x: i32, // +0x28
     /// CBG/script auxiliary reference point Y; sub_401EF0/sub_402440.
-    pub(crate) auxiliary_y: i32,              // +0x2c
+    pub(crate) auxiliary_y: i32, // +0x2c
     pub(crate) unknown_30_to_47: [u8; 0x18],  // +0x30
 }
 
@@ -306,19 +306,19 @@ pub(crate) struct CDspObjBackSLayout32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CDspObjBackFLayout32 {
     pub(crate) base: CDspObjBackLayout32,
-    pub(crate) primary_x: i32,                      // +0x13c
-    pub(crate) primary_y: i32,                      // +0x140
-    pub(crate) primary_bitmap: i32,                 // +0x144
-    pub(crate) primary_bitmap_generation: u32,      // +0x148
-    pub(crate) secondary_x: i32,                    // +0x14c
-    pub(crate) secondary_y: i32,                    // +0x150
-    pub(crate) secondary_bitmap_or_sentinel: i32,   // +0x154
-    pub(crate) secondary_bitmap_generation: u32,    // +0x158
-    pub(crate) mask_bitmap: i32,                    // +0x15c
-    pub(crate) mask_parameter: i32,                 // +0x160
-    pub(crate) mask_bitmap_generation: u32,         // +0x164
-    pub(crate) mask_control_enabled: i32,            // +0x168
-    pub(crate) mask_control_mode: i32,               // +0x16c
+    pub(crate) primary_x: i32,                    // +0x13c
+    pub(crate) primary_y: i32,                    // +0x140
+    pub(crate) primary_bitmap: i32,               // +0x144
+    pub(crate) primary_bitmap_generation: u32,    // +0x148
+    pub(crate) secondary_x: i32,                  // +0x14c
+    pub(crate) secondary_y: i32,                  // +0x150
+    pub(crate) secondary_bitmap_or_sentinel: i32, // +0x154
+    pub(crate) secondary_bitmap_generation: u32,  // +0x158
+    pub(crate) mask_bitmap: i32,                  // +0x15c
+    pub(crate) mask_parameter: i32,               // +0x160
+    pub(crate) mask_bitmap_generation: u32,       // +0x164
+    pub(crate) mask_control_enabled: i32,         // +0x168
+    pub(crate) mask_control_mode: i32,            // +0x16c
 }
 
 #[repr(C)]
@@ -412,10 +412,19 @@ mod tests {
         assert_eq!(offset_of!(CDspObjLayout32, primary_offset_x), 0x38);
         assert_eq!(offset_of!(CDspObjLayout32, secondary_offset_x), 0x40);
         assert_eq!(offset_of!(CDspObjLayout32, mask_slot_78), 0x78);
-        assert_eq!(offset_of!(CDspObjLayout32, fixed_position_updates_integer_position), 0x7c);
+        assert_eq!(
+            offset_of!(CDspObjLayout32, fixed_position_updates_integer_position),
+            0x7c
+        );
         assert_eq!(offset_of!(CDspObjLayout32, use_graph_center), 0x100);
-        assert_eq!(offset_of!(CDspObjLayout32, fixed_position_rounding_enabled), 0x80);
-        assert_eq!(offset_of!(CDspObjLayout32, fixed_position_rounding_mode), 0x84);
+        assert_eq!(
+            offset_of!(CDspObjLayout32, fixed_position_rounding_enabled),
+            0x80
+        );
+        assert_eq!(
+            offset_of!(CDspObjLayout32, fixed_position_rounding_mode),
+            0x84
+        );
         assert_eq!(offset_of!(CDspObjLayout32, unknown_8c), 0x8c);
         assert_eq!(offset_of!(CDspObjLayout32, alpha_parameter), 0xac);
         assert_eq!(offset_of!(CDspObjLayout32, mask_alpha), 0xb0);

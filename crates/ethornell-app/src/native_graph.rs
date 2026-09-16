@@ -656,14 +656,9 @@ impl RuntimeTraceApi {
         // only for a format-1 secondary carrying non-opaque legacy bytes,
         // materialize a BackF-local opaque view. This keeps selector 128 as a
         // true copy without mutating the source bitmap or changing generation.
-        if secondary_image.is_some()
-            && self.bitmap_formats.get(&secondary).copied() == Some(1)
-        {
+        if secondary_image.is_some() && self.bitmap_formats.get(&secondary).copied() == Some(1) {
             if let Some(mut image) = self.graph_bitmap_image(secondary) {
-                let needs_opaque_view = image
-                    .rgba
-                    .chunks_exact(4)
-                    .any(|pixel| pixel[3] != 0xff);
+                let needs_opaque_view = image.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0xff);
                 if needs_opaque_view {
                     for pixel in image.rgba.chunks_exact_mut(4) {
                         pixel[3] = 0xff;
@@ -691,12 +686,7 @@ impl RuntimeTraceApi {
         let Some(background) = properties.background.as_mut() else {
             return Err("BackF object has no native background state".to_string());
         };
-        background.set_position(
-            primary_x,
-            primary_y,
-            self.screen_width,
-            self.screen_height,
-        );
+        background.set_position(primary_x, primary_y, self.screen_width, self.screen_height);
         background.resource_binding = Some((primary, primary_generation));
         background.secondary_resource_binding = Some(secondary_binding);
         let Some(backf) = background.backf.as_mut() else {
@@ -883,7 +873,10 @@ impl RuntimeTraceApi {
     /// pixel path that cannot be represented by a single ordinary layer.
     /// The source resource itself is never modified: target generation checks
     /// continue to refer to the original bitmap handle.
-    pub(super) fn graph90_refresh_backf_primary(&mut self, object: i32) -> std::result::Result<(), String> {
+    pub(super) fn graph90_refresh_backf_primary(
+        &mut self,
+        object: i32,
+    ) -> std::result::Result<(), String> {
         let Some(properties) = self.graph_object_properties.get(&object).cloned() else {
             return Ok(());
         };
@@ -1469,11 +1462,7 @@ impl RuntimeTraceApi {
         // top-left; it deliberately does not invent source cropping.
         let scale_x = args[7] as f32 / 65_536.0;
         let scale_y = args[8] as f32 / 65_536.0;
-        if !scale_x.is_finite()
-            || !scale_y.is_finite()
-            || scale_x <= 0.0
-            || scale_y <= 0.0
-        {
+        if !scale_x.is_finite() || !scale_y.is_finite() || scale_x <= 0.0 || scale_y <= 0.0 {
             return false;
         }
         let rotation_degrees = args[6] as f32 / 65_536.0;
@@ -1812,10 +1801,9 @@ impl RuntimeTraceApi {
                 .graph_object_properties
                 .entry(mode5.node_id)
                 .or_default();
-            properties.named_properties.insert(
-                "mode5-cache-nonzero-alpha".to_string(),
-                nonzero_alpha,
-            );
+            properties
+                .named_properties
+                .insert("mode5-cache-nonzero-alpha".to_string(), nonzero_alpha);
             properties
                 .named_properties
                 .insert("mode5-cache-max-alpha".to_string(), max_alpha);
@@ -1857,10 +1845,14 @@ impl RuntimeTraceApi {
                     .get(&mode5.node_id)
                     .map(|properties| properties.native)
                     .unwrap_or_default();
-                layer.transform_x =
-                    native.primary_offset_x.saturating_add(native.secondary_offset_x) as f32;
-                layer.transform_y =
-                    native.primary_offset_y.saturating_add(native.secondary_offset_y) as f32;
+                layer.transform_x = native
+                    .primary_offset_x
+                    .saturating_add(native.secondary_offset_x)
+                    as f32;
+                layer.transform_y = native
+                    .primary_offset_y
+                    .saturating_add(native.secondary_offset_y)
+                    as f32;
                 layer.transform_z = 0;
             }
             let properties = self
@@ -1893,10 +1885,9 @@ impl RuntimeTraceApi {
                 "mode5-perspective-scale-16-16".to_string(),
                 (geometry.scale * 65_536.0).round() as i32,
             );
-            properties.named_properties.insert(
-                "mode5-transition-current".to_string(),
-                transition_value,
-            );
+            properties
+                .named_properties
+                .insert("mode5-transition-current".to_string(), transition_value);
             self.display_tree.set_local_position(
                 mode5.node_id,
                 geometry.object_x,
@@ -1919,13 +1910,7 @@ impl RuntimeTraceApi {
         alpha_parameter: Option<i32>,
         priority: Option<i32>,
     ) {
-        self.graph90_set_common_state(
-            object,
-            None,
-            blend_mode,
-            alpha_parameter,
-            priority,
-        );
+        self.graph90_set_common_state(object, None, blend_mode, alpha_parameter, priority);
         // sub_427170/sub_427220 call the object's vtable+60 setter rather
         // than writing +0x4C/+0x50/+0x54 directly. Route construction through
         // the same helper used by animation so +0x80/+0x84 rounding, +0x7C
@@ -1954,14 +1939,18 @@ impl RuntimeTraceApi {
     /// this path, and mode 5 must recompute sub_41AAA0/sub_429220 when Z
     /// changes rather than merely translating the already-projected layer.
     pub(super) fn graph90_resync_fixed_sprite_geometry(&mut self, object: i32) -> bool {
-        let Some((mode, x, y, z)) = self.graph_object_properties.get(&object).and_then(|properties| {
-            Some((
-                *properties.named_properties.get("target-object-mode")?,
-                properties.native.fixed_position_x_16_16,
-                properties.native.fixed_position_y_16_16,
-                properties.native.fixed_position_z_16_16,
-            ))
-        }) else {
+        let Some((mode, x, y, z)) =
+            self.graph_object_properties
+                .get(&object)
+                .and_then(|properties| {
+                    Some((
+                        *properties.named_properties.get("target-object-mode")?,
+                        properties.native.fixed_position_x_16_16,
+                        properties.native.fixed_position_y_16_16,
+                        properties.native.fixed_position_z_16_16,
+                    ))
+                })
+        else {
             return false;
         };
         let (selector, argc) = match mode {
@@ -2364,17 +2353,8 @@ impl RuntimeTraceApi {
             (0x90, 0x43) => {
                 let args = Self::graph90_source_args(stack, 9);
                 let object = self.graph90_prepare_current_background(NativeBackgroundClass::BackF);
-                if let [
-                    primary_x,
-                    primary_y,
-                    primary,
-                    secondary_x,
-                    secondary_y,
-                    secondary,
-                    mask,
-                    mask_parameter,
-                    alpha_parameter,
-                ] = args.as_slice()
+                if let [primary_x, primary_y, primary, secondary_x, secondary_y, secondary, mask, mask_parameter, alpha_parameter] =
+                    args.as_slice()
                 {
                     if let Err(reason) = self.graph90_sync_backf_layers(
                         object,
@@ -2789,9 +2769,7 @@ impl RuntimeTraceApi {
                             2 => self
                                 .graph90_recorded_source_args(*object, 0x59, 13)
                                 .is_some_and(|mut mode_args| {
-                                    if let Some((x, y)) =
-                                        self.graph_native_base_position(*object)
-                                    {
+                                    if let Some((x, y)) = self.graph_native_base_position(*object) {
                                         mode_args[1] = x;
                                         mode_args[2] = y;
                                     }
@@ -2824,10 +2802,8 @@ impl RuntimeTraceApi {
                                     mode_args[5] = -1;
                                     mode_args[6] = 0;
                                     mode_args[7] = -1;
-                                    let properties = self
-                                        .graph_object_properties
-                                        .entry(*object)
-                                        .or_default();
+                                    let properties =
+                                        self.graph_object_properties.entry(*object).or_default();
                                     properties.format_resource = Some(*primary_bitmap);
                                     properties
                                         .named_properties
@@ -2865,10 +2841,8 @@ impl RuntimeTraceApi {
                                     mode_args[5] = -1;
                                     mode_args[6] = 0;
                                     mode_args[7] = -1;
-                                    let properties = self
-                                        .graph_object_properties
-                                        .entry(*object)
-                                        .or_default();
+                                    let properties =
+                                        self.graph_object_properties.entry(*object).or_default();
                                     properties.format_resource = Some(*primary_bitmap);
                                     properties
                                         .named_properties
@@ -2988,8 +2962,8 @@ impl RuntimeTraceApi {
                         .copied()
                         .unwrap_or(true);
                     let chain_drawable = self.display_tree.chain_drawable(args[0]);
-                    let draw_eligible = layer
-                        .is_some_and(|layer| self.should_draw_graph_layer(args[0], layer));
+                    let draw_eligible =
+                        layer.is_some_and(|layer| self.should_draw_graph_layer(args[0], layer));
                     let primary_size = self.bitmap_dimensions.get(&args[3]).copied();
                     let secondary_size = self.bitmap_dimensions.get(&args[4]).copied();
                     tracing::info!(
@@ -3041,8 +3015,12 @@ impl RuntimeTraceApi {
                         .format_resource = Some(args[3]);
                     {
                         let properties = self.graph_object_properties.entry(args[0]).or_default();
-                        properties.named_properties.insert("mode2-transform-x".to_string(), args[4]);
-                        properties.named_properties.insert("mode2-transform-y".to_string(), args[5]);
+                        properties
+                            .named_properties
+                            .insert("mode2-transform-x".to_string(), args[4]);
+                        properties
+                            .named_properties
+                            .insert("mode2-transform-y".to_string(), args[5]);
                         properties
                             .named_properties
                             .insert("mode2-rotation-16-16".to_string(), args[6]);
@@ -3199,10 +3177,9 @@ impl RuntimeTraceApi {
                         .named_properties
                         .insert("mode5-fixed-parameter-y".to_string(), args[9]);
                     for (index, value) in args[10..=13].iter().copied().enumerate() {
-                        properties.named_properties.insert(
-                            format!("mode5-transform-parameter-{index}"),
-                            value,
-                        );
+                        properties
+                            .named_properties
+                            .insert(format!("mode5-transform-parameter-{index}"), value);
                     }
                     let configured = self.graph90_sync_mode5_primary_layer(&args);
                     let primary_size = self
@@ -3236,24 +3213,24 @@ impl RuntimeTraceApi {
                         .graph_layers
                         .get(&args[0])
                         .is_some_and(|layer| self.should_draw_graph_layer(args[0], layer));
-                    let cache_nonzero_alpha = self
-                        .graph_object_properties
-                        .get(&args[0])
-                        .and_then(|properties| {
-                            properties
-                                .named_properties
-                                .get("mode5-cache-nonzero-alpha")
-                                .copied()
-                        });
-                    let cache_max_alpha = self
-                        .graph_object_properties
-                        .get(&args[0])
-                        .and_then(|properties| {
-                            properties
-                                .named_properties
-                                .get("mode5-cache-max-alpha")
-                                .copied()
-                        });
+                    let cache_nonzero_alpha =
+                        self.graph_object_properties
+                            .get(&args[0])
+                            .and_then(|properties| {
+                                properties
+                                    .named_properties
+                                    .get("mode5-cache-nonzero-alpha")
+                                    .copied()
+                            });
+                    let cache_max_alpha =
+                        self.graph_object_properties
+                            .get(&args[0])
+                            .and_then(|properties| {
+                                properties
+                                    .named_properties
+                                    .get("mode5-cache-max-alpha")
+                                    .copied()
+                            });
                     let property_40 = self
                         .graph_object_properties
                         .get(&args[0])
@@ -3267,21 +3244,21 @@ impl RuntimeTraceApi {
                         let (x, y, z) = self.layer_world_transform(args[0], layer);
                         (x, y, z)
                     });
-                    let origin_offset = self
-                        .graph_object_properties
-                        .get(&args[0])
-                        .map(|properties| {
-                            (
-                                properties
-                                    .named_properties
-                                    .get("mode5-origin-offset-x")
-                                    .copied(),
-                                properties
-                                    .named_properties
-                                    .get("mode5-origin-offset-y")
-                                    .copied(),
-                            )
-                        });
+                    let origin_offset =
+                        self.graph_object_properties
+                            .get(&args[0])
+                            .map(|properties| {
+                                (
+                                    properties
+                                        .named_properties
+                                        .get("mode5-origin-offset-x")
+                                        .copied(),
+                                    properties
+                                        .named_properties
+                                        .get("mode5-origin-offset-y")
+                                        .copied(),
+                                )
+                            });
                     tracing::info!(
                         sprite = args[0],
                         x_16_16 = args[1],
@@ -3363,10 +3340,9 @@ impl RuntimeTraceApi {
                         .named_properties
                         .insert("mode6-fixed-parameter-y".to_string(), args[9]);
                     for (index, value) in args[10..=16].iter().copied().enumerate() {
-                        properties.named_properties.insert(
-                            format!("mode6-transform-parameter-{index}"),
-                            value,
-                        );
+                        properties
+                            .named_properties
+                            .insert(format!("mode6-transform-parameter-{index}"), value);
                     }
                     let configured = self.graph90_sync_mode6_primary_layer(&args);
                     let primary_size = self

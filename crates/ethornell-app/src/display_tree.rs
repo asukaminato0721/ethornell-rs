@@ -441,7 +441,9 @@ impl NativeDisplayTree {
     }
 
     pub(crate) fn native_sort_key(&self, handle: i32) -> Option<u32> {
-        self.objects.get(&handle).and_then(|object| object.manager_sort_key)
+        self.objects
+            .get(&handle)
+            .and_then(|object| object.manager_sort_key)
     }
 
     /// Position in the target-style ascending depth chain.  The target

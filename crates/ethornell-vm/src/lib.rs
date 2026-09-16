@@ -2522,10 +2522,7 @@ impl Vm {
                 .get(self.current_program)
                 .and_then(|program| program.instructions.get(self.pc))
                 .is_some();
-        if steps >= step_limit
-            && still_runnable
-            && matches!(stop_reason, VmStopReason::Completed)
-        {
+        if steps >= step_limit && still_runnable && matches!(stop_reason, VmStopReason::Completed) {
             if step_limit == TARGET_COOPERATIVE_QUANTUM_STEPS
                 && options.max_steps >= TARGET_COOPERATIVE_QUANTUM_STEPS
             {
@@ -5923,13 +5920,12 @@ impl Vm {
                             }
                         }
                         let active = match (procedure.object_id, procedure.control_id) {
-                            (Some(object_id), Some(control_id)) => {
-                                api.poll_native_graph_control_procedure(
+                            (Some(object_id), Some(control_id)) => api
+                                .poll_native_graph_control_procedure(
                                     installed.source_opcode,
                                     object_id,
                                     control_id,
-                                )
-                            }
+                                ),
                             (Some(object_id), None) => api.native_graph_object_procedure_is_active(
                                 installed.source_opcode,
                                 object_id,
@@ -6815,8 +6811,7 @@ impl Vm {
                 let normal_resource = self.read_int(region_ptr.wrapping_add(32), 2)? as i32;
                 let hover_resource = self.read_int(region_ptr.wrapping_add(36), 2)? as i32;
                 let selected_resource = self.read_int(region_ptr.wrapping_add(40), 2)? as i32;
-                let hover_selected_resource =
-                    self.read_int(region_ptr.wrapping_add(44), 2)? as i32;
+                let hover_selected_resource = self.read_int(region_ptr.wrapping_add(44), 2)? as i32;
                 let mask_resource = self.read_int(region_ptr.wrapping_add(48), 2)? as i32;
                 // sub_44C110 reads extended source item+0x34 before the
                 // CDspObjVirtual hit query. A nonzero value excludes the
@@ -7260,7 +7255,8 @@ impl Vm {
     where
         A: SysApi + ?Sized,
     {
-        api.next_native_crt_rand().unwrap_or_else(|| self.rand_msvc())
+        api.next_native_crt_rand()
+            .unwrap_or_else(|| self.rand_msvc())
     }
 
     fn rand_msvc_wide(&mut self) -> i32 {
@@ -7345,18 +7341,13 @@ impl Vm {
             Value::Str(text) => self.write_c_string(dst, &text),
             Value::Int(ptr) if ptr != 0 => {
                 let src = Self::translate_system_descriptor(ptr as u32);
-                let size = self.c_string_byte_len(src)?.saturating_add(1);
-                self.copy_buffer(dst, src, size)
+                self.copy_c_string_pointer(dst, src)
             }
             Value::Ptr(ptr) if ptr != 0 => {
                 let src = Self::translate_system_descriptor(ptr);
-                let size = self.c_string_byte_len(src)?.saturating_add(1);
-                self.copy_buffer(dst, src, size)
+                self.copy_c_string_pointer(dst, src)
             }
-            Value::Func { offset, .. } if offset != 0 => {
-                let size = self.c_string_byte_len(offset)?.saturating_add(1);
-                self.copy_buffer(dst, offset, size)
-            }
+            Value::Func { offset, .. } if offset != 0 => self.copy_c_string_pointer(dst, offset),
             Value::Int(_) | Value::Ptr(_) | Value::Func { .. } | Value::None => {
                 self.write_c_string(dst, "")
             }
@@ -7364,6 +7355,14 @@ impl Vm {
                 "program value cannot be copied as a C string".into(),
             )),
         }
+    }
+
+    fn copy_c_string_pointer(&mut self, dst: u32, src: u32) -> VmResult<()> {
+        if let Some(Value::Str(text)) = self.mem_values.get(&Self::value_key(src)).cloned() {
+            return self.write_c_string(dst, &text);
+        }
+        let size = self.c_string_byte_len(src)?.saturating_add(1);
+        self.copy_buffer(dst, src, size)
     }
 
     fn write_c_string_raw(&mut self, ptr: u32, text: &str) -> VmResult<()> {
@@ -8406,6 +8405,19 @@ impl Vm {
                     .message_auxiliary_input_mask = mask;
                 Value::None
             }
+            (0x81, 0x21) => {
+                // amachoco.exe's sub_4953A0 pops source then destination and
+                // converts the source from CP932 to UTF-8. Retain the decoded
+                // string as a shadow value so later BP copies and graph calls
+                // do not lose it by treating the pointer as an integer.
+                let source = self.pop_value()?;
+                let destination = self.pop_ptr()?;
+                let text = self.value_as_native_string_lossy(source)?;
+                self.write_c_string(destination, &text)?;
+                self.mem_values
+                    .insert(Self::value_key(destination), Value::Str(text));
+                Value::None
+            }
             (0x81, 0x28) => {
                 let mode = self.pop_int()?;
                 let path = self.pop_string_lossy()?;
@@ -8624,8 +8636,8 @@ impl Vm {
                 }
             }
             (0x81, 0x35) => {
-                let _context = self.pop_ptr()?;
                 let path = self.pop_string_lossy()?;
+                let _context = self.pop_ptr()?;
                 let size = api
                     .load_file_bytes("", &path)
                     .or_else(|| std::fs::read(&path).ok())
@@ -9090,6 +9102,16 @@ impl Vm {
                 } else {
                     Value::Int(system81_state::NATIVE_NOT_FOUND)
                 }
+            }
+            (0x81, 0xda) => {
+                // amachoco.exe's sub_4961E0 queries an optional sentence
+                // substitution table. Returning zero selects the script's
+                // built-in fallback, which copies the original sentence via
+                // Sys81:21.
+                let _text = self.pop_value()?;
+                let _keyword = self.pop_value()?;
+                let _destination = self.pop_ptr()?;
+                Value::Int(0)
             }
             (0x81, 0xe0) => {
                 let flags = self.pop_int()?;
@@ -9746,10 +9768,12 @@ impl Vm {
             }
             (0x80, 0x45) => Value::None,
             (0x80, 0x80) => {
-                self.push_value(Value::Int(0));
-                self.push_value(Value::Int(0));
-                Value::Int(0)
+                let result = self.load_global_user_data(api)?;
+                self.push_value(Value::Int(result.window_x));
+                self.push_value(Value::Int(result.window_y));
+                Value::Int(result.status)
             }
+            (0x80, 0x81) => Value::Int(i32::from(self.save_global_user_data(api))),
             (0x80, 0x88) => self.sys80_88_create_or_resize_read_flag_table()?,
             (0x80, 0x89) => self.sys80_89_set_read_flag_bit()?,
             (0x80, 0xd0) => {
@@ -10903,17 +10927,18 @@ impl Vm {
     fn value_as_native_string_lossy(&self, value: Value) -> VmResult<String> {
         match value {
             Value::Str(text) => Ok(text),
-            Value::Ptr(ptr) => self.read_c_string(ptr),
-            Value::Int(value) => {
-                if let Some(Value::Str(text)) = self.mem_values.get(&Self::value_key(value as u32))
-                {
-                    Ok(text.clone())
-                } else {
-                    self.read_c_string(value as u32)
-                }
-            }
-            Value::Func { offset, .. } => self.read_c_string(offset),
+            Value::Ptr(ptr) => self.read_shadowed_c_string(ptr),
+            Value::Int(value) => self.read_shadowed_c_string(value as u32),
+            Value::Func { offset, .. } => self.read_shadowed_c_string(offset),
             Value::Program(_) | Value::None => Ok(String::new()),
+        }
+    }
+
+    fn read_shadowed_c_string(&self, ptr: u32) -> VmResult<String> {
+        if let Some(Value::Str(text)) = self.mem_values.get(&Self::value_key(ptr)) {
+            Ok(text.clone())
+        } else {
+            self.read_c_string(ptr)
         }
     }
 
@@ -14680,6 +14705,48 @@ mod tests {
     }
 
     #[test]
+    fn strcpy_materializes_shadowed_scenario_strings() {
+        let source = 0x3000;
+        let destination = 0x3100;
+        let mut vm = Vm::new();
+        vm.mem_values
+            .insert(Vm::value_key(source), Value::Str("シナリオの台詞".into()));
+        vm.stack
+            .extend([Value::Ptr(destination), Value::Ptr(source)]);
+
+        vm.dispatch(
+            &test_instruction(0x10, 0x6a, "strcpy", vec![0x6a], Vec::new()),
+            &mut TraceApi,
+        )
+        .unwrap();
+
+        assert_eq!(vm.read_c_string(destination).unwrap(), "シナリオの台詞");
+    }
+
+    #[test]
+    fn system81_utf8_copy_materializes_shadowed_scenario_strings() {
+        let source = 0x3000;
+        let destination = 0x3100;
+        let mut vm = Vm::new();
+        vm.mem_values
+            .insert(Vm::value_key(source), Value::Str("シナリオの台詞".into()));
+        vm.stack
+            .extend([Value::Ptr(destination), Value::Ptr(source)]);
+
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut TraceApi, 0x81, 0x21)
+                .unwrap(),
+            Some(Value::None)
+        );
+        assert!(vm.stack.is_empty());
+        assert_eq!(vm.read_c_string(destination).unwrap(), "シナリオの台詞");
+        assert_eq!(
+            vm.mem_values.get(&Vm::value_key(destination)),
+            Some(&Value::Str("シナリオの台詞".into()))
+        );
+    }
+
+    #[test]
     fn native_system_event_queue_preserves_two_argument_abi() {
         let destination = 0x2000u32;
         let program = BpProgram {
@@ -16433,6 +16500,22 @@ mod tests {
         assert_eq!(vm.stack, [Value::Int(0)]);
         assert!(vm.thread.current_procedure().is_none());
         assert_eq!(vm.thread.status(), 0);
+    }
+
+    #[test]
+    fn sys81_35_uses_target_context_then_path_argument_order() {
+        let mut vm = Vm::new();
+        let mut api = FileBytesApi {
+            bytes: b"save data".to_vec(),
+        };
+        vm.stack
+            .extend([Value::Int(0), Value::Str("sample.bin".into())]);
+
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut api, 0x81, 0x35).unwrap(),
+            Some(Value::Int(9))
+        );
+        assert!(vm.stack.is_empty());
     }
 
     #[test]

@@ -216,10 +216,10 @@ impl ResourceManager {
         let (archive_index, entry_index) = self
             .find_locator_in_archive(archive_name, entry_name)
             .ok_or_else(|| {
-                EthornellError::Parse(format!(
-                    "resource not found in archive {archive_name}: {entry_name}"
-                ))
-            })?;
+            EthornellError::Parse(format!(
+                "resource not found in archive {archive_name}: {entry_name}"
+            ))
+        })?;
         self.read_locator_decoded(archive_index, entry_index)
     }
 
@@ -252,7 +252,9 @@ impl ResourceManager {
             .iter()
             .filter(|&&(candidate_archive, _)| candidate_archive == archive_index)
             .find_map(|&(_, candidate_entry)| {
-                let candidate = self.inner.set.archives[archive_index].entries.get(candidate_entry)?;
+                let candidate = self.inner.set.archives[archive_index]
+                    .entries
+                    .get(candidate_entry)?;
                 (candidate.name == entry.entry_name && candidate.packed_size == entry.packed_size)
                     .then_some(candidate_entry)
             })
@@ -263,8 +265,9 @@ impl ResourceManager {
                     .iter()
                     .filter(|&&(candidate_archive, _)| candidate_archive == archive_index)
                     .find_map(|&(_, candidate_entry)| {
-                        let candidate =
-                            self.inner.set.archives[archive_index].entries.get(candidate_entry)?;
+                        let candidate = self.inner.set.archives[archive_index]
+                            .entries
+                            .get(candidate_entry)?;
                         (candidate.packed_size == entry.packed_size).then_some(candidate_entry)
                     })
             })
@@ -293,7 +296,8 @@ impl ResourceManager {
         // Compatibility fallback for the historical fuzzy lookup. Scan the
         // already-normalized hash keys instead of normalizing every archive
         // entry again on each miss. This keeps the slow path allocation-free.
-        self.inner.by_name
+        self.inner
+            .by_name
             .iter()
             .filter(|(candidate, _)| candidate.ends_with(&key) || candidate.contains(&key))
             .min_by(|(left, _), (right, _)| left.cmp(right))
@@ -305,11 +309,17 @@ impl ResourceManager {
         archive_name: &str,
         entry_name: &str,
     ) -> Option<(usize, usize)> {
-        let archive_index = *self.inner.archive_by_name.get(&archive_name_key(archive_name))?;
+        let archive_index = *self
+            .inner
+            .archive_by_name
+            .get(&archive_name_key(archive_name))?;
         let entry_key = normalize_resource_name(entry_name);
-        self.inner.by_name.get(&entry_key)?.iter().copied().find(
-            |&(candidate_archive, _)| candidate_archive == archive_index,
-        )
+        self.inner
+            .by_name
+            .get(&entry_key)?
+            .iter()
+            .copied()
+            .find(|&(candidate_archive, _)| candidate_archive == archive_index)
     }
 
     fn read_locator_raw(&self, archive_index: usize, entry_index: usize) -> Result<Vec<u8>> {
@@ -322,11 +332,16 @@ impl ResourceManager {
             ))
         })?;
         let file = self.inner.archive_files.get(archive_index).ok_or_else(|| {
-            EthornellError::Parse(format!("archive handle index out of range: {archive_index}"))
+            EthornellError::Parse(format!(
+                "archive handle index out of range: {archive_index}"
+            ))
         })?;
-        let mut file = file
-            .lock()
-            .map_err(|_| EthornellError::Other(format!("archive handle poisoned: {}", archive.path.display())))?;
+        let mut file = file.lock().map_err(|_| {
+            EthornellError::Other(format!(
+                "archive handle poisoned: {}",
+                archive.path.display()
+            ))
+        })?;
         file.seek(SeekFrom::Start(entry.offset))?;
         let mut data = vec![0u8; entry.packed_size as usize];
         file.read_exact(&mut data)?;
@@ -348,9 +363,13 @@ impl ResourceManager {
     }
 
     fn archive_index_for_path(&self, path: &Path) -> Result<usize> {
-        self.inner.archive_by_path.get(path).copied().ok_or_else(|| {
-            EthornellError::Parse(format!("archive not indexed: {}", path.display()))
-        })
+        self.inner
+            .archive_by_path
+            .get(path)
+            .copied()
+            .ok_or_else(|| {
+                EthornellError::Parse(format!("archive not indexed: {}", path.display()))
+            })
     }
 
     fn entry_at(&self, archive_index: usize, entry_index: usize) -> Option<ResourceEntry> {
@@ -1107,7 +1126,6 @@ mod tests {
             PathBuf::from("out/free-name")
         );
     }
-
 
     #[test]
     fn resource_lookup_indexes_archive_and_entry_without_listing() {

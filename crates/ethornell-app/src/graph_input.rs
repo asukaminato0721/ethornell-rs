@@ -167,11 +167,7 @@ impl RuntimeGraphInputObject {
     /// the materialized child Sprite. Unmentioned items keep the constructor
     /// default enabled=1.
     pub(crate) fn item_enabled(&self, group: i32, index: i32) -> bool {
-        self.item_states
-            .get(&(group, index))
-            .copied()
-            .unwrap_or(1)
-            != 0
+        self.item_states.get(&(group, index)).copied().unwrap_or(1) != 0
     }
 
     /// Target DCIPIconEx hit selection calls vtable+0x28 (sub_44C110) before
@@ -191,9 +187,7 @@ impl RuntimeGraphInputObject {
                 .groups
                 .iter()
                 .find(|candidate| candidate.index == group)
-                .map(|candidate| {
-                    candidate.selection_enabled && candidate.pointer_selection_enabled
-                })
+                .map(|candidate| candidate.selection_enabled && candidate.pointer_selection_enabled)
                 // Legacy hand-built descriptors have no group table. Preserve
                 // their former permissive behavior only for tests/compatibility.
                 .unwrap_or(self.descriptor.groups.is_empty())
@@ -297,8 +291,7 @@ impl RuntimeGraphInputObject {
                 .groups
                 .iter()
                 .filter(|candidate| {
-                    candidate.index != group
-                        && candidate.selection_exclusion_key == exclusion_key
+                    candidate.index != group && candidate.selection_exclusion_key == exclusion_key
                 })
                 .map(|candidate| candidate.index)
                 .collect::<Vec<_>>();
@@ -551,7 +544,10 @@ mod tests {
         assert!(input.pointer_activation_is_immediate(item));
 
         input.defer_pointer_activation(item);
-        assert_eq!(input.deferred_pointer_activation(), Some((item.group, item.index)));
+        assert_eq!(
+            input.deferred_pointer_activation(),
+            Some((item.group, item.index))
+        );
         input.clear_deferred_pointer_activation();
         assert_eq!(input.deferred_pointer_activation(), None);
     }

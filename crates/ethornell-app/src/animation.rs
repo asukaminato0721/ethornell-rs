@@ -469,33 +469,34 @@ impl LayerAnimationSystem {
         } else {
             0
         };
-        self.native_object_controls.push(NativeObjectControlAnimation {
-            control_id,
-            object_id,
-            from_x: from_position.0,
-            from_y: from_position.1,
-            to_x: to_position.0,
-            to_y: to_position.1,
-            position_curve,
-            from_alpha: from_alpha.clamp(0, 256),
-            to_alpha: to_alpha.clamp(0, 256),
-            alpha_curve,
-            from_fixed_parameter_16_16,
-            to_fixed_parameter_16_16,
-            duration_ms: duration_ms as u64,
-            wall_elapsed_ms: 0,
-            update_numerator,
-            update_interval_ms,
-            next_update_ms: update_interval_ms,
-            input_enabled,
-            input_descriptor,
-            force_complete: false,
-            procedure_update_count: 0,
-            last_x: from_position.0,
-            last_y: from_position.1,
-            last_alpha: from_alpha.clamp(0, 256),
-            last_fixed_parameter_16_16: from_fixed_parameter_16_16,
-        });
+        self.native_object_controls
+            .push(NativeObjectControlAnimation {
+                control_id,
+                object_id,
+                from_x: from_position.0,
+                from_y: from_position.1,
+                to_x: to_position.0,
+                to_y: to_position.1,
+                position_curve,
+                from_alpha: from_alpha.clamp(0, 256),
+                to_alpha: to_alpha.clamp(0, 256),
+                alpha_curve,
+                from_fixed_parameter_16_16,
+                to_fixed_parameter_16_16,
+                duration_ms: duration_ms as u64,
+                wall_elapsed_ms: 0,
+                update_numerator,
+                update_interval_ms,
+                next_update_ms: update_interval_ms,
+                input_enabled,
+                input_descriptor,
+                force_complete: false,
+                procedure_update_count: 0,
+                last_x: from_position.0,
+                last_y: from_position.1,
+                last_alpha: from_alpha.clamp(0, 256),
+                last_fixed_parameter_16_16: from_fixed_parameter_16_16,
+            });
         control_id
     }
 
@@ -548,33 +549,42 @@ impl LayerAnimationSystem {
         } else {
             fixed_parameter_target.saturating_mul(0x1_0000)
         };
-        self.native_spline_controls.push(NativeSplineObjectControlAnimation {
-            control_id,
-            object_id,
-            x: NativeNaturalCubicSpline::new(x),
-            y: NativeNaturalCubicSpline::new(y),
-            z: NativeNaturalCubicSpline::new(z),
-            final_vector: (points.last().unwrap()[0], points.last().unwrap()[1], points.last().unwrap()[2]),
-            position_curve,
-            from_alpha: from_alpha.clamp(0, 256),
-            to_alpha: to_alpha.clamp(0, 256),
-            alpha_curve,
-            from_fixed_parameter_16_16,
-            to_fixed_parameter_16_16,
-            duration_ms: duration_ms.max(1) as u64,
-            wall_elapsed_ms: 0,
-            update_numerator,
-            update_interval_ms,
-            next_update_ms: update_interval_ms,
-            spline_time_scale: if spline_time_scale == 0 { 0x1_0000u32 } else { u32::from(spline_time_scale) },
-            input_enabled,
-            input_descriptor,
-            force_complete: false,
-            procedure_update_count: 0,
-            last_vector: (i32::MIN, i32::MIN, i32::MIN),
-            last_alpha: i32::MIN,
-            last_fixed_parameter_16_16: i32::MIN,
-        });
+        self.native_spline_controls
+            .push(NativeSplineObjectControlAnimation {
+                control_id,
+                object_id,
+                x: NativeNaturalCubicSpline::new(x),
+                y: NativeNaturalCubicSpline::new(y),
+                z: NativeNaturalCubicSpline::new(z),
+                final_vector: (
+                    points.last().unwrap()[0],
+                    points.last().unwrap()[1],
+                    points.last().unwrap()[2],
+                ),
+                position_curve,
+                from_alpha: from_alpha.clamp(0, 256),
+                to_alpha: to_alpha.clamp(0, 256),
+                alpha_curve,
+                from_fixed_parameter_16_16,
+                to_fixed_parameter_16_16,
+                duration_ms: duration_ms.max(1) as u64,
+                wall_elapsed_ms: 0,
+                update_numerator,
+                update_interval_ms,
+                next_update_ms: update_interval_ms,
+                spline_time_scale: if spline_time_scale == 0 {
+                    0x1_0000u32
+                } else {
+                    u32::from(spline_time_scale)
+                },
+                input_enabled,
+                input_descriptor,
+                force_complete: false,
+                procedure_update_count: 0,
+                last_vector: (i32::MIN, i32::MIN, i32::MIN),
+                last_alpha: i32::MIN,
+                last_fixed_parameter_16_16: i32::MIN,
+            });
         control_id
     }
 
@@ -675,9 +685,7 @@ impl LayerAnimationSystem {
         let mut amplitude_fixed = i64::from(amplitude) << 16;
         for _ in 0..cycles {
             envelope.push((amplitude_fixed >> 16) as i32);
-            amplitude_fixed = i64::from(100 - decay_percent)
-                .saturating_mul(amplitude_fixed)
-                / 100;
+            amplitude_fixed = i64::from(100 - decay_percent).saturating_mul(amplitude_fixed) / 100;
         }
 
         // The second table is the target's deterministic triangular phase
@@ -984,17 +992,14 @@ impl LayerAnimationSystem {
 
                 let progress_8_24 = (((u128::from(elapsed)) << 24)
                     / u128::from(track.duration_ms.max(1)))
-                    .min(0x0100_0000) as i32;
+                .min(0x0100_0000) as i32;
                 let position_weight = target_curve_fixed_16(track.position_curve, progress_8_24);
                 let alpha_weight = target_curve_fixed_16(track.alpha_curve, progress_8_24);
                 let x = interpolate_target_fixed(track.from_x, track.to_x, position_weight);
                 let y = interpolate_target_fixed(track.from_y, track.to_y, position_weight);
-                let alpha_parameter = interpolate_target_fixed(
-                    track.from_alpha,
-                    track.to_alpha,
-                    alpha_weight,
-                )
-                .clamp(0, 256);
+                let alpha_parameter =
+                    interpolate_target_fixed(track.from_alpha, track.to_alpha, alpha_weight)
+                        .clamp(0, 256);
                 let fixed_parameter_16_16 = if elapsed >= track.duration_ms {
                     track.to_fixed_parameter_16_16
                 } else {
@@ -1093,8 +1098,7 @@ impl LayerAnimationSystem {
                     let mut due = if track.interval_ms == 0 {
                         remaining
                     } else {
-                        (track.accumulated_ms / track.interval_ms)
-                            .min(u64::from(remaining)) as u32
+                        (track.accumulated_ms / track.interval_ms).min(u64::from(remaining)) as u32
                     };
                     if due == 0 {
                         false
@@ -1133,17 +1137,18 @@ impl LayerAnimationSystem {
                 } else {
                     let progress_8_24 = (((u64::from(track.current_step)) << 24)
                         / u64::from(track.total_steps.max(1)))
-                        .min(0x0100_0000) as i32;
+                    .min(0x0100_0000) as i32;
                     let weight = target_curve_fixed_16(track.position_curve, progress_8_24);
                     let point_count = track.total_steps.saturating_add(1);
                     let path_index = ((u64::from(point_count) * weight.max(0) as u64) >> 16)
-                        .min(u64::from(track.total_steps)) as usize;
+                        .min(u64::from(track.total_steps))
+                        as usize;
                     let (x, y) = track.path[path_index];
                     let delta = i64::from(track.to_alpha - track.from_alpha);
                     let alpha = (i64::from(track.from_alpha)
                         + (delta * i64::from(track.current_step))
                             / i64::from(track.total_steps.max(1)))
-                        .clamp(0, 256) as i32;
+                    .clamp(0, 256) as i32;
                     (x, y, alpha)
                 };
                 if x != track.last_x || y != track.last_y || alpha_parameter != track.last_alpha {
@@ -1216,8 +1221,7 @@ impl LayerAnimationSystem {
                     let due = if track.interval_ms == 0 {
                         remaining
                     } else {
-                        (track.accumulated_ms / track.interval_ms)
-                            .min(u64::from(remaining)) as u32
+                        (track.accumulated_ms / track.interval_ms).min(u64::from(remaining)) as u32
                     };
                     if due == 0 {
                         false
@@ -1252,12 +1256,14 @@ impl LayerAnimationSystem {
                     let wave_len = track.waveform.len() as u32;
                     let step_index = track.current_step;
                     let envelope_index = (step_index / wave_len)
-                        .min(track.envelope.len().saturating_sub(1) as u32) as usize;
+                        .min(track.envelope.len().saturating_sub(1) as u32)
+                        as usize;
                     let wave_index = (step_index % wave_len) as usize;
                     let offset = ((i64::from(track.envelope[envelope_index])
                         * i64::from(track.waveform[wave_index]))
                         >> 16)
-                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                        .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+                        as i32;
                     match track.mode {
                         0 | 1 | 4 => (track.base_x, track.base_y.wrapping_add(offset)),
                         2 | 3 | 5 => (track.base_x.wrapping_add(offset), track.base_y),
@@ -1342,7 +1348,7 @@ impl LayerAnimationSystem {
                 let done = elapsed >= track.duration_ms;
                 let progress_8_24 = (((u128::from(elapsed)) << 24)
                     / u128::from(track.duration_ms.max(1)))
-                    .min(0x0100_0000) as i32;
+                .min(0x0100_0000) as i32;
                 let vector = if done {
                     track.final_vector
                 } else {
@@ -1355,7 +1361,7 @@ impl LayerAnimationSystem {
                 } else {
                     let scaled_progress = ((i128::from(progress_8_24) * 65_536)
                         / i128::from(track.spline_time_scale.max(1)))
-                        .clamp(0, 0x0100_0000) as i32;
+                    .clamp(0, 0x0100_0000) as i32;
                     let weight = target_curve_fixed_16(track.alpha_curve, scaled_progress);
                     interpolate_target_fixed(track.from_alpha, track.to_alpha, weight).clamp(0, 256)
                 };
@@ -1419,15 +1425,11 @@ impl LayerAnimationSystem {
         elapsed_ms: u64,
     ) -> Vec<LayerAnimationEvent> {
         let mut events = self.tick_native_object_controls_filtered(elapsed_ms, Some(control_id));
-        events.extend(self.tick_native_special_path_controls_filtered(
-            elapsed_ms,
-            Some(control_id),
-        ));
+        events
+            .extend(self.tick_native_special_path_controls_filtered(elapsed_ms, Some(control_id)));
         events.extend(self.tick_native_spline_controls_filtered(elapsed_ms, Some(control_id)));
-        events.extend(self.tick_native_shake_object_controls_filtered(
-            elapsed_ms,
-            Some(control_id),
-        ));
+        events
+            .extend(self.tick_native_shake_object_controls_filtered(elapsed_ms, Some(control_id)));
         events
     }
 
@@ -1765,8 +1767,7 @@ impl NativeNaturalCubicSpline {
                 let denominator = 4.0 - upper[index - 1];
                 upper[index] = 1.0 / denominator;
                 second_derivatives[index] = (3.0
-                    * (f64::from(values[index - 1])
-                        - 2.0 * f64::from(values[index])
+                    * (f64::from(values[index - 1]) - 2.0 * f64::from(values[index])
                         + f64::from(values[index + 1]))
                     - second_derivatives[index - 1])
                     / denominator;
@@ -1775,7 +1776,10 @@ impl NativeNaturalCubicSpline {
                 second_derivatives[index] -= upper[index] * second_derivatives[index + 1];
             }
         }
-        Self { values, second_derivatives }
+        Self {
+            values,
+            second_derivatives,
+        }
     }
 
     fn sample(&self, t: f64) -> i32 {
@@ -2010,9 +2014,8 @@ fn build_native_three_point_path(
             (y2 - y1) / h1
         };
         let y = base_y
-            + dx
-                * (slope - (2.0 * c0 + c_next) * h / 3.0
-                    + ((c_next - c0) / (3.0 * h) * dx + c0) * dx);
+            + dx * (slope - (2.0 * c0 + c_next) * h / 3.0
+                + ((c_next - c0) / (3.0 * h) * dx + c0) * dx);
         let x_delta = round_half_away_from_zero(x);
         let sampled_x = if ascending {
             start.0.wrapping_add(x_delta)
@@ -2050,21 +2053,16 @@ pub(crate) fn target_curve_fixed_16(curve: i32, progress_8_24: i32) -> i32 {
         // otherwise repeated animation samples can differ by one 16.16 unit.
         1 => {
             let angle_units = 11_796_480i64 - (180i64 * i64::from(progress) / 256);
-            ((f64::from(angle_units as i32) * std::f64::consts::PI / 11_796_480.0)
-                .cos()
-                + 1.0)
+            ((f64::from(angle_units as i32) * std::f64::consts::PI / 11_796_480.0).cos() + 1.0)
                 * 32_768.0
         }
         2 => {
             let angle_units = 90i64 * i64::from(progress) / 256;
-            (f64::from(angle_units as i32) * std::f64::consts::PI / 11_796_480.0).sin()
-                * 65_536.0
+            (f64::from(angle_units as i32) * std::f64::consts::PI / 11_796_480.0).sin() * 65_536.0
         }
         3 => {
             let angle_units = 5_898_240i64 - (90i64 * i64::from(progress) / 256);
-            (1.0
-                - (f64::from(angle_units as i32) * std::f64::consts::PI / 11_796_480.0)
-                    .sin())
+            (1.0 - (f64::from(angle_units as i32) * std::f64::consts::PI / 11_796_480.0).sin())
                 * 65_536.0
         }
         4..=15 => {
@@ -2257,16 +2255,46 @@ mod tests {
     fn cooperative_poll_advances_only_the_exact_native_control() {
         let mut animations = LayerAnimationSystem::default();
         let first = animations.schedule_native_object_control(
-            7, (0, 0), (100, 0), 0, 0, 0, 0, 0, 0, 100, 0, 0, false, 0,
+            7,
+            (0, 0),
+            (100, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            false,
+            0,
         );
         let second = animations.schedule_native_object_control(
-            8, (0, 0), (200, 0), 0, 0, 0, 0, 0, 0, 100, 0, 0, false, 0,
+            8,
+            (0, 0),
+            (200, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            false,
+            0,
         );
 
         let events = animations.tick_native_control(first, 50);
         assert!(events.iter().any(|event| matches!(
             event,
-            LayerAnimationEvent::NativeObjectControlUpdated { object_id: 7, x: 50, .. }
+            LayerAnimationEvent::NativeObjectControlUpdated {
+                object_id: 7,
+                x: 50,
+                ..
+            }
         )));
         assert!(!events.iter().any(|event| matches!(
             event,
@@ -2278,7 +2306,11 @@ mod tests {
         let events = animations.tick_native_control(second, 50);
         assert!(events.iter().any(|event| matches!(
             event,
-            LayerAnimationEvent::NativeObjectControlUpdated { object_id: 8, x: 100, .. }
+            LayerAnimationEvent::NativeObjectControlUpdated {
+                object_id: 8,
+                x: 100,
+                ..
+            }
         )));
     }
 
@@ -2286,10 +2318,36 @@ mod tests {
     fn native_wait_identity_is_per_procedure_not_per_object() {
         let mut animations = LayerAnimationSystem::default();
         let first = animations.schedule_native_object_control(
-            7, (0, 0), (100, 0), 0, 0, 0, 0, 0, 0, 100, 0, 0, false, 0,
+            7,
+            (0, 0),
+            (100, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            false,
+            0,
         );
         let second = animations.schedule_native_object_control(
-            7, (0, 0), (200, 0), 0, 0, 0, 0, 0, 0, 200, 0, 0, false, 0,
+            7,
+            (0, 0),
+            (200, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            200,
+            0,
+            0,
+            false,
+            0,
         );
         assert_ne!(first, second);
         assert!(animations.has_native_control(first));
@@ -2310,7 +2368,20 @@ mod tests {
     fn native_input_skip_commits_endpoint_and_counts_terminal_updater() {
         let mut animations = LayerAnimationSystem::default();
         let control = animations.schedule_native_object_control(
-            9, (0, 0), (100, 0), 0, 0, 256, 0, 0, 0, 100, 0, 0, true, 1808,
+            9,
+            (0, 0),
+            (100, 0),
+            0,
+            0,
+            256,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            true,
+            1808,
         );
         let first = animations.tick_native_object_controls(25);
         assert!(first.iter().any(|event| matches!(
@@ -2338,7 +2409,20 @@ mod tests {
     fn native_base_cancel_does_not_snap_to_endpoint() {
         let mut animations = LayerAnimationSystem::default();
         let control = animations.schedule_native_object_control(
-            11, (0, 0), (100, 0), 0, 0, 256, 0, 0, 0, 100, 0, 0, false, 0,
+            11,
+            (0, 0),
+            (100, 0),
+            0,
+            0,
+            256,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            false,
+            0,
         );
         let partial = animations.tick_native_object_controls(25);
         assert!(partial.iter().any(|event| matches!(
@@ -2357,7 +2441,20 @@ mod tests {
     fn native_control_update_deadline_caps_one_procedure_poll() {
         let mut animations = LayerAnimationSystem::default();
         let control = animations.schedule_native_object_control(
-            13, (0, 0), (1_000, 0), 0, 0, 0, 0, 0, 0, 1_000, 250, 1, false, 0,
+            13,
+            (0, 0),
+            (1_000, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1_000,
+            250,
+            1,
+            false,
+            0,
         );
         // 0x432160 caps one updater invocation to its current 4 ms sampling
         // deadline even when the host arrives 500 ms late.  The scheduler may
@@ -2381,7 +2478,20 @@ mod tests {
     fn native_natural_completion_returns_updater_count_ratio() {
         let mut animations = LayerAnimationSystem::default();
         let control = animations.schedule_native_object_control(
-            14, (0, 0), (100, 0), 0, 0, 0, 0, 0, 0, 100, 0, 0, false, 0,
+            14,
+            (0, 0),
+            (100, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            false,
+            0,
         );
         animations.tick_native_object_controls(50);
         animations.tick_native_object_controls(50);
@@ -2395,7 +2505,20 @@ mod tests {
     fn zero_duration_native_control_still_installs_one_millisecond_procedure() {
         let mut animations = LayerAnimationSystem::default();
         let control = animations.schedule_native_object_control(
-            15, (0, 0), (100, 0), 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0,
+            15,
+            (0, 0),
+            (100, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            0,
         );
         assert!(animations.has_native_control(control));
         animations.tick_native_object_controls(0);

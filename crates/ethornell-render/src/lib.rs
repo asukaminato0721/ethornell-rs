@@ -505,8 +505,10 @@ impl<'w> Renderer<'w> {
         };
         let linear_bind_group =
             make_bind_group("ethornell-texture-linear-bind-group", &self.linear_sampler);
-        let nearest_bind_group =
-            make_bind_group("ethornell-texture-nearest-bind-group", &self.nearest_sampler);
+        let nearest_bind_group = make_bind_group(
+            "ethornell-texture-nearest-bind-group",
+            &self.nearest_sampler,
+        );
         TextureRecord {
             texture,
             linear_bind_group,
@@ -697,9 +699,7 @@ impl<'w> Renderer<'w> {
                     self.virtual_width,
                     self.virtual_height,
                 );
-                quad.map(|[game_x, game_y]| {
-                    [offset_x + game_x * scale, offset_y + game_y * scale]
-                })
+                quad.map(|[game_x, game_y]| [offset_x + game_x * scale, offset_y + game_y * scale])
             });
             let (x, y, width, height) = self.game_to_surface_rect(x, y, width, height);
             let scissor = match clip {
@@ -714,11 +714,8 @@ impl<'w> Renderer<'w> {
                 .get(&texture)
                 .map(|record| record.opaque)
                 .unwrap_or(false);
-            let pipeline_kind = native_pipeline_kind(
-                blend_mode,
-                opacity,
-                texture_opaque || ignore_source_alpha,
-            );
+            let pipeline_kind =
+                native_pipeline_kind(blend_mode, opacity, texture_opaque || ignore_source_alpha);
             let shader_opacity = if pipeline_kind == NativePipelineKind::ConstantInterpolation {
                 1.0
             } else {
@@ -1243,12 +1240,42 @@ fn quad_vertices_from_points(
     let v1 = (src_y + src_h).clamp(0.0, 1.0);
     let ignore_source_alpha = if ignore_source_alpha { 1.0 } else { 0.0 };
     [
-        Vertex { position: top_left, texcoord: [u0, v0], opacity, ignore_source_alpha },
-        Vertex { position: bottom_left, texcoord: [u0, v1], opacity, ignore_source_alpha },
-        Vertex { position: bottom_right, texcoord: [u1, v1], opacity, ignore_source_alpha },
-        Vertex { position: top_left, texcoord: [u0, v0], opacity, ignore_source_alpha },
-        Vertex { position: bottom_right, texcoord: [u1, v1], opacity, ignore_source_alpha },
-        Vertex { position: top_right, texcoord: [u1, v0], opacity, ignore_source_alpha },
+        Vertex {
+            position: top_left,
+            texcoord: [u0, v0],
+            opacity,
+            ignore_source_alpha,
+        },
+        Vertex {
+            position: bottom_left,
+            texcoord: [u0, v1],
+            opacity,
+            ignore_source_alpha,
+        },
+        Vertex {
+            position: bottom_right,
+            texcoord: [u1, v1],
+            opacity,
+            ignore_source_alpha,
+        },
+        Vertex {
+            position: top_left,
+            texcoord: [u0, v0],
+            opacity,
+            ignore_source_alpha,
+        },
+        Vertex {
+            position: bottom_right,
+            texcoord: [u1, v1],
+            opacity,
+            ignore_source_alpha,
+        },
+        Vertex {
+            position: top_right,
+            texcoord: [u1, v0],
+            opacity,
+            ignore_source_alpha,
+        },
     ]
 }
 
