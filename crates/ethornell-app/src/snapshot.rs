@@ -114,7 +114,7 @@ pub(crate) fn compose_runtime_frame_through_priority(
         height,
         rgba: vec![0; width as usize * height as usize * 4],
     };
-    for px in out.rgba.chunks_exact_mut(4) {
+    for px in out.rgba.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[0, 0, 0, 255]);
     }
 
@@ -248,41 +248,39 @@ pub(crate) fn compose_graph_object(
         rgba: vec![0; width.max(1) as usize * height.max(1) as usize * 4],
     };
 
-    if let Some(surface) = surface {
-        if let Some(resource_id) = surface.resource_id {
-            if let Some((key, region)) = api.resource_image_region(resource_id) {
-                if let Some(source) = api.graph_images.get(key) {
-                    let viewport_x = surface.viewport_x.max(0.0);
-                    let viewport_y = surface.viewport_y.max(0.0);
-                    let draw_width = surface
-                        .viewport_width
-                        .min(region.width - viewport_x)
-                        .max(0.0);
-                    let draw_height = surface
-                        .viewport_height
-                        .min(region.height - viewport_y)
-                        .max(0.0);
-                    composite_nearest(
-                        &mut out,
-                        source,
-                        0.0,
-                        0.0,
-                        draw_width,
-                        draw_height,
-                        region.x + viewport_x,
-                        region.y + viewport_y,
-                        draw_width,
-                        draw_height,
-                        surface.opacity,
-                        api.graph_object_properties
-                            .get(&surface.id)
-                            .map(|properties| properties.blend_mode)
-                            .unwrap_or(128),
-                        None,
-                    );
-                }
-            }
-        }
+    if let Some(surface) = surface
+        && let Some(resource_id) = surface.resource_id
+        && let Some((key, region)) = api.resource_image_region(resource_id)
+        && let Some(source) = api.graph_images.get(key)
+    {
+        let viewport_x = surface.viewport_x.max(0.0);
+        let viewport_y = surface.viewport_y.max(0.0);
+        let draw_width = surface
+            .viewport_width
+            .min(region.width - viewport_x)
+            .max(0.0);
+        let draw_height = surface
+            .viewport_height
+            .min(region.height - viewport_y)
+            .max(0.0);
+        composite_nearest(
+            &mut out,
+            source,
+            0.0,
+            0.0,
+            draw_width,
+            draw_height,
+            region.x + viewport_x,
+            region.y + viewport_y,
+            draw_width,
+            draw_height,
+            surface.opacity,
+            api.graph_object_properties
+                .get(&surface.id)
+                .map(|properties| properties.blend_mode)
+                .unwrap_or(128),
+            None,
+        );
     }
 
     let mut draw_items = selected_layers

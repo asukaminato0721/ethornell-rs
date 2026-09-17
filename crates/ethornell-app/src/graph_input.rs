@@ -150,10 +150,10 @@ impl RuntimeGraphInputObject {
         };
         let mut values = vec![-1; group_count];
         for (&group, &index) in &self.current_selections {
-            if let Ok(group) = usize::try_from(group) {
-                if let Some(value) = values.get_mut(group) {
-                    *value = index;
-                }
+            if let Ok(group) = usize::try_from(group)
+                && let Some(value) = values.get_mut(group)
+            {
+                *value = index;
             }
         }
         values

@@ -272,7 +272,7 @@ impl RuntimeTraceApi {
         let Some(mut image) = self.graph_bitmap_image(bitmap) else {
             return false;
         };
-        for pixel in image.rgba.chunks_exact_mut(4) {
+        for pixel in image.rgba.as_chunks_mut::<4>().0 {
             let value = 255_u8.wrapping_sub(pixel[3]);
             pixel.copy_from_slice(&[value, value, value, value]);
         }

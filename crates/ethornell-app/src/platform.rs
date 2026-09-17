@@ -192,10 +192,10 @@ impl PortablePlatformStore {
         let Some(path) = self.path.as_deref() else {
             return true;
         };
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                return false;
-            }
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return false;
         }
         let mut text = String::new();
         for (key, value) in &self.values {

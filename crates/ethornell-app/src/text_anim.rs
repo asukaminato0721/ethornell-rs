@@ -149,7 +149,7 @@ impl TextRuntime {
             .iter()
             .filter_map(|span| {
                 let end_char = span.end_char.min(self.visible_chars);
-                (span.start_char < end_char).then(|| RuntimeTextStyleSpan {
+                (span.start_char < end_char).then_some(RuntimeTextStyleSpan {
                     start_char: span.start_char,
                     end_char,
                     style: span.style,

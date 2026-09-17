@@ -32,7 +32,7 @@ impl RuntimeTraceApi {
                     )
                 })
             })
-            .or_else(|| {
+            .or({
                 if self.scenario_bootstrapped {
                     Some((640.0, 650.0))
                 } else {

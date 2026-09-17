@@ -7,6 +7,9 @@ edition.workspace = true
 name = "ethornell"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

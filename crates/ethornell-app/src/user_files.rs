@@ -199,35 +199,35 @@ pub(crate) fn runtime_file_exists_from_root(
     // under the configured roots (or an absolute path); it does not search
     // archive entries by resource name. This distinction is critical for
     // marker probes such as `Tayutama2TV`.
-    if let Some(path) = find_runtime_file_from_root(manager, native_root, archive, file) {
-        if path.is_file() {
-            if std::env::var_os("DEBUG").is_some() {
-                tracing::info!(
-                    backend = "loose_file",
-                    path = %path.display(),
-                    archive,
-                    file,
-                    "RuntimeFileExistsHit"
-                );
-            }
-            return true;
+    if let Some(path) = find_runtime_file_from_root(manager, native_root, archive, file)
+        && path.is_file()
+    {
+        if std::env::var_os("DEBUG").is_some() {
+            tracing::info!(
+                backend = "loose_file",
+                path = %path.display(),
+                archive,
+                file,
+                "RuntimeFileExistsHit"
+            );
         }
+        return true;
     }
 
-    if !is_empty_archive_arg(archive) {
-        if let Some(entry) = find_runtime_resource(manager, archive, file) {
-            if std::env::var_os("DEBUG").is_some() {
-                tracing::info!(
-                    backend = "archive_entry",
-                    archive_path = %entry.archive_path.display(),
-                    entry_name = entry.entry_name,
-                    archive,
-                    file,
-                    "RuntimeFileExistsHit"
-                );
-            }
-            return true;
+    if !is_empty_archive_arg(archive)
+        && let Some(entry) = find_runtime_resource(manager, archive, file)
+    {
+        if std::env::var_os("DEBUG").is_some() {
+            tracing::info!(
+                backend = "archive_entry",
+                archive_path = %entry.archive_path.display(),
+                entry_name = entry.entry_name,
+                archive,
+                file,
+                "RuntimeFileExistsHit"
+            );
         }
+        return true;
     }
 
     if std::env::var_os("DEBUG").is_some() {
@@ -249,10 +249,10 @@ pub(crate) fn read_runtime_bytes(
     archive: &str,
     file: &str,
 ) -> Option<Vec<u8>> {
-    if let Some(path) = find_runtime_file(manager, archive, file) {
-        if let Ok(bytes) = std::fs::read(path) {
-            return Some(bytes);
-        }
+    if let Some(path) = find_runtime_file(manager, archive, file)
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        return Some(bytes);
     }
     let entry = find_runtime_resource(manager, archive, file)?;
     manager.read_by_entry_decoded(&entry).ok()

@@ -308,7 +308,7 @@ impl ScenarioPlayback {
                     .args
                     .iter()
                     .filter_map(value_i32)
-                    .last()
+                    .next_back()
                     .and_then(|value| usize::try_from(value).ok());
             }
             Some("jmp") => self.jump_to_stack_address(),
@@ -1321,8 +1321,7 @@ fn duration_millis(values: &[BcsValue]) -> Option<i32> {
     values
         .iter()
         .filter_map(value_i32)
-        .filter(|value| (16..=30_000).contains(value))
-        .last()
+        .rfind(|value| (16..=30_000).contains(value))
 }
 
 fn value_i32(value: &BcsValue) -> Option<i32> {

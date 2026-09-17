@@ -90,10 +90,11 @@ fn idct_row_cond_dc_int16_8bit(row: &mut [i16; 8]) {
 }
 
 #[inline(always)]
+// Keep the column + stride * row layout explicit for every row.
 fn idct_sparse_col_int16_8bit(block: &mut [i16; 64], col: usize) {
     // Column elements are block[col + 8*r]
-    let c0 = block[col] as i64;
-    let c1 = block[col + 8] as i64;
+    let c0 = block[col + 8 * 0] as i64;
+    let c1 = block[col + 8 * 1] as i64;
     let c2 = block[col + 8 * 2] as i64;
     let c3 = block[col + 8 * 3] as i64;
     let c4 = block[col + 8 * 4] as i64;
@@ -142,8 +143,8 @@ fn idct_sparse_col_int16_8bit(block: &mut [i16; 64], col: usize) {
     }
 
     let cs = COL_SHIFT as i64;
-    block[col] = ((a0 + b0) >> cs) as i16;
-    block[col + 8] = ((a1 + b1) >> cs) as i16;
+    block[col + 8 * 0] = ((a0 + b0) >> cs) as i16;
+    block[col + 8 * 1] = ((a1 + b1) >> cs) as i16;
     block[col + 8 * 2] = ((a2 + b2) >> cs) as i16;
     block[col + 8 * 3] = ((a3 + b3) >> cs) as i16;
     block[col + 8 * 4] = ((a3 - b3) >> cs) as i16;
@@ -153,6 +154,7 @@ fn idct_sparse_col_int16_8bit(block: &mut [i16; 64], col: usize) {
 }
 
 #[inline(always)]
+// Keep the column + stride * row layout explicit for every row.
 fn idct_sparse_col_add_int16_8bit(
     dest: &mut [u8],
     dest_off: usize,
@@ -160,8 +162,8 @@ fn idct_sparse_col_add_int16_8bit(
     block: &[i16; 64],
     col: usize,
 ) {
-    let c0 = block[col] as i64;
-    let c1 = block[col + 8] as i64;
+    let c0 = block[col + 8 * 0] as i64;
+    let c1 = block[col + 8 * 1] as i64;
     let c2 = block[col + 8 * 2] as i64;
     let c3 = block[col + 8 * 3] as i64;
     let c4 = block[col + 8 * 4] as i64;
@@ -289,6 +291,7 @@ const R2: i64 = 12540;
 const R3: i64 = 23170;
 
 #[inline(always)]
+// Keep the column + stride * row layout explicit for every row.
 fn idct4col_add(
     dest: &mut [u8],
     dest_off: usize,
@@ -297,8 +300,8 @@ fn idct4col_add(
     col_idx: usize,
 ) {
     // col points to block + i (column i), but in upstream idct4col_add reads col[8*0..8*3]
-    let a0 = col[col_idx] as i64;
-    let a1 = col[col_idx + 8] as i64;
+    let a0 = col[col_idx + 8 * 0] as i64;
+    let a1 = col[col_idx + 8 * 1] as i64;
     let a2 = col[col_idx + 8 * 2] as i64;
     let a3 = col[col_idx + 8 * 3] as i64;
 

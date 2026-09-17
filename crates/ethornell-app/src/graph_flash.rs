@@ -190,12 +190,11 @@ impl RuntimeFlashRegistry {
             player.preload(&mut ExecutionLimit::none());
             player.set_is_playing(true);
             player.mutate_with_update_context(|context| {
-                if let Some(root) = context.stage.root_clip() {
-                    if let Some(movie_clip) = root.as_movie_clip() {
-                        if !movie_clip.playing() {
-                            movie_clip.play();
-                        }
-                    }
+                if let Some(root) = context.stage.root_clip()
+                    && let Some(movie_clip) = root.as_movie_clip()
+                    && !movie_clip.playing()
+                {
+                    movie_clip.play();
                 }
             });
             Ok::<(), String>(())

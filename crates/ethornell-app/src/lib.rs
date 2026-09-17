@@ -76,7 +76,7 @@ use graph::{
 };
 use graph_defaults::{GraphRuntimeDefaults, SurfaceTextState};
 use graph_group::GraphGroupState;
-use graph_input::{RuntimeGraphInputObject, pack_words};
+use graph_input::RuntimeGraphInputObject;
 use graph_knob::GraphKnobState;
 use graph_movie::BurikoMovieRegistry;
 use graph_sprite_targets::GraphSpriteTargetRegistry;
@@ -95,7 +95,7 @@ use surface_controls::{SurfaceControlOwner, SurfaceControlRegistry};
 use text::{MESSAGE_NAME_TEXT_Z, MESSAGE_TEXT_Z, RuntimeTextNode, TextState};
 use text_anim::TextRuntime;
 use timeline::{TimelineEvent, TimelineSystem};
-use timing::{NATIVE_TICK_MS, duration_ms_to_ticks, normalize_engine_elapsed_ms};
+use timing::{NATIVE_TICK_MS, normalize_engine_elapsed_ms};
 use user_files::{
     bgi_xxx_pattern_matches, find_runtime_file_from_root, game_root_path, is_empty_archive_arg,
     read_runtime_bytes, resolve_existing_path_case_insensitive, runtime_file_cache_key,
@@ -141,10 +141,10 @@ fn detect_game_id_from_bootstrap(program: &ethornell_script::BpProgram) -> Optio
                 }
                 break;
             }
-            if let [ethornell_script::BpOperand::String(value)] = instruction.operands.as_slice() {
-                if !value.is_empty() {
-                    candidate = Some(value.clone());
-                }
+            if let [ethornell_script::BpOperand::String(value)] = instruction.operands.as_slice()
+                && !value.is_empty()
+            {
+                candidate = Some(value.clone());
             }
         }
     }
@@ -234,14 +234,14 @@ pub fn run(config: AppConfig) -> Result<()> {
     } else {
         Some(load_runtime_image(&manager)?)
     };
-    if config.trace {
-        if let Some(image) = image.as_ref() {
-            tracing::info!(
-                width = image.width,
-                height = image.height,
-                "runtime reached resource image decode stage"
-            );
-        }
+    if config.trace
+        && let Some(image) = image.as_ref()
+    {
+        tracing::info!(
+            width = image.width,
+            height = image.height,
+            "runtime reached resource image decode stage"
+        );
     }
     let text = config
         .force_text_test
@@ -1297,7 +1297,7 @@ impl RuntimeTraceApi {
         let mut max_alpha = 0u8;
         let mut rgb_min = [u8::MAX; 3];
         let mut rgb_max = [0u8; 3];
-        for pixel in image.rgba.chunks_exact(4) {
+        for pixel in image.rgba.as_chunks::<4>().0 {
             if pixel[3] != 0 {
                 nonzero_alpha += 1;
                 for channel in 0..3 {
@@ -1396,7 +1396,7 @@ impl RuntimeTraceApi {
             source_image = fit_decoded_image_canvas(&source_image, width, height);
         }
         let mut rgba = Vec::with_capacity(source_image.rgba.len());
-        for pixel in source_image.rgba.chunks_exact(4) {
+        for pixel in source_image.rgba.as_chunks::<4>().0 {
             let weighted =
                 77 * u32::from(pixel[0]) + 151 * u32::from(pixel[1]) + 28 * u32::from(pixel[2]);
             let luma = if source_format == 1 {
@@ -3182,17 +3182,17 @@ impl RuntimeTraceApi {
             Some((x, y, width, height))
         };
 
-        if let Some(layer) = self.graph_layers.get(&target) {
-            if let Some(rect) = resolve(target, layer) {
-                return Some(rect);
-            }
+        if let Some(layer) = self.graph_layers.get(&target)
+            && let Some(rect) = resolve(target, layer)
+        {
+            return Some(rect);
         }
         if let Some(layers) = self.graph_object_layers.get(&target) {
             for layer_id in layers.iter().rev() {
-                if let Some(layer) = self.graph_layers.get(layer_id) {
-                    if let Some(rect) = resolve(*layer_id, layer) {
-                        return Some(rect);
-                    }
+                if let Some(layer) = self.graph_layers.get(layer_id)
+                    && let Some(rect) = resolve(*layer_id, layer)
+                {
+                    return Some(rect);
                 }
             }
         }
@@ -3987,10 +3987,10 @@ impl RuntimeTraceApi {
             let _ = self.graph90_resync_fixed_sprite_geometry(target);
         }
         let sort_key_after = self.graph90_native_sort_key(target);
-        if sort_key_before != sort_key_after {
-            if let Some(sort_key) = sort_key_after {
-                self.display_tree.set_native_sort_key(target, sort_key);
-            }
+        if sort_key_before != sort_key_after
+            && let Some(sort_key) = sort_key_after
+        {
+            self.display_tree.set_native_sort_key(target, sort_key);
         }
         trace_graph!(
             self,
@@ -4744,27 +4744,27 @@ impl RuntimeTraceApi {
                         fixed_parameter_16_16,
                     );
                     let sort_key_after = self.graph90_native_sort_key(object_id);
-                    if sort_key_before != sort_key_after {
-                        if let Some(sort_key) = sort_key_after {
-                            self.display_tree.set_native_sort_key(object_id, sort_key);
-                        }
+                    if sort_key_before != sort_key_after
+                        && let Some(sort_key) = sort_key_after
+                    {
+                        self.display_tree.set_native_sort_key(object_id, sort_key);
                     }
                 }
-                animation::LayerAnimationEvent::NativeObjectControlFinished { object_id } => {
-                    if self.debug_graph {
-                        let position = self
-                            .graph_object_properties
-                            .get(&object_id)
-                            .map(|p| (p.native.position_x, p.native.position_y));
-                        let alpha = self
-                            .graph_object_properties
-                            .get(&object_id)
-                            .map(RuntimeGraphObjectProperties::alpha_parameter);
-                        trace_graph!(
-                            self,
-                            "native object control finished object={object_id} position={position:?} alpha={alpha:?}"
-                        );
-                    }
+                animation::LayerAnimationEvent::NativeObjectControlFinished { object_id }
+                    if self.debug_graph =>
+                {
+                    let position = self
+                        .graph_object_properties
+                        .get(&object_id)
+                        .map(|p| (p.native.position_x, p.native.position_y));
+                    let alpha = self
+                        .graph_object_properties
+                        .get(&object_id)
+                        .map(RuntimeGraphObjectProperties::alpha_parameter);
+                    trace_graph!(
+                        self,
+                        "native object control finished object={object_id} position={position:?} alpha={alpha:?}"
+                    );
                 }
                 _ => {}
             }
@@ -4876,10 +4876,10 @@ impl RuntimeTraceApi {
                         fixed_parameter_16_16,
                     );
                     let sort_key_after = self.graph90_native_sort_key(object_id);
-                    if sort_key_before != sort_key_after {
-                        if let Some(sort_key) = sort_key_after {
-                            self.display_tree.set_native_sort_key(object_id, sort_key);
-                        }
+                    if sort_key_before != sort_key_after
+                        && let Some(sort_key) = sort_key_after
+                    {
+                        self.display_tree.set_native_sort_key(object_id, sort_key);
                     }
                 }
                 animation::LayerAnimationEvent::NativeObjectControlFinished { object_id } => {
@@ -5795,7 +5795,7 @@ impl RuntimeTraceApi {
             );
             return None;
         }
-        if !matches!(transition.blend_selector, -1 | 0..=3)
+        if !matches!(transition.blend_selector, -1..=3)
             && std::env::var_os("TRACE_REVERSE_GAPS").is_some()
         {
             tracing::warn!(
@@ -5819,19 +5819,18 @@ impl RuntimeTraceApi {
             layer.src_x = 0.0;
             layer.src_y = 0.0;
         }
-        if self.graph_node_sources.contains_key(&node) {
-            self.graph_node_sources.insert(
-                node,
-                (
-                    key.clone(),
-                    RuntimeClipRect {
-                        x: 0.0,
-                        y: 0.0,
-                        width,
-                        height,
-                    },
-                ),
-            );
+        if let std::collections::btree_map::Entry::Occupied(mut e) =
+            self.graph_node_sources.entry(node)
+        {
+            e.insert((
+                key.clone(),
+                RuntimeClipRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height,
+                },
+            ));
             self.refresh_graph_node_mask(node);
         }
         Some(key)
@@ -6524,21 +6523,20 @@ impl RuntimeTraceApi {
                 });
             }
             let mut order_serial = self.display_order_serial(*layer_id, layer.owner_object);
-            if self.surface_controls.contains_layer(*layer_id) {
-                if let Some(surface) = layer
+            if self.surface_controls.contains_layer(*layer_id)
+                && let Some(surface) = layer
                     .target_surface
                     .and_then(|surface| self.graph_surfaces.get(&surface))
-                {
-                    // Target window controls are rendered by the window's
-                    // private CObjectManager and then the window enters the
-                    // global display chain as one object. Flatten that nested
-                    // composition without leaking local depths into global z.
-                    z = self.display_tree.effective_depth(surface.id, surface.z);
-                    order_serial = self
-                        .display_order_serial(surface.id, None)
-                        .saturating_add(1)
-                        .saturating_add(layer.z.max(0) as u64);
-                }
+            {
+                // Target window controls are rendered by the window's
+                // private CObjectManager and then the window enters the
+                // global display chain as one object. Flatten that nested
+                // composition without leaking local depths into global z.
+                z = self.display_tree.effective_depth(surface.id, surface.z);
+                order_serial = self
+                    .display_order_serial(surface.id, None)
+                    .saturating_add(1)
+                    .saturating_add(layer.z.max(0) as u64);
             }
             items.push(RuntimeGraphDrawItem {
                 owner_object: layer.owner_object.or(Some(*layer_id)),
@@ -15112,7 +15110,7 @@ fn cursor_motion_scale_tolerance(logical: i32, surface: i32) -> u32 {
     }
     let smaller = logical.min(surface) as u64;
     let larger = logical.max(surface) as u64;
-    ((larger + smaller - 1) / smaller).clamp(1, u64::from(u32::MAX)) as u32
+    larger.div_ceil(smaller).clamp(1, u64::from(u32::MAX)) as u32
 }
 
 fn drain_native_input_descriptor(api: &mut RuntimeTraceApi, descriptor: i32) -> i32 {
@@ -15433,10 +15431,8 @@ impl RuntimeTraceApi {
                 };
                 let should_queue =
                     !is_extended || !suppress_extended_event || current_hit.is_none();
-                if should_queue {
-                    if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                        input.queue_event([0x1000_0002, event_payload, event_parameter]);
-                    }
+                if should_queue && let Some(input) = self.graph_input_objects.get_mut(&object) {
+                    input.queue_event([0x1000_0002, event_payload, event_parameter]);
                 }
                 self.refresh_graph_input_control_layers(object);
             }
@@ -15513,10 +15509,10 @@ impl RuntimeTraceApi {
                 (-1, 0, false)
             }
         };
-        if !is_extended || !suppress_extended_event || current_hit.is_none() {
-            if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                input.queue_event([0x1000_0002, payload, parameter]);
-            }
+        if (!is_extended || !suppress_extended_event || current_hit.is_none())
+            && let Some(input) = self.graph_input_objects.get_mut(&object)
+        {
+            input.queue_event([0x1000_0002, payload, parameter]);
         }
         self.refresh_graph_input_control_layers(object);
     }
@@ -15779,10 +15775,8 @@ impl RuntimeTraceApi {
         // of whether the base processor has a callback. DCIPIconEx overrides
         // the no-item callback with sub_44B9E0 and queues 0x10000007/-1.
         let _ = drain_native_input_descriptor(self, INPUT_DESCRIPTOR_MOUSE_LEFT);
-        if extended {
-            if let Some(input) = self.graph_input_objects.get_mut(&object) {
-                input.queue_event([0x1000_0007, -1, graph_input::pack_words(object_y, object_x)]);
-            }
+        if extended && let Some(input) = self.graph_input_objects.get_mut(&object) {
+            input.queue_event([0x1000_0007, -1, graph_input::pack_words(object_y, object_x)]);
         }
         true
     }
@@ -15831,10 +15825,8 @@ impl RuntimeTraceApi {
                 matches_pending,
                 "GraphInputReleaseRouteCandidate"
             );
-            if matches_pending {
-                if let Some((region, local_x, local_y)) = hit {
-                    matching.push((*object, region, local_x, local_y));
-                }
+            if matches_pending && let Some((region, local_x, local_y)) = hit {
+                matching.push((*object, region, local_x, local_y));
             }
         }
 
@@ -16189,23 +16181,23 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             found = bytes.is_some(),
             "LoadFileBytes"
         );
-        if file.eq_ignore_ascii_case("main") {
-            if let Some(bytes) = bytes.as_deref() {
-                if self.title_ui_active && self.title_scenario_requested {
-                    self.depart_title_ui_for_scenario(file);
-                }
-                self.scenario_bootstrapped = true;
-                if std::env::var("ETHORNELL_SCENARIO_SHADOW").ok().as_deref() == Some("1") {
-                    if self.title_ui_departed {
-                        self.start_scenario_playback(&resolved_archive, file, bytes);
-                    } else {
-                        self.pending_scenario_bootstrap =
-                            Some((resolved_archive.clone(), file.to_string(), bytes.to_vec()));
-                        trace_graph!(
-                            self,
-                            "BCS playback bootstrap deferred {resolved_archive}:{file} requested={archive}"
-                        );
-                    }
+        if file.eq_ignore_ascii_case("main")
+            && let Some(bytes) = bytes.as_deref()
+        {
+            if self.title_ui_active && self.title_scenario_requested {
+                self.depart_title_ui_for_scenario(file);
+            }
+            self.scenario_bootstrapped = true;
+            if std::env::var("ETHORNELL_SCENARIO_SHADOW").ok().as_deref() == Some("1") {
+                if self.title_ui_departed {
+                    self.start_scenario_playback(&resolved_archive, file, bytes);
+                } else {
+                    self.pending_scenario_bootstrap =
+                        Some((resolved_archive.clone(), file.to_string(), bytes.to_vec()));
+                    trace_graph!(
+                        self,
+                        "BCS playback bootstrap deferred {resolved_archive}:{file} requested={archive}"
+                    );
                 }
             }
         }
@@ -16454,10 +16446,10 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             if let Ok(current) = std::env::current_dir() {
                 candidates.push(current);
             }
-            if let Ok(executable) = std::env::current_exe() {
-                if let Some(parent) = executable.parent() {
-                    candidates.push(parent.to_path_buf());
-                }
+            if let Ok(executable) = std::env::current_exe()
+                && let Some(parent) = executable.parent()
+            {
+                candidates.push(parent.to_path_buf());
             }
             #[cfg(target_os = "windows")]
             for drive in b'A'..=b'Z' {
@@ -16497,17 +16489,17 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
             for candidate in &candidates {
                 for marker in &marker_variants {
-                    if let Some(found) = resolve_existing_path_case_insensitive(candidate, marker) {
-                        if let Some(root) = matched_root(&found) {
-                            tracing::info!(
-                                candidate = %candidate.display(),
-                                marker = %marker.display(),
-                                found = %found.display(),
-                                root = %root.display(),
-                                "removable archive marker matched filesystem"
-                            );
-                            return Some(root.to_string_lossy().into_owned());
-                        }
+                    if let Some(found) = resolve_existing_path_case_insensitive(candidate, marker)
+                        && let Some(root) = matched_root(&found)
+                    {
+                        tracing::info!(
+                            candidate = %candidate.display(),
+                            marker = %marker.display(),
+                            found = %found.display(),
+                            root = %root.display(),
+                            "removable archive marker matched filesystem"
+                        );
+                        return Some(root.to_string_lossy().into_owned());
                     }
                 }
             }
@@ -16537,7 +16529,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                         )
                 });
                 if matched {
-                    let root = archive.path.parent().unwrap_or_else(|| game_root.as_path());
+                    let root = archive.path.parent().unwrap_or(game_root.as_path());
                     tracing::info!(
                         archive = %archive.path.display(),
                         root = %root.display(),
@@ -16761,14 +16753,13 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn keyboard_state(&mut self) -> [u8; 256] {
         let mut state = [0u8; 256];
-        if !self.pending_input_consumed && self.pending_input_state.unwrap_or_default() != 0 {
-            if let Some(descriptor) = self.pending_input_descriptor {
-                if let Ok(index) = usize::try_from(descriptor) {
-                    if let Some(value) = state.get_mut(index) {
-                        *value = 0x80;
-                    }
-                }
-            }
+        if !self.pending_input_consumed
+            && self.pending_input_state.unwrap_or_default() != 0
+            && let Some(descriptor) = self.pending_input_descriptor
+            && let Ok(index) = usize::try_from(descriptor)
+            && let Some(value) = state.get_mut(index)
+        {
+            *value = 0x80;
         }
         state
     }
@@ -16838,12 +16829,10 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             return false;
         };
         let ok = std::fs::remove_file(&path).is_ok();
-        if ok {
-            if let Ok(relative) = path.strip_prefix(self.manager.archives().root.as_path()) {
-                let key = runtime_file_cache_key("", &relative.to_string_lossy());
-                self.file_exists_cache.remove(&key);
-                self.file_size_cache.remove(&key);
-            }
+        if ok && let Ok(relative) = path.strip_prefix(self.manager.archives().root.as_path()) {
+            let key = runtime_file_cache_key("", &relative.to_string_lossy());
+            self.file_exists_cache.remove(&key);
+            self.file_size_cache.remove(&key);
         }
         tracing::debug!(root, file, path = %path.display(), ok, "DeleteFile");
         ok
@@ -17134,10 +17123,10 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return false;
             };
             let destination = root.join(destination.replace('\\', std::path::MAIN_SEPARATOR_STR));
-            if let Some(parent) = destination.parent() {
-                if std::fs::create_dir_all(parent).is_err() {
-                    return false;
-                }
+            if let Some(parent) = destination.parent()
+                && std::fs::create_dir_all(parent).is_err()
+            {
+                return false;
             }
             if std::fs::copy(source, destination).is_err() {
                 return false;
@@ -18887,7 +18876,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         bytes.extend_from_slice(&height.to_le_bytes());
         bytes.extend_from_slice(&32u32.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
-        for pixel in image.rgba.chunks_exact(4) {
+        for pixel in image.rgba.as_chunks::<4>().0 {
             bytes.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
         }
         Ok(bytes)
@@ -18909,7 +18898,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             return false;
         }
         let mut rgba = Vec::with_capacity(pixel_count * 4);
-        for rgb in pixels[..pixel_count * 3].chunks_exact(3) {
+        for rgb in pixels[..pixel_count * 3].as_chunks::<3>().0 {
             rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
         let image = DecodedImage {
@@ -18938,7 +18927,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             return None;
         }
         let mut rgb = Vec::with_capacity(required);
-        for rgba in image.rgba.chunks_exact(4) {
+        for rgba in image.rgba.as_chunks::<4>().0 {
             rgb.extend_from_slice(&rgba[..3]);
         }
         Some(rgb)
@@ -19320,8 +19309,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             .graph_object_properties
             .entry(schedule.target_object)
             .or_default()
-            .native
-            .clone();
+            .native;
         let from_vector = (
             native.fixed_position_x_16_16,
             native.fixed_position_y_16_16,
@@ -20466,7 +20454,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 // allocates a Knob slot. It does not require the target to be
                 // unparented and does not claim it as a member child.
                 let handle = if self.graph_handle_exists(target) {
-                    self.alloc_graph_knob_handle().map(|handle| {
+                    self.alloc_graph_knob_handle().inspect(|&handle| {
                         // sub_420EC0 initializes the Knob's ordinary +0x30/+0x34
                         // position from target vtable+0x30 (sub_41B240): the
                         // target's raw/native base position, not composite/world.
@@ -20529,7 +20517,6 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         // Constructor ends with sub_421430(0,0), which aligns
                         // the controlled target to the Knob's current position.
                         self.apply_graph_knob_position(handle);
-                        handle
                     })
                 } else {
                     None
@@ -20859,7 +20846,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             (0x90, 0xe0) => {
                 let handle = self
                     .alloc_graph_group_handle()
-                    .map(|handle| {
+                    .inspect(|&handle| {
                         self.graph_groups.insert(handle, GraphGroupState::default());
                         self.display_tree.register(handle, NativeDisplayKind::Group);
                         self.graph_object_enabled.insert(handle, true);
@@ -20877,7 +20864,6 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             native.enabled = 1;
                             native.draw_enabled = 0;
                         }
-                        handle
                     })
                     .unwrap_or_default();
                 tracing::info!(handle, "GraphCreateGroupObject");
@@ -21835,33 +21821,32 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         .map(|hit| (hit, hit & 0xffff, false))
                 })
         });
-        if hit.is_none() {
-            if let Some(point) = self.pending_click {
-                let input = self.graph_input_objects.get(&object);
-                let layer = input.map(|input| input.layer);
-                let surface_origin = layer
-                    .and_then(|layer| self.graph_surfaces.get(&layer))
-                    .map(|surface| (surface.x, surface.y));
-                let layer_origin =
-                    layer
-                        .and_then(|layer| self.graph_layers.get(&layer))
-                        .map(|layer| {
-                            (
-                                layer.screen_x(&self.graph_surfaces),
-                                layer.screen_y(&self.graph_surfaces),
-                            )
-                        });
-                tracing::debug!(
-                    target: "graph_input",
-                    object,
-                    ?point,
-                    ?layer,
-                    ?surface_origin,
-                    ?layer_origin,
-                    regions = input.map(|input| input.descriptor.regions.len()).unwrap_or_default(),
-                    "input click missed object"
-                );
-            }
+        if hit.is_none()
+            && let Some(point) = self.pending_click
+        {
+            let input = self.graph_input_objects.get(&object);
+            let layer = input.map(|input| input.layer);
+            let surface_origin = layer
+                .and_then(|layer| self.graph_surfaces.get(&layer))
+                .map(|surface| (surface.x, surface.y));
+            let layer_origin = layer
+                .and_then(|layer| self.graph_layers.get(&layer))
+                .map(|layer| {
+                    (
+                        layer.screen_x(&self.graph_surfaces),
+                        layer.screen_y(&self.graph_surfaces),
+                    )
+                });
+            tracing::debug!(
+                target: "graph_input",
+                object,
+                ?point,
+                ?layer,
+                ?surface_origin,
+                ?layer_origin,
+                regions = input.map(|input| input.descriptor.regions.len()).unwrap_or_default(),
+                "input click missed object"
+            );
         }
         let (event, payload) = if let Some((hit, payload, title_only)) = hit {
             let payload = if title_only {
@@ -22712,10 +22697,10 @@ fn load_runtime_image(manager: &ResourceManager) -> Result<DecodedImage> {
             }
         }
     }
-    if let Ok(bytes) = manager.read_decoded("BG01D_a") {
-        if detect_magic(&bytes) == MagicKind::CompressedBg {
-            return decode_image(&bytes);
-        }
+    if let Ok(bytes) = manager.read_decoded("BG01D_a")
+        && detect_magic(&bytes) == MagicKind::CompressedBg
+    {
+        return decode_image(&bytes);
     }
     for entry in manager.list() {
         let Ok(bytes) = manager.read_by_entry_decoded(&entry) else {
@@ -22769,12 +22754,12 @@ fn run_headless(
             None
         }
     };
-    if runtime.is_none() {
-        if let (Some(audio), Some(bgm)) = (audio.as_mut(), bgm.as_ref()) {
-            match audio.play_from_bytes(bgm) {
-                Ok(()) => tracing::info!("headless title BGM playback started"),
-                Err(err) => tracing::warn!(%err, "headless title BGM playback failed"),
-            }
+    if runtime.is_none()
+        && let (Some(audio), Some(bgm)) = (audio.as_mut(), bgm.as_ref())
+    {
+        match audio.play_from_bytes(bgm) {
+            Ok(()) => tracing::info!("headless title BGM playback started"),
+            Err(err) => tracing::warn!(%err, "headless title BGM playback failed"),
         }
     }
     if let Some(image) = image.as_ref() {
@@ -22854,20 +22839,20 @@ fn run_headless(
             // render tree and produces a complete offscreen framebuffer.
             let frame_composition =
                 snapshot::compose_runtime_frame_with_diagnostics(&runtime.api, true);
-            if snapshot_frame == Some(frame) {
-                if let Some(path) = snapshot_path.as_ref() {
-                    snapshot::write_composed_runtime_snapshot(
-                        &runtime.api,
-                        &frame_composition.framebuffer,
-                        path,
-                    )?;
-                    frame_snapshot_written = true;
-                    tracing::info!(
-                        frame,
-                        path = %path.display(),
-                        "headless frame snapshot written"
-                    );
-                }
+            if snapshot_frame == Some(frame)
+                && let Some(path) = snapshot_path.as_ref()
+            {
+                snapshot::write_composed_runtime_snapshot(
+                    &runtime.api,
+                    &frame_composition.framebuffer,
+                    path,
+                )?;
+                frame_snapshot_written = true;
+                tracing::info!(
+                    frame,
+                    path = %path.display(),
+                    "headless frame snapshot written"
+                );
             }
             if runtime.api.debug_graph || runtime.api.trace_render_tree || frame % 60 == 0 {
                 let report = last_report.as_ref();
@@ -22906,13 +22891,13 @@ fn run_headless(
                     "headless frame tick"
                 );
                 runtime.api.trace_render_snapshot(frame, report);
-                if let Some(report) = report {
-                    if report.stop_reason.is_fatal() {
-                        tracing::warn!(
-                            recent_trace = ?report.recent_trace,
-                            "headless runtime VM halted with error"
-                        );
-                    }
+                if let Some(report) = report
+                    && report.stop_reason.is_fatal()
+                {
+                    tracing::warn!(
+                        recent_trace = ?report.recent_trace,
+                        "headless runtime VM halted with error"
+                    );
                 }
             }
             latest_framebuffer = Some(frame_composition.framebuffer);
@@ -22953,15 +22938,15 @@ fn run_headless(
             }
         }
     }
-    if !frame_snapshot_written {
-        if let (Some(path), Some(runtime)) = (snapshot_path, runtime.as_ref()) {
-            if let Some(framebuffer) = latest_framebuffer.as_ref() {
-                snapshot::write_composed_runtime_snapshot(&runtime.api, framebuffer, &path)?;
-            } else {
-                snapshot::write_runtime_snapshot(&runtime.api, &path)?;
-            }
-            tracing::info!(path = %path.display(), "headless snapshot written");
+    if !frame_snapshot_written
+        && let (Some(path), Some(runtime)) = (snapshot_path, runtime.as_ref())
+    {
+        if let Some(framebuffer) = latest_framebuffer.as_ref() {
+            snapshot::write_composed_runtime_snapshot(&runtime.api, framebuffer, &path)?;
+        } else {
+            snapshot::write_runtime_snapshot(&runtime.api, &path)?;
         }
+        tracing::info!(path = %path.display(), "headless snapshot written");
     }
     if let Some(runtime) = runtime.as_ref() {
         runtime.api.write_call_coverage_if_requested();
@@ -22994,12 +22979,12 @@ fn run_window(
         runtime.api.graphics_memory_metric = renderer.graphics_memory_metric();
     }
     let mut _audio = AudioSystem::new()?;
-    if runtime.is_none() {
-        if let Some(bgm) = bgm {
-            match _audio.play_from_bytes(&bgm) {
-                Ok(()) => tracing::info!("title BGM playback started"),
-                Err(err) => tracing::warn!(%err, "title BGM playback failed"),
-            }
+    if runtime.is_none()
+        && let Some(bgm) = bgm
+    {
+        match _audio.play_from_bytes(&bgm) {
+            Ok(()) => tracing::info!("title BGM playback started"),
+            Err(err) => tracing::warn!(%err, "title BGM playback failed"),
         }
     }
     let texture = match &image {
@@ -23040,7 +23025,7 @@ fn run_window(
             WindowEvent::CloseRequested => {
                 let allow_native_close = runtime
                     .as_mut()
-                    .map_or(true, |runtime| runtime.api.handle_host_window_close("window"));
+                    .is_none_or(|runtime| runtime.api.handle_host_window_close("window"));
                 if allow_native_close {
                     target.exit();
                 }
@@ -23067,28 +23052,26 @@ fn run_window(
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                if let Some(runtime) = runtime.as_mut() {
-                    if runtime.api.native_system.drag_drop_enabled {
+                if let Some(runtime) = runtime.as_mut()
+                    && runtime.api.native_system.drag_drop_enabled {
                         runtime.api.dropped_files.clear();
                         runtime
                             .api
                             .dropped_files
                             .push_back(path.to_string_lossy().into_owned());
                     }
-                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 cursor_surface_pos = Some((position.x as f32, position.y as f32));
                 let cursor_game_pos =
                     renderer.surface_to_game_point(position.x as f32, position.y as f32);
-                if runtime.is_some() {
-                    if let Some((x, y)) = cursor_game_pos {
+                if runtime.is_some()
+                    && let Some((x, y)) = cursor_game_pos {
                         queue_runtime_input_event(
                             &mut pending_input_events,
                             RuntimeInputEvent::MouseMove { x, y },
                         );
                     }
-                }
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -23109,8 +23092,8 @@ fn run_window(
                             .as_deref()
                             .is_some_and(|text| runtime.api.append_native_edit_text(text))
                 });
-                if !edit_consumed && !modeless_consumed {
-                    if let Some(descriptor) = input_descriptor_for_keycode(code) {
+                if !edit_consumed && !modeless_consumed
+                    && let Some(descriptor) = input_descriptor_for_keycode(code) {
                         if let Some(runtime) = runtime.as_mut() {
                             if runtime.api.native_system.fullscreen_hotkeys_enabled
                                 && runtime
@@ -23130,7 +23113,6 @@ fn run_window(
                         }
                         tracing::info!(descriptor, "keyboard advance");
                     }
-                }
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -23141,30 +23123,27 @@ fn run_window(
                     },
                 ..
             } => {
-                if let Some(descriptor) = input_descriptor_for_keycode(code) {
-                    if let Some(runtime) = runtime.as_mut() {
-                        if !runtime.api.has_visible_user_modeless_dialog() {
+                if let Some(descriptor) = input_descriptor_for_keycode(code)
+                    && let Some(runtime) = runtime.as_mut()
+                        && !runtime.api.has_visible_user_modeless_dialog() {
                             queue_runtime_input_event(
                                 &mut pending_input_events,
                                 RuntimeInputEvent::KeyRelease { descriptor },
                             );
                         }
-                    }
-                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta_y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(position) => position.y as f32,
                 };
-                if delta_y != 0.0 {
-                    if runtime.is_some() {
+                if delta_y != 0.0
+                    && runtime.is_some() {
                         queue_runtime_input_event(
                             &mut pending_input_events,
                             RuntimeInputEvent::MouseWheel { delta_y },
                         );
                     }
-                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -23381,13 +23360,12 @@ fn run_window(
                 // games whose runtime script could not be created. A running
                 // BP runtime must render exclusively from its graph draw list.
                 let draw_static_fallback = runtime.is_none();
-                if draw_static_fallback {
-                    if let (Some(texture), Some((image_width, image_height))) =
+                if draw_static_fallback
+                    && let (Some(texture), Some((image_width, image_height))) =
                         (&texture, image_size)
                     {
                         push_fit_texture_command(&mut commands, texture, image_width, image_height);
                     }
-                }
                 if let Some(text) = &text {
                     commands.push(RenderCommand::DrawText {
                         text: text.clone(),

@@ -339,13 +339,13 @@ impl RuntimeTraceApi {
         {
             return *offset;
         }
-        if self.graph_native_owners.get(&child) == Some(&parent) {
-            if let Some(transform) = self.graph91_object_transforms.get(&child) {
-                return (
-                    transform.attachment_offset[0],
-                    transform.attachment_offset[1],
-                );
-            }
+        if self.graph_native_owners.get(&child) == Some(&parent)
+            && let Some(transform) = self.graph91_object_transforms.get(&child)
+        {
+            return (
+                transform.attachment_offset[0],
+                transform.attachment_offset[1],
+            );
         }
         if let Some(surface) = self
             .graph_surfaces
@@ -656,27 +656,33 @@ impl RuntimeTraceApi {
         // only for a format-1 secondary carrying non-opaque legacy bytes,
         // materialize a BackF-local opaque view. This keeps selector 128 as a
         // true copy without mutating the source bitmap or changing generation.
-        if secondary_image.is_some() && self.bitmap_formats.get(&secondary).copied() == Some(1) {
-            if let Some(mut image) = self.graph_bitmap_image(secondary) {
-                let needs_opaque_view = image.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0xff);
-                if needs_opaque_view {
-                    for pixel in image.rgba.chunks_exact_mut(4) {
-                        pixel[3] = 0xff;
-                    }
-                    let width = image.width;
-                    let height = image.height;
-                    let key = format!("runtime:backf:{object}:secondary");
-                    self.store_graph_image(key.clone(), image);
-                    secondary_image = Some((
-                        key,
-                        crate::graph::RuntimeClipRect {
-                            x: 0.0,
-                            y: 0.0,
-                            width: width as f32,
-                            height: height as f32,
-                        },
-                    ));
+        if secondary_image.is_some()
+            && self.bitmap_formats.get(&secondary).copied() == Some(1)
+            && let Some(mut image) = self.graph_bitmap_image(secondary)
+        {
+            let needs_opaque_view = image
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 0xff);
+            if needs_opaque_view {
+                for pixel in image.rgba.as_chunks_mut::<4>().0 {
+                    pixel[3] = 0xff;
                 }
+                let width = image.width;
+                let height = image.height;
+                let key = format!("runtime:backf:{object}:secondary");
+                self.store_graph_image(key.clone(), image);
+                secondary_image = Some((
+                    key,
+                    crate::graph::RuntimeClipRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: width as f32,
+                        height: height as f32,
+                    },
+                ));
             }
         }
 
@@ -916,7 +922,7 @@ impl RuntimeTraceApi {
             // that no-op instead of applying the format-1 mask equation to an
             // alpha-bearing source.
             if primary_format != 1 {
-                for pixel in primary_image.rgba.chunks_exact_mut(4) {
+                for pixel in primary_image.rgba.as_chunks_mut::<4>().0 {
                     pixel[3] = 0;
                 }
                 Some(primary_image)
@@ -979,7 +985,7 @@ impl RuntimeTraceApi {
                 let needs_black_fade = matches!(sentinel, 0x7000) || transparency != 0;
                 if toward_white || needs_black_fade {
                     let inverse = 256 - transparency;
-                    for pixel in primary_image.rgba.chunks_exact_mut(4) {
+                    for pixel in primary_image.rgba.as_chunks_mut::<4>().0 {
                         for channel in &mut pixel[..3] {
                             let source = i32::from(*channel);
                             let base = (source * inverse) >> 8;
@@ -1011,10 +1017,12 @@ impl RuntimeTraceApi {
             if primary_format == 1 && secondary_format != 1 {
                 let needs_opaque_view = primary_image
                     .rgba
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|pixel| pixel[3] != 0xff);
                 if needs_opaque_view {
-                    for pixel in primary_image.rgba.chunks_exact_mut(4) {
+                    for pixel in primary_image.rgba.as_chunks_mut::<4>().0 {
                         pixel[3] = 0xff;
                     }
                     Some(primary_image)
@@ -1785,13 +1793,17 @@ impl RuntimeTraceApi {
             };
             let nonzero_alpha = cache_image
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|pixel| pixel[3] != 0)
                 .count()
                 .min(i32::MAX as usize) as i32;
             let max_alpha = cache_image
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|pixel| pixel[3])
                 .max()
                 .unwrap_or_default() as i32;
@@ -2628,66 +2640,66 @@ impl RuntimeTraceApi {
             }
             (0x90, 0x53) => {
                 let args = Self::graph90_source_args(stack, 5);
-                if let Some(handle) = args.first().copied() {
-                    if self.graph90_object_matches(
+                if let Some(handle) = args.first().copied()
+                    && self.graph90_object_matches(
                         handle,
                         GRAPH90_SPRITE_TAG,
                         512,
                         GRAPH90_CLASS_SPRITE,
-                    ) {
-                        // Target sub_428C00 rebuilds/invalidates the sprite's cached geometry.
-                        self.graph_redraw_requested = Some(false);
-                        self.graph90_record_call(handle, id, &args);
-                    }
+                    )
+                {
+                    // Target sub_428C00 rebuilds/invalidates the sprite's cached geometry.
+                    self.graph_redraw_requested = Some(false);
+                    self.graph90_record_call(handle, id, &args);
                 }
                 ethornell_vm::Value::None
             }
             (0x90, 0x54) => {
                 let args = Self::graph90_source_args(stack, 2);
-                if let [handle, enabled] = args.as_slice() {
-                    if self.graph90_object_matches(
+                if let [handle, enabled] = args.as_slice()
+                    && self.graph90_object_matches(
                         *handle,
                         GRAPH90_SPRITE_TAG,
                         512,
                         GRAPH90_CLASS_SPRITE,
-                    ) {
-                        // Tayutama2_trial_TG.exe: 0x47C1F0 -> sub_462540
-                        // -> sub_43EE70. The latter dispatches Sprite
-                        // vtable+0x04, i.e. CDspObj::SetDrawEnabled
-                        // (sub_41AE00, field +0x14). This is the same virtual
-                        // used by generic Graph90:30 and by CDspObjKnob's
-                        // Graph90:D4 forwarding path. It is NOT the separate
-                        // CDspObj enabled field changed by Graph90:31.
-                        self.set_graph_object_draw_enabled(*handle, *enabled != 0);
-                        self.graph90_record_call(*handle, id, &args);
-                    }
+                    )
+                {
+                    // Tayutama2_trial_TG.exe: 0x47C1F0 -> sub_462540
+                    // -> sub_43EE70. The latter dispatches Sprite
+                    // vtable+0x04, i.e. CDspObj::SetDrawEnabled
+                    // (sub_41AE00, field +0x14). This is the same virtual
+                    // used by generic Graph90:30 and by CDspObjKnob's
+                    // Graph90:D4 forwarding path. It is NOT the separate
+                    // CDspObj enabled field changed by Graph90:31.
+                    self.set_graph_object_draw_enabled(*handle, *enabled != 0);
+                    self.graph90_record_call(*handle, id, &args);
                 }
                 ethornell_vm::Value::None
             }
             (0x90, 0x55) => {
                 let args = Self::graph90_source_args(stack, 2);
-                if let [handle, bitmap] = args.as_slice() {
-                    if self.graph90_object_matches(
+                if let [handle, bitmap] = args.as_slice()
+                    && self.graph90_object_matches(
                         *handle,
                         GRAPH90_SPRITE_TAG,
                         512,
                         GRAPH90_CLASS_SPRITE,
-                    ) {
-                        let properties = self.graph_object_properties.entry(*handle).or_default();
-                        // Target sub_43ED20 -> sub_427F80 stores an independent
-                        // auxiliary bitmap at Sprite+0x13C and generation at
-                        // +0x140. It never overwrites the mode's primary bitmap
-                        // at Sprite+0x150.
-                        properties.aux_resource = (*bitmap != -1).then_some(*bitmap);
-                        tracing::info!(
-                            sprite = *handle,
-                            bitmap = *bitmap,
-                            primary = ?properties.format_resource,
-                            aux = ?properties.aux_resource,
-                            "GraphSetSpriteAuxBitmap"
-                        );
-                        self.graph90_record_call(*handle, id, &args);
-                    }
+                    )
+                {
+                    let properties = self.graph_object_properties.entry(*handle).or_default();
+                    // Target sub_43ED20 -> sub_427F80 stores an independent
+                    // auxiliary bitmap at Sprite+0x13C and generation at
+                    // +0x140. It never overwrites the mode's primary bitmap
+                    // at Sprite+0x150.
+                    properties.aux_resource = (*bitmap != -1).then_some(*bitmap);
+                    tracing::info!(
+                        sprite = *handle,
+                        bitmap = *bitmap,
+                        primary = ?properties.format_resource,
+                        aux = ?properties.aux_resource,
+                        "GraphSetSpriteAuxBitmap"
+                    );
+                    self.graph90_record_call(*handle, id, &args);
                 }
                 ethornell_vm::Value::None
             }
@@ -2918,12 +2930,16 @@ impl RuntimeTraceApi {
                     let bitmap_alpha = self.graph_bitmap_image(*primary_bitmap).map(|image| {
                         let nonzero = image
                             .rgba
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .filter(|pixel| pixel[3] != 0)
                             .count();
                         let max = image
                             .rgba
-                            .chunks_exact(4)
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|pixel| pixel[3])
                             .max()
                             .unwrap_or_default();
@@ -3466,16 +3482,16 @@ impl RuntimeTraceApi {
             }
             (0x90, 0x64) => {
                 let args = Self::graph90_source_args(stack, 2);
-                if let [handle, enabled] = args.as_slice() {
-                    if self.graph90_object_matches(
+                if let [handle, enabled] = args.as_slice()
+                    && self.graph90_object_matches(
                         *handle,
                         GRAPH90_FILTER_TAG,
                         8,
                         GRAPH90_CLASS_FILTER,
-                    ) {
-                        self.graph90_set_enabled(*handle, *enabled != 0);
-                        self.graph90_record_call(*handle, id, &args);
-                    }
+                    )
+                {
+                    self.graph90_set_enabled(*handle, *enabled != 0);
+                    self.graph90_record_call(*handle, id, &args);
                 }
                 ethornell_vm::Value::None
             }
@@ -3556,11 +3572,11 @@ impl RuntimeTraceApi {
             }
             (0x90, 0x74) => {
                 let args = Self::graph90_source_args(stack, 2);
-                if let [handle, enabled] = args.as_slice() {
-                    if self.graph90_object_matches(*handle, GRAPH90_MAP_TAG, 8, GRAPH90_CLASS_MAP) {
-                        self.graph90_set_enabled(*handle, *enabled != 0);
-                        self.graph90_record_call(*handle, id, &args);
-                    }
+                if let [handle, enabled] = args.as_slice()
+                    && self.graph90_object_matches(*handle, GRAPH90_MAP_TAG, 8, GRAPH90_CLASS_MAP)
+                {
+                    self.graph90_set_enabled(*handle, *enabled != 0);
+                    self.graph90_record_call(*handle, id, &args);
                 }
                 ethornell_vm::Value::None
             }
@@ -3689,14 +3705,14 @@ impl RuntimeTraceApi {
                     self.fullwidth_glyph_bitmap = None;
                     self.fullwidth_glyph_count = 0;
                     self.fullwidth_glyph_cell_width = 0;
-                } else if character_count <= 255 {
-                    if let Some((width, _height)) = self.bitmap_dimensions.get(&bitmap).copied() {
-                        let count = character_count as u32;
-                        if count != 0 && width % count == 0 {
-                            self.fullwidth_glyph_bitmap = Some(bitmap);
-                            self.fullwidth_glyph_count = character_count;
-                            self.fullwidth_glyph_cell_width = (width / count) as i32;
-                        }
+                } else if character_count <= 255
+                    && let Some((width, _height)) = self.bitmap_dimensions.get(&bitmap).copied()
+                {
+                    let count = character_count as u32;
+                    if count != 0 && width % count == 0 {
+                        self.fullwidth_glyph_bitmap = Some(bitmap);
+                        self.fullwidth_glyph_count = character_count;
+                        self.fullwidth_glyph_cell_width = (width / count) as i32;
                     }
                 }
                 tracing::info!(

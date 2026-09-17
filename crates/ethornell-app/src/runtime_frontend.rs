@@ -17,10 +17,10 @@ pub(crate) fn drive_runtime_frame(
     while let Some(event) = pending_input_events.pop_front() {
         apply_runtime_input_event(&mut runtime.api, event);
     }
-    if let Some(script) = input_script.as_mut() {
-        if let Some(event) = script.tick() {
-            apply_headless_input_event(&mut runtime.api, event);
-        }
+    if let Some(script) = input_script.as_mut()
+        && let Some(event) = script.tick()
+    {
+        apply_headless_input_event(&mut runtime.api, event);
     }
 
     let report = runtime.run_frame(pacing, elapsed_ms, audio_elapsed_ms);

@@ -4,25 +4,13 @@ const PARTICLE_HANDLE_BASE: i32 = 0xC000_0000u32 as i32;
 const MAX_PARTICLE_SCREENS: usize = 8;
 const MAX_SPLINE_POINTS: usize = 100;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct NativeEffectState {
     particle_screens: BTreeMap<i32, NativeParticleScreen>,
     particle_banks: BTreeMap<u16, Vec<ethornell_vm::Value>>,
     particle_interpolation_mode: i32,
     splines: BTreeMap<i32, NativeSpline>,
     next_spline_handle: i32,
-}
-
-impl Default for NativeEffectState {
-    fn default() -> Self {
-        Self {
-            particle_screens: BTreeMap::new(),
-            particle_banks: BTreeMap::new(),
-            particle_interpolation_mode: 0,
-            splines: BTreeMap::new(),
-            next_spline_handle: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -311,17 +299,16 @@ impl RuntimeTraceApi {
                 let mut source = pop_args(stack, 6);
                 source.reverse();
                 let values = source.iter().map(value_to_i32).collect::<Vec<_>>();
-                if let [handle, x, y, z, blend, alpha] = values.as_slice() {
-                    if is_native_blend_mode(*blend) && (0..=256).contains(alpha) {
-                        if let Some(screen) = self.native_effect.particle_screen_mut(*handle) {
-                            screen.display = [*x, *y, *z, *blend, *alpha];
-                            let properties =
-                                self.graph_object_properties.entry(*handle).or_default();
-                            properties.blend_mode = *blend;
-                            properties.set_alpha_parameter(*alpha);
-                            self.display_tree.set_chain_depth(*handle, *z);
-                        }
-                    }
+                if let [handle, x, y, z, blend, alpha] = values.as_slice()
+                    && is_native_blend_mode(*blend)
+                    && (0..=256).contains(alpha)
+                    && let Some(screen) = self.native_effect.particle_screen_mut(*handle)
+                {
+                    screen.display = [*x, *y, *z, *blend, *alpha];
+                    let properties = self.graph_object_properties.entry(*handle).or_default();
+                    properties.blend_mode = *blend;
+                    properties.set_alpha_parameter(*alpha);
+                    self.display_tree.set_chain_depth(*handle, *z);
                 }
                 ethornell_vm::Value::None
             }
@@ -366,10 +353,10 @@ impl RuntimeTraceApi {
             0x0C => {
                 let percent = pop_int_value(stack).unwrap_or_default();
                 let handle = pop_int_value(stack).unwrap_or_default();
-                if (0..=100).contains(&percent) {
-                    if let Some(screen) = self.native_effect.particle_screen_mut(handle) {
-                        screen.emission_percent = percent;
-                    }
+                if (0..=100).contains(&percent)
+                    && let Some(screen) = self.native_effect.particle_screen_mut(handle)
+                {
+                    screen.emission_percent = percent;
                 }
                 ethornell_vm::Value::None
             }

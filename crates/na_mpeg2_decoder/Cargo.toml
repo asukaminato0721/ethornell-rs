@@ -8,6 +8,9 @@ description = "Rust MPEG-1/2 video decoder"
 name = "na_mpeg2_decoder"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 thiserror = "1"
 log = "0.4"

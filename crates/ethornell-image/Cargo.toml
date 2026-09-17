@@ -3,6 +3,9 @@ name = "ethornell-image"
 version = "0.1.0"
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ethornell-core = { path = "../ethornell-core" }
 serde.workspace = true

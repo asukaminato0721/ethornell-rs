@@ -8,6 +8,9 @@ name = "wmv_decoder"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
+[lints]
+workspace = true
+
 [dependencies]
 byteorder = "1.5"
 thiserror = "1.0"

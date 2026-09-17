@@ -128,11 +128,11 @@ pub fn simple_idct_put(dest: &mut [u8], stride: usize, block: &mut [i16; 64]) {
     }
 
     // Column transforms + store
-    #[allow(clippy::erasing_op)]
+    // Keep the row * stride + column layout explicit for every row.
     for x in 0..8 {
         let col = [
-            block[x],
-            block[8 + x],
+            block[0 * 8 + x],
+            block[1 * 8 + x],
             block[2 * 8 + x],
             block[3 * 8 + x],
             block[4 * 8 + x],
@@ -160,10 +160,11 @@ pub fn simple_idct_add(dest: &mut [u8], stride: usize, block: &mut [i16; 64]) {
         }
     }
 
+    // Keep the row * stride + column layout explicit for every row.
     for x in 0..8 {
         let col = [
-            block[x],
-            block[8 + x],
+            block[0 * 8 + x],
+            block[1 * 8 + x],
             block[2 * 8 + x],
             block[3 * 8 + x],
             block[4 * 8 + x],

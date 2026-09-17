@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct GraphGroupState {
     pub(crate) draw_enabled: bool,
     pub(crate) x: i32,
@@ -8,16 +8,4 @@ pub(crate) struct GraphGroupState {
     /// CDspObjGroup transparency parameter written by Graph90:E5 vtable+0x48.
     pub(crate) alpha_parameter: i32,
     pub(crate) members: BTreeMap<i32, (i32, i32)>,
-}
-
-impl Default for GraphGroupState {
-    fn default() -> Self {
-        Self {
-            draw_enabled: false,
-            x: 0,
-            y: 0,
-            alpha_parameter: 0,
-            members: BTreeMap::new(),
-        }
-    }
 }

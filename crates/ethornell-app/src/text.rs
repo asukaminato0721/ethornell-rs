@@ -1722,10 +1722,7 @@ pub(crate) fn ruby_draw_runs(
                     x_units += wrap_char_units(*ch);
                 }
             }
-            if chars[span.start_char..span.end_char]
-                .iter()
-                .any(|ch| *ch == '\n')
-            {
+            if chars[span.start_char..span.end_char].contains(&'\n') {
                 return None;
             }
             let body_units = chars[span.start_char..span.end_char]

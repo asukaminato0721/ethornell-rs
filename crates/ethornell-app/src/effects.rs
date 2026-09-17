@@ -155,7 +155,7 @@ impl RuntimeEffects {
             for index in 0..count {
                 let seed = mix64(effect.handle as u64 ^ (index as u64).wrapping_mul(0x9E37_79B9));
                 let x_fraction = (seed & 0xffff) as f32 / 65535.0;
-                let start = ((seed >> 16) & 0xffff) as u64;
+                let start = (seed >> 16) & 0xffff;
                 let travel = self
                     .rain_tick
                     .wrapping_mul(speed)
@@ -304,17 +304,17 @@ impl RuntimeEffects {
         y: i32,
     ) -> bool {
         let mut copied = false;
-        if let Some(source) = self.vector_maps.get(&source).cloned() {
-            if let Some(destination) = self.vector_maps.get_mut(&destination) {
-                destination.blit(&source, x, y);
-                copied = true;
-            }
+        if let Some(source) = self.vector_maps.get(&source).cloned()
+            && let Some(destination) = self.vector_maps.get_mut(&destination)
+        {
+            destination.blit(&source, x, y);
+            copied = true;
         }
-        if let Some(source) = self.displacement_maps.get(&source).cloned() {
-            if let Some(destination) = self.displacement_maps.get_mut(&destination) {
-                destination.blit(&source, x, y);
-                copied = true;
-            }
+        if let Some(source) = self.displacement_maps.get(&source).cloned()
+            && let Some(destination) = self.displacement_maps.get_mut(&destination)
+        {
+            destination.blit(&source, x, y);
+            copied = true;
         }
         copied
     }

@@ -19,6 +19,11 @@ edition = "2024"
 license = "MPL-2.0"
 repository = ""
 
+[workspace.lints.clippy]
+# Preserve explicit offsets and row/column formulas in indexed data layouts.
+identity_op = "allow"
+erasing_op = "allow"
+
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "1"

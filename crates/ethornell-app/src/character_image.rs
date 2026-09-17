@@ -86,7 +86,7 @@ fn character_body_layer_aliases(name: &str, hint: Option<&str>) -> Vec<String> {
         suffixes.push(hint);
     }
     for fallback in ["ax12", "ax11", "ax14"] {
-        if !suffixes.iter().any(|suffix| *suffix == fallback) {
+        if !suffixes.contains(&fallback) {
             suffixes.push(fallback);
         }
     }
@@ -97,7 +97,13 @@ fn character_body_layer_aliases(name: &str, hint: Option<&str>) -> Vec<String> {
 }
 
 fn alpha_composite(dst: &mut DecodedImage, src: &DecodedImage) {
-    for (dst, src) in dst.rgba.chunks_exact_mut(4).zip(src.rgba.chunks_exact(4)) {
+    for (dst, src) in dst
+        .rgba
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.rgba.as_chunks::<4>().0)
+    {
         let src_a = src[3] as f32 / 255.0;
         if src_a <= 0.0 {
             continue;

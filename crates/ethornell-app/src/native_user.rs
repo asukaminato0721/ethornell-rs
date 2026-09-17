@@ -646,8 +646,7 @@ impl NativeUserState {
             let row_y = MODELESS_SLIDER_Y + index as f32 * MODELESS_SLIDER_ROW_HEIGHT;
             if y >= row_y - 5.0
                 && y < row_y + 27.0
-                && x >= MODELESS_SLIDER_X
-                && x <= MODELESS_SLIDER_X + MODELESS_SLIDER_WIDTH
+                && (MODELESS_SLIDER_X..=MODELESS_SLIDER_X + MODELESS_SLIDER_WIDTH).contains(&x)
             {
                 let value = (((x - MODELESS_SLIDER_X) / MODELESS_SLIDER_WIDTH) * 128.0)
                     .round()
@@ -661,8 +660,7 @@ impl NativeUserState {
             let row_y = MODELESS_TOGGLE_Y + (index - 5) as f32 * MODELESS_TOGGLE_ROW_HEIGHT;
             if y >= row_y - 4.0
                 && y < row_y + 25.0
-                && x >= MODELESS_DIALOG_X
-                && x <= MODELESS_DIALOG_X + 520.0
+                && (MODELESS_DIALOG_X..=MODELESS_DIALOG_X + 520.0).contains(&x)
             {
                 let left = x < MODELESS_DIALOG_X + 285.0;
                 let value = if index < 7 {
@@ -675,10 +673,8 @@ impl NativeUserState {
                 return true;
             }
         }
-        if y >= MODELESS_CLOSE_Y - 5.0
-            && y < MODELESS_CLOSE_Y + 30.0
-            && x >= MODELESS_DIALOG_X
-            && x < MODELESS_DIALOG_X + 150.0
+        if (MODELESS_CLOSE_Y - 5.0..MODELESS_CLOSE_Y + 30.0).contains(&y)
+            && (MODELESS_DIALOG_X..MODELESS_DIALOG_X + 150.0).contains(&x)
         {
             dialog.visible = false;
             dialog.events.push_back([-1, 0]);
@@ -710,16 +706,16 @@ impl RuntimeTraceApi {
         self.screen_shake_offset = native_user
             .screen_shake
             .tick(elapsed_ms, &mut native_user.crt_rng_seed);
-        if let Some((object, offset_x, offset_y)) = self.native_user.cursor_object {
-            if let Some((x, y)) = self.mouse_pos {
-                let x = x.round() as i32 + offset_x;
-                let y = y.round() as i32 + offset_y;
-                let properties = self.graph_object_properties.entry(object).or_default();
-                properties.native.position_x = x;
-                properties.native.position_y = y;
-                self.display_tree
-                    .set_local_position(object, x as f32, y as f32);
-            }
+        if let Some((object, offset_x, offset_y)) = self.native_user.cursor_object
+            && let Some((x, y)) = self.mouse_pos
+        {
+            let x = x.round() as i32 + offset_x;
+            let y = y.round() as i32 + offset_y;
+            let properties = self.graph_object_properties.entry(object).or_default();
+            properties.native.position_x = x;
+            properties.native.position_y = y;
+            self.display_tree
+                .set_local_position(object, x as f32, y as f32);
         }
     }
 
