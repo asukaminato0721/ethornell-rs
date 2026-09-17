@@ -1830,7 +1830,7 @@ fn portable_local_system_time() -> [u16; 8] {
             gmtoff: c_long,
             zone: *const c_char,
         }
-        extern "C" {
+        unsafe extern "C" {
             fn time(timer: *mut i64) -> i64;
             fn localtime_r(timer: *const i64, result: *mut Tm) -> *mut Tm;
         }
