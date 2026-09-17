@@ -1,5 +1,5 @@
 use super::{
-    blit_decoded_image, DecodedImage, RuntimeGraphResource, RuntimeSurface, RuntimeTraceApi,
+    DecodedImage, RuntimeGraphResource, RuntimeSurface, RuntimeTraceApi, blit_decoded_image,
 };
 
 // Indexed by the native bitmap format stored in the target's registry entry.
@@ -111,11 +111,7 @@ impl RuntimeTraceApi {
                 (destination_info.format, source_info.format),
                 (1, 2) | (2, 1)
             );
-        if compatible {
-            0
-        } else {
-            3
-        }
+        if compatible { 0 } else { 3 }
     }
 
     /// `sub_4033A0` allocates a detached destination using the source format,

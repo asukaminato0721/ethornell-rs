@@ -1,4 +1,4 @@
-use super::{value_to_i32, RuntimeTraceApi, RuntimeUserControl, INPUT_DESCRIPTOR_MOUSE_LEFT};
+use super::{INPUT_DESCRIPTOR_MOUSE_LEFT, RuntimeTraceApi, RuntimeUserControl, value_to_i32};
 use ethornell_vm::{GraphInputDescriptor, Value};
 
 impl RuntimeTraceApi {

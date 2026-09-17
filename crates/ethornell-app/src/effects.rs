@@ -191,8 +191,15 @@ impl RuntimeEffects {
     ///  amplitude, quarter_period, slot].
     pub(crate) fn configure_wave_table(&mut self, popped: &[Value]) -> bool {
         let values = popped.iter().map(value_to_i32).collect::<Vec<_>>();
-        let [block_count, block_height, trail_levels, lead_levels, amplitude, quarter_period, slot] =
-            values.as_slice()
+        let [
+            block_count,
+            block_height,
+            trail_levels,
+            lead_levels,
+            amplitude,
+            quarter_period,
+            slot,
+        ] = values.as_slice()
         else {
             return false;
         };
@@ -622,7 +629,15 @@ impl DisplacementMap {
     }
 
     fn wave(&mut self, parameters: &[i32]) {
-        let [x_period, x_phase, x_amplitude, y_period, y_phase, y_amplitude, ..] = parameters
+        let [
+            x_period,
+            x_phase,
+            x_amplitude,
+            y_period,
+            y_phase,
+            y_amplitude,
+            ..,
+        ] = parameters
         else {
             return;
         };
@@ -654,8 +669,14 @@ impl DisplacementMap {
     }
 
     fn radial_warp(&mut self, parameters: &[i32]) {
-        let [source_origin_x, source_origin_y, warp_center_x, warp_center_y, radius_bias, ..] =
-            parameters
+        let [
+            source_origin_x,
+            source_origin_y,
+            warp_center_x,
+            warp_center_y,
+            radius_bias,
+            ..,
+        ] = parameters
         else {
             return;
         };
@@ -1064,12 +1085,14 @@ mod tests {
             Value::Int(9),
         ];
         assert!(effects.configure_displacement_map(0x14, &curvature));
-        assert!(effects
-            .displacement_map(9)
-            .unwrap()
-            .samples
-            .iter()
-            .any(|sample| *sample != [0, 0]));
+        assert!(
+            effects
+                .displacement_map(9)
+                .unwrap()
+                .samples
+                .iter()
+                .any(|sample| *sample != [0, 0])
+        );
 
         let radial_warp = [
             Value::Int(4),
@@ -1080,12 +1103,14 @@ mod tests {
             Value::Int(9),
         ];
         assert!(effects.configure_displacement_map(0x17, &radial_warp));
-        assert!(effects
-            .displacement_map(9)
-            .unwrap()
-            .samples
-            .iter()
-            .any(|sample| *sample != [0, 0]));
+        assert!(
+            effects
+                .displacement_map(9)
+                .unwrap()
+                .samples
+                .iter()
+                .any(|sample| *sample != [0, 0])
+        );
     }
 
     #[test]

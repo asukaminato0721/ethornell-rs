@@ -2069,8 +2069,17 @@ impl RuntimeTraceApi {
                 // input_descriptor. Native pop order is reversed.
                 let args = pop_args(stack, 9);
                 let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let [input_descriptor, input_enabled, update_denominator, duration_ms, target_transparency, position_curve, target_y, target_x, object] =
-                    ints.as_slice()
+                let [
+                    input_descriptor,
+                    input_enabled,
+                    update_denominator,
+                    duration_ms,
+                    target_transparency,
+                    position_curve,
+                    target_y,
+                    target_x,
+                    object,
+                ] = ints.as_slice()
                 else {
                     return Some(Err(ethornell_vm::VmError::Runtime(
                         "Graph90:21 expected nine arguments".to_string(),
@@ -2103,8 +2112,20 @@ impl RuntimeTraceApi {
                 // point and the script final point.
                 let args = pop_args(stack, 12);
                 let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let [input_descriptor, input_enabled, max_catchup_steps, sample_rate_hz, duration_ms, target_transparency, position_curve, target_y, target_x, middle_y, middle_x, object] =
-                    ints.as_slice()
+                let [
+                    input_descriptor,
+                    input_enabled,
+                    max_catchup_steps,
+                    sample_rate_hz,
+                    duration_ms,
+                    target_transparency,
+                    position_curve,
+                    target_y,
+                    target_x,
+                    middle_y,
+                    middle_x,
+                    object,
+                ] = ints.as_slice()
                 else {
                     return Some(Err(ethornell_vm::VmError::Runtime(
                         "Graph90:24 expected twelve arguments".to_string(),
@@ -2135,8 +2156,17 @@ impl RuntimeTraceApi {
                 // procedure previously assigned to it in the portable map.
                 let args = pop_args(stack, 9);
                 let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let [input_descriptor, input_enabled, sample_rate_hz, decay_percent, cycles, frequency_hz, amplitude, mode, object] =
-                    ints.as_slice()
+                let [
+                    input_descriptor,
+                    input_enabled,
+                    sample_rate_hz,
+                    decay_percent,
+                    cycles,
+                    frequency_hz,
+                    amplitude,
+                    mode,
+                    object,
+                ] = ints.as_slice()
                 else {
                     return Some(Err(ethornell_vm::VmError::Runtime(
                         "Graph90:2C expected nine arguments".to_string(),
@@ -2353,8 +2383,17 @@ impl RuntimeTraceApi {
             (0x90, 0x43) => {
                 let args = Self::graph90_source_args(stack, 9);
                 let object = self.graph90_prepare_current_background(NativeBackgroundClass::BackF);
-                if let [primary_x, primary_y, primary, secondary_x, secondary_y, secondary, mask, mask_parameter, alpha_parameter] =
-                    args.as_slice()
+                if let [
+                    primary_x,
+                    primary_y,
+                    primary,
+                    secondary_x,
+                    secondary_y,
+                    secondary,
+                    mask,
+                    mask_parameter,
+                    alpha_parameter,
+                ] = args.as_slice()
                 {
                     if let Err(reason) = self.graph90_sync_backf_layers(
                         object,

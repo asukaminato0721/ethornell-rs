@@ -1,10 +1,10 @@
 use crate::{
-    graph::{RuntimeGraphDrawItem, RuntimeGraphLayer},
     RuntimeTraceApi,
+    graph::{RuntimeGraphDrawItem, RuntimeGraphLayer},
 };
-use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
-use ethornell_core::{composite_native_rgba, Result};
-use ethornell_image::{write_rgba_png, DecodedImage};
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
+use ethornell_core::{Result, composite_native_rgba};
+use ethornell_image::{DecodedImage, write_rgba_png};
 use std::{path::Path, sync::OnceLock};
 
 const SNAPSHOT_WIDTH: u32 = 1280;
@@ -1221,13 +1221,17 @@ mod styled_text_snapshot_tests {
             rgba: vec![0; 128 * 64 * 4],
         };
         draw_text_node(&mut image, &node, layout, None, None);
-        assert!(image
-            .rgba
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 && pixel[3] > 0));
-        assert!(image
-            .rgba
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0));
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 && pixel[3] > 0)
+        );
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0)
+        );
     }
 }

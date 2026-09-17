@@ -183,7 +183,7 @@ impl ResourceManager {
             .collect::<Vec<_>>();
         // The old BTreeMap implementation exposed lexicographic normalized-key
         // order. Preserve that behavior without re-normalizing archive entries.
-        matching_keys.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        matching_keys.sort_unstable_by_key(|(left, _)| *left);
         let mut out = Vec::new();
         for (_, matches) in matching_keys {
             for &(archive, entry) in matches {
@@ -616,7 +616,7 @@ pub fn extract_entry(path: &Path, entry: &ArchiveEntry) -> Result<Vec<u8>> {
 
 pub fn decode_payload(name: &str, raw: &[u8]) -> Result<Vec<u8>> {
     if raw.starts_with(MAGIC_DSC_FORMAT) {
-        dsc_decode(&raw).map_err(|err| {
+        dsc_decode(raw).map_err(|err| {
             EthornellError::UnsupportedFormat(format!("DSC decode failed for {name}: {err}"))
         })
     } else if raw.starts_with(b"BSE 1.") {

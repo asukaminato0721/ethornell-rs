@@ -3,19 +3,10 @@ use crate::calls::instruction_call_key;
 use crate::{BpInstruction, BpOperand, BpProgram};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DecompileOptions {
     pub limit: Option<usize>,
     pub show_stack: bool,
-}
-
-impl Default for DecompileOptions {
-    fn default() -> Self {
-        Self {
-            limit: None,
-            show_stack: false,
-        }
-    }
 }
 
 pub fn decompile_bp(program: &BpProgram, options: &DecompileOptions) -> String {

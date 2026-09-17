@@ -479,7 +479,7 @@ fn is_native_blend_mode(value: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{sample_natural_cubic, NativeEffectState, PARTICLE_HANDLE_BASE};
+    use super::{NativeEffectState, PARTICLE_HANDLE_BASE, sample_natural_cubic};
 
     #[test]
     fn particle_screen_uses_target_tag_and_eight_slots() {

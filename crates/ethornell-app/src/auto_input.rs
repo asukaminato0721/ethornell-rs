@@ -1,4 +1,4 @@
-use super::{RuntimeTraceApi, RuntimeUserControl, INPUT_DESCRIPTOR_MOUSE_LEFT};
+use super::{INPUT_DESCRIPTOR_MOUSE_LEFT, RuntimeTraceApi, RuntimeUserControl};
 
 impl RuntimeTraceApi {
     pub(crate) fn maybe_auto_click_user(&mut self) {

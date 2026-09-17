@@ -1,7 +1,7 @@
-use ethornell_archive::{detect_magic, scan_game_root, MagicKind, ResourceManager};
+use ethornell_archive::{MagicKind, ResourceManager, detect_magic, scan_game_root};
 use ethornell_audio::AudioSystem;
 use ethornell_core::{EthornellError, GameRoot, Result};
-use ethornell_image::{decode_image, parse_cbg_metadata, DecodedImage};
+use ethornell_image::{DecodedImage, decode_image, parse_cbg_metadata};
 use ethornell_render::{RenderCommand, Renderer, TextStyleSpan, TextureHandle};
 use ethornell_script::calls::known_call_arg_count;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -59,43 +59,43 @@ mod title;
 mod user_files;
 use animation::{GraphAnimationRegistry, LayerAnimationSystem};
 use audio_runtime::{
-    execute_audio_command, AudioAsset, AudioCommand, NativeAudioClock, NativeCdAudioState,
-    SoundSlot,
+    AudioAsset, AudioCommand, NativeAudioClock, NativeCdAudioState, SoundSlot,
+    execute_audio_command,
 };
 use character_image::decode_scenario_resource_image;
 use display_tree::{NativeDisplayKind, NativeDisplayTree};
 use graph::{
-    apply_alpha_mask, backf_mask_weight, blit_decoded_image, blit_decoded_image_format1_to_format2,
-    blit_decoded_image_format2_source_over, blit_decoded_image_parameter,
-    blit_decoded_image_raw_copy, crop_decoded_image, crossfade_decoded_images,
-    crossfade_decoded_images_straight_alpha, fit_decoded_image_canvas, fixed_16_to_f32,
-    native_draw_order, scale_decoded_image_fixed, NativeMode5DynamicState, NativeMode5NodeArgs,
+    NATIVE_DISPLAY_Z, NATIVE_SCREEN_BITMAP, NativeMode5DynamicState, NativeMode5NodeArgs,
     RuntimeClipRect, RuntimeGraphDrawItem, RuntimeGraphLayer, RuntimeGraphObjectProperties,
     RuntimeGraphResource, RuntimeGraphTransitionNode, RuntimeMode5RenderState, RuntimeSurface,
-    RuntimeUserControl, NATIVE_DISPLAY_Z, NATIVE_SCREEN_BITMAP,
+    RuntimeUserControl, apply_alpha_mask, backf_mask_weight, blit_decoded_image,
+    blit_decoded_image_format1_to_format2, blit_decoded_image_format2_source_over,
+    blit_decoded_image_parameter, blit_decoded_image_raw_copy, crop_decoded_image,
+    crossfade_decoded_images, crossfade_decoded_images_straight_alpha, fit_decoded_image_canvas,
+    fixed_16_to_f32, native_draw_order, scale_decoded_image_fixed,
 };
 use graph_defaults::{GraphRuntimeDefaults, SurfaceTextState};
 use graph_group::GraphGroupState;
-use graph_input::{pack_words, RuntimeGraphInputObject};
+use graph_input::{RuntimeGraphInputObject, pack_words};
 use graph_knob::GraphKnobState;
 use graph_movie::BurikoMovieRegistry;
 use graph_sprite_targets::GraphSpriteTargetRegistry;
 use headless::{HeadlessInputEvent, HeadlessInputScript};
 use native_background::{
-    NativeBackgroundClass, NativeBackgroundSecondaryResource, NativeBackgroundState,
     BACK_B_SECONDARY_LAYER_ID, BACK_F_SECONDARY_LAYER_ID, BACK_S_ADDITIONAL_LAYER_IDS,
+    NativeBackgroundClass, NativeBackgroundSecondaryResource, NativeBackgroundState,
 };
 use resource_lookup::find_scenario_image;
 use scenario::{ScenarioAction, ScenarioPlayback};
 use scene::{
-    place_scenario_sprite_with_hints, scenario_layer_ids_for_slot, sprite_fade_frames,
-    sprite_target_opacity, SCENARIO_OVERLAY_LAYER_ID,
+    SCENARIO_OVERLAY_LAYER_ID, place_scenario_sprite_with_hints, scenario_layer_ids_for_slot,
+    sprite_fade_frames, sprite_target_opacity,
 };
 use surface_controls::{SurfaceControlOwner, SurfaceControlRegistry};
-use text::{RuntimeTextNode, TextState, MESSAGE_NAME_TEXT_Z, MESSAGE_TEXT_Z};
+use text::{MESSAGE_NAME_TEXT_Z, MESSAGE_TEXT_Z, RuntimeTextNode, TextState};
 use text_anim::TextRuntime;
 use timeline::{TimelineEvent, TimelineSystem};
-use timing::{duration_ms_to_ticks, normalize_engine_elapsed_ms, NATIVE_TICK_MS};
+use timing::{NATIVE_TICK_MS, duration_ms_to_ticks, normalize_engine_elapsed_ms};
 use user_files::{
     bgi_xxx_pattern_matches, find_runtime_file_from_root, game_root_path, is_empty_archive_arg,
     read_runtime_bytes, resolve_existing_path_case_insensitive, runtime_file_cache_key,
@@ -1962,7 +1962,8 @@ impl RuntimeTraceApi {
             self.layer_animations
                 .fade_to(placement.layer_id, 0.0, target_opacity, fade_frames);
         }
-        trace_graph!(self,
+        trace_graph!(
+            self,
             "BCS scenario sprite {key} requested={} class={:?} layer={} slot={slot:?} x={layer_x:.1} y={layer_y:.1} z={} blocks={} opacity={:.2} fade={} layer={}x{} image={}x{}",
             resource.requested,
             placement.class,
@@ -2678,7 +2679,8 @@ impl RuntimeTraceApi {
             surface.resource_id = Some(resource_id);
             surface.viewport_width = width;
             surface.viewport_height = height;
-            trace_graph!(self,
+            trace_graph!(
+                self,
                 "blit rect surface #{target} res=#{resource_id} {key} x={x:.0} y={y:.0} w={width:.0} h={height:.0}"
             );
             return;
@@ -2722,7 +2724,8 @@ impl RuntimeTraceApi {
                 clip: None,
             },
         );
-        trace_graph!(self,
+        trace_graph!(
+            self,
             "blit rect layer #{layer_id} res=#{resource_id} {key} x={x:.0} y={y:.0} w={width:.0} h={height:.0} owner={owner_object:?}"
         );
     }
@@ -4039,7 +4042,8 @@ impl RuntimeTraceApi {
                 changed += 1;
             }
         }
-        trace_graph!(self,
+        trace_graph!(
+            self,
             "layer color blend targets={targets:?} alpha={alpha:?} color={color:?} changed={changed} raw={popped:?}"
         );
     }
@@ -4361,8 +4365,15 @@ impl RuntimeTraceApi {
         args: &[ethornell_vm::Value],
     ) -> ethornell_vm::VmResult<u64> {
         let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-        let [input_descriptor, input_enabled, update_numerator, update_denominator, duration_ms, target_transparency, object] =
-            ints.as_slice()
+        let [
+            input_descriptor,
+            input_enabled,
+            update_numerator,
+            update_denominator,
+            duration_ms,
+            target_transparency,
+            object,
+        ] = ints.as_slice()
         else {
             return Err(ethornell_vm::VmError::Runtime(
                 "Graph90:22 expected seven arguments".to_string(),
@@ -4605,7 +4616,8 @@ impl RuntimeTraceApi {
                 changed += 1;
             }
         }
-        trace_graph!(self,
+        trace_graph!(
+            self,
             "affine transform target=#{target} resource={resource_id:?} layers={layer_ids:?} changed={changed} x={x:?} y={y:?} scale={scale_x:?}x{scale_y:?} opacity={opacity:?} raw={source:?}"
         );
     }
@@ -5000,7 +5012,8 @@ impl RuntimeTraceApi {
             .filter(|layer_id| self.graph_layers.contains_key(layer_id))
             .collect::<Vec<_>>();
         if layer_ids.is_empty() {
-            trace_graph!(self,
+            trace_graph!(
+                self,
                 "BCS playback transform skipped missing slot={slot} x={x:?} y={y:?} opacity={opacity:?}"
             );
             return;
@@ -5054,7 +5067,8 @@ impl RuntimeTraceApi {
                     }
                 }
             }
-            trace_graph!(self,
+            trace_graph!(
+                self,
                 "BCS playback transform layer={layer_id} slot={slot} x={x:?} y={y:?} opacity={opacity:?} frames={frames}"
             );
         }
@@ -5134,7 +5148,8 @@ impl RuntimeTraceApi {
                 body_layer,
             } => {
                 self.load_scenario_sprite(&file, wait_frames, slot, x, z, opacity, body_layer);
-                trace_graph!(self,
+                trace_graph!(
+                    self,
                     "BCS playback sprite {file} slot={slot:?} x={x:?} z={z:?} opacity={opacity:?} body_layer={body_layer:?}"
                 );
             }
@@ -7793,14 +7808,14 @@ fn native_bitmap_clear_color(color: i32) -> [u8; 4] {
 #[cfg(test)]
 mod input_tests {
     use super::graph::{RuntimeGraphLayer, RuntimeGraphResource, RuntimeSurface};
-    use super::text::{ruby_draw_runs, RuntimeTextNode};
+    use super::text::{RuntimeTextNode, ruby_draw_runs};
     use super::text_anim::RuntimeRubySpan;
     use super::{
+        BACK_F_SECONDARY_LAYER_ID, DecodedImage, INPUT_DESCRIPTOR_DOWN, INPUT_DESCRIPTOR_ENTER,
+        INPUT_DESCRIPTOR_LEFT, INPUT_DESCRIPTOR_MOUSE_LEFT, INPUT_DESCRIPTOR_RIGHT,
+        INPUT_DESCRIPTOR_UP, NATIVE_SCREEN_BITMAP, SurfaceControlOwner,
         detect_game_id_from_bootstrap, input_class_state_for_descriptor,
-        input_state_for_descriptor, DecodedImage, SurfaceControlOwner, BACK_F_SECONDARY_LAYER_ID,
-        INPUT_DESCRIPTOR_DOWN, INPUT_DESCRIPTOR_ENTER, INPUT_DESCRIPTOR_LEFT,
-        INPUT_DESCRIPTOR_MOUSE_LEFT, INPUT_DESCRIPTOR_RIGHT, INPUT_DESCRIPTOR_UP,
-        NATIVE_SCREEN_BITMAP,
+        input_state_for_descriptor,
     };
     use ethornell_script::{BpInstruction, BpOpcode, BpOperand, BpProgram};
     use ethornell_vm::{
@@ -8337,13 +8352,15 @@ mod input_tests {
         assert_eq!((node.x, node.y), (12.0, 7.0));
         assert!(!node.screen_attached);
         assert!(api.should_draw_text_node(node));
-        assert!(!api
-            .graph_layers
-            .contains_key(&super::text::MESSAGE_WINDOW_LAYER_ID));
-        assert!(!api
-            .user_controls
-            .values()
-            .any(|control| control.owner_id == super::text::MESSAGE_CONTROL_OWNER_ID));
+        assert!(
+            !api.graph_layers
+                .contains_key(&super::text::MESSAGE_WINDOW_LAYER_ID)
+        );
+        assert!(
+            !api.user_controls
+                .values()
+                .any(|control| control.owner_id == super::text::MESSAGE_CONTROL_OWNER_ID)
+        );
     }
 
     #[test]
@@ -8914,9 +8931,10 @@ mod input_tests {
         let layer = &api.graph_layers[&control_layer];
         assert_eq!((layer.x, layer.y), (40.0, 55.0));
         assert_eq!(layer.key, "test:compact-valid-hover");
-        assert!(api
-            .hit_test_graph_input_object(901, (141.0, 556.0))
-            .is_some());
+        assert!(
+            api.hit_test_graph_input_object(901, (141.0, 556.0))
+                .is_some()
+        );
     }
 
     #[test]
@@ -9167,9 +9185,11 @@ mod input_tests {
             Value::Int(0),
         ];
         let error = call_graph(&mut api, 0x90, 0x18, &mut missing_destination).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("destination bitmap 131 is missing"));
+        assert!(
+            error
+                .to_string()
+                .contains("destination bitmap 131 is missing")
+        );
 
         api.recreate_native_bitmap(131, 1, 1, 3);
         let mut incompatible = vec![
@@ -9506,9 +9526,11 @@ mod input_tests {
             Value::Int(0),
         ];
         let error = call_graph(&mut api, 0x90, 0x43, &mut bad_secondary).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("secondary bitmap #999999 is not registered"));
+        assert!(
+            error
+                .to_string()
+                .contains("secondary bitmap #999999 is not registered")
+        );
 
         api.bitmap_formats.insert(403, 2);
         let mut bad_mask = vec![
@@ -13382,9 +13404,10 @@ mod input_tests {
             .expect("materialized child Sprite should be hittable at its rendered position");
         assert_eq!((region.group, region.index), (0, 0));
         assert_eq!((local_x, local_y), (1, 1));
-        assert!(api
-            .hit_test_graph_input_object(78, (111.0, 521.0))
-            .is_none());
+        assert!(
+            api.hit_test_graph_input_object(78, (111.0, 521.0))
+                .is_none()
+        );
     }
 
     #[test]
@@ -13719,27 +13742,30 @@ mod input_tests {
             })
             .unwrap();
         assert!(api.graph_layers[&layer_id].enabled);
-        assert!(api
-            .hit_test_graph_input_object(object, (20.0, 20.0))
-            .is_some());
+        assert!(
+            api.hit_test_graph_input_object(object, (20.0, 20.0))
+                .is_some()
+        );
 
         assert_eq!(
             GraphApi::set_graph_input_item_state(&mut api, object, 0, 0, 0),
             0
         );
         assert!(!api.graph_layers[&layer_id].enabled);
-        assert!(api
-            .hit_test_graph_input_object(object, (20.0, 20.0))
-            .is_none());
+        assert!(
+            api.hit_test_graph_input_object(object, (20.0, 20.0))
+                .is_none()
+        );
 
         assert_eq!(
             GraphApi::set_graph_input_item_state(&mut api, object, 0, 0, 1),
             0
         );
         assert!(api.graph_layers[&layer_id].enabled);
-        assert!(api
-            .hit_test_graph_input_object(object, (20.0, 20.0))
-            .is_some());
+        assert!(
+            api.hit_test_graph_input_object(object, (20.0, 20.0))
+                .is_some()
+        );
 
         // Reconfigure rebuilds target child Sprites with constructor enabled=1.
         GraphApi::configure_graph_input_object(&mut api, object, descriptor);
@@ -13841,9 +13867,10 @@ mod input_tests {
             .hit_test_graph_input_object(object_a, (115.0, 525.0))
             .expect("processor A must retain its own target child set");
         assert_eq!((hit_a.0.group, hit_a.0.index), (0, 3));
-        assert!(api
-            .hit_test_graph_input_object(object_a, (205.0, 525.0))
-            .is_none());
+        assert!(
+            api.hit_test_graph_input_object(object_a, (205.0, 525.0))
+                .is_none()
+        );
         let hit_b = api
             .hit_test_graph_input_object(object_b, (205.0, 525.0))
             .expect("processor B must retain its own target child set");
@@ -13988,9 +14015,11 @@ mod input_tests {
                 && event[1] == super::graph_input::pack_words(0, 5)
                 && event[2] != -1
         }));
-        assert!(!fallback_events
-            .iter()
-            .any(|event| event[0] == 0x1000_0007 && event[1] == -1));
+        assert!(
+            !fallback_events
+                .iter()
+                .any(|event| event[0] == 0x1000_0007 && event[1] == -1)
+        );
     }
 
     #[test]
@@ -14312,9 +14341,10 @@ mod input_tests {
         );
         assert_eq!(api.surface_controls.layer_count(surface), 1);
         assert_eq!(api.graph_input_objects[&object].descriptor.regions.len(), 2);
-        assert!(api
-            .hit_test_graph_input_object(object, (205.0, 525.0))
-            .is_none());
+        assert!(
+            api.hit_test_graph_input_object(object, (205.0, 525.0))
+                .is_none()
+        );
 
         api.store_graph_image(
             "test:second-icon".to_string(),
@@ -14536,23 +14566,26 @@ mod input_tests {
             api.graph_draw_items().iter().any(|item| item.key == key)
         };
         assert!(!draws_key(&api));
-        assert!(api
-            .hit_test_graph_input_object(object, (111.0, 521.0))
-            .is_none());
+        assert!(
+            api.hit_test_graph_input_object(object, (111.0, 521.0))
+                .is_none()
+        );
 
         let surface_record = api.graph_surfaces.get_mut(&surface).unwrap();
         surface_record.enabled = true;
         surface_record.opacity = 0.0;
         assert!(!draws_key(&api));
-        assert!(api
-            .hit_test_graph_input_object(object, (111.0, 521.0))
-            .is_none());
+        assert!(
+            api.hit_test_graph_input_object(object, (111.0, 521.0))
+                .is_none()
+        );
 
         api.graph_surfaces.get_mut(&surface).unwrap().opacity = 1.0;
         assert!(draws_key(&api));
-        assert!(api
-            .hit_test_graph_input_object(object, (111.0, 521.0))
-            .is_some());
+        assert!(
+            api.hit_test_graph_input_object(object, (111.0, 521.0))
+                .is_some()
+        );
     }
 
     #[test]
@@ -14860,8 +14893,8 @@ fn queue_runtime_input_event(queue: &mut VecDeque<RuntimeInputEvent>, event: Run
 #[cfg(test)]
 mod runtime_input_queue_tests {
     use super::{
-        apply_runtime_input_event, cursor_motion_scale_tolerance, queue_runtime_input_event,
-        RuntimeCursorMotion, RuntimeInputEvent, RuntimeTraceApi,
+        RuntimeCursorMotion, RuntimeInputEvent, RuntimeTraceApi, apply_runtime_input_event,
+        cursor_motion_scale_tolerance, queue_runtime_input_event,
     };
     use ethornell_vm::Value;
     use std::collections::VecDeque;
@@ -16168,9 +16201,10 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                     } else {
                         self.pending_scenario_bootstrap =
                             Some((resolved_archive.clone(), file.to_string(), bytes.to_vec()));
-                        trace_graph!(self,
-                        "BCS playback bootstrap deferred {resolved_archive}:{file} requested={archive}"
-                    );
+                        trace_graph!(
+                            self,
+                            "BCS playback bootstrap deferred {resolved_archive}:{file} requested={archive}"
+                        );
                     }
                 }
             }
@@ -16855,11 +16889,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 path
             } else {
                 let candidate = working_path.join(&path);
-                if candidate.exists() {
-                    candidate
-                } else {
-                    path
-                }
+                if candidate.exists() { candidate } else { path }
             }
         };
         let mut command = std::process::Command::new(&executable_path);
@@ -17439,7 +17469,8 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             if self.title_ui_active {
                 self.title_scenario_requested = crate::title::title_payload_is_scenario(payload);
             }
-            trace_graph!(self,
+            trace_graph!(
+                self,
                 "dispatch object event object=#{object} count={count} event=0x{event:08X} payload=0x{:04X}",
                 self.last_hit_payload
             );
@@ -17481,9 +17512,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 result = format_args!("0x{state:08X}"),
                 "runtime input state queried"
             );
-            trace_graph!(self,
+            trace_graph!(
+                self,
                 "read input state descriptor={descriptor} active={:?} pending={:?} -> 0x{state:08X}",
-                self.pending_input_descriptor, self.pending_input_state
+                self.pending_input_descriptor,
+                self.pending_input_state
             );
         }
         if state != 0 {
@@ -19844,7 +19877,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             Some(transparency),
                             Some(priority),
                         );
-                        trace_graph!(self, "window #{window} pos=({x},{y}) blend={blend_mode} transparency={transparency} reserved={reserved} priority={priority}");
+                        trace_graph!(
+                            self,
+                            "window #{window} pos=({x},{y}) blend={blend_mode} transparency={transparency} reserved={reserved} priority={priority}"
+                        );
                     }
                     tracing::info!(
                         window,
@@ -20170,11 +20206,13 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             output_key = %key,
                             "GraphCompositeBitmap"
                         );
-                        trace_graph!(self,
+                        trace_graph!(
+                            self,
                             "bitmap apply source=#{source} source_key={source_key:?} source_format={source_format:?} destination=#{destination} destination_format={destination_format:?} key={key} x={x} y={y} mode={mode} parameter={parameter} values={values:?}"
                         );
                     } else if copied_vector {
-                        trace_graph!(self,
+                        trace_graph!(
+                            self,
                             "vector-map apply source=#{source} destination=#{destination} x={x} y={y} mode={mode} parameter={parameter}"
                         );
                     }
@@ -20189,8 +20227,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 // object, accidentally animating `current_graph_object`.
                 let args = pop_args(stack, 6);
                 let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let [input_descriptor, input_enabled, frame_rate, duration_ms, target_transparency, object] =
-                    ints.as_slice()
+                let [
+                    input_descriptor,
+                    input_enabled,
+                    frame_rate,
+                    duration_ms,
+                    target_transparency,
+                    object,
+                ] = ints.as_slice()
                 else {
                     return Err(ethornell_vm::VmError::Runtime(
                         "Graph90:20 expected six arguments".to_string(),
@@ -20239,7 +20283,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             _ => unreachable!("native bitmap-region status"),
                         }));
                     }
-                    trace_graph!(self,
+                    trace_graph!(
+                        self,
                         "bitmap region destination=#{destination} source=#{source} src=({x},{y} {width}x{height}) detached=true"
                     );
                 }
@@ -21460,8 +21505,18 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 // input_enabled, input_descriptor.
                 let args = pop_args(stack, 10);
                 let ints = args.iter().map(value_to_i32).collect::<Vec<_>>();
-                let [input_descriptor, input_enabled, update_numerator, update_denominator, duration_ms, target_transparency, position_curve, target_y, target_x, object] =
-                    ints.as_slice()
+                let [
+                    input_descriptor,
+                    input_enabled,
+                    update_numerator,
+                    update_denominator,
+                    duration_ms,
+                    target_transparency,
+                    position_curve,
+                    target_y,
+                    target_x,
+                    object,
+                ] = ints.as_slice()
                 else {
                     return Err(ethornell_vm::VmError::Runtime(
                         "Graph90:23 expected ten arguments".to_string(),
@@ -21732,7 +21787,8 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 .mouse_pos
                 .map(|(x, y)| format!("({x:.0},{y:.0})"))
                 .unwrap_or_else(|| "none".to_string());
-            trace_graph!(self,
+            trace_graph!(
+                self,
                 "poll object state #{object} point={point} pressed={} pending_hit={} hit={} payload=0x{:04X} -> 0x{state:08X}",
                 self.mouse_pressed,
                 pending_hit.unwrap_or_default(),

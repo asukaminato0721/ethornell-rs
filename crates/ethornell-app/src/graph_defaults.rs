@@ -97,8 +97,14 @@ impl Default for TextLayoutDefaults {
 
 impl TextLayoutDefaults {
     pub(crate) fn configure(&mut self, args: [i32; 6]) -> Result<(), TextLayoutError> {
-        let [layout_advance, scale_denominator, character_spacing, font_percent, boundary_offset, mode_flag] =
-            args;
+        let [
+            layout_advance,
+            scale_denominator,
+            character_spacing,
+            font_percent,
+            boundary_offset,
+            mode_flag,
+        ] = args;
         if !(25..=100).contains(&font_percent) {
             return Err(TextLayoutError::FontPercent(font_percent));
         }

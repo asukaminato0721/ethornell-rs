@@ -2,8 +2,8 @@ use crate::Vm;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 

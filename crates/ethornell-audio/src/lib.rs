@@ -2,8 +2,8 @@ use ethornell_core::{EthornellError, Result};
 use kira::dsp::Frame;
 use kira::manager::{AudioManager, AudioManagerSettings};
 use kira::sound::{
-    static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
     PlaybackPosition, PlaybackState,
+    static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings},
 };
 use kira::tween::Tween;
 use serde::Serialize;

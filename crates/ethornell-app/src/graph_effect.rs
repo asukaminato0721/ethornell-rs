@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use ethornell_image::DecodedImage;
-use na_mpeg2_decoder::{frame_to_rgba_bt601_limited, Decoder, Demuxer, Frame, Packet, StreamType};
+use na_mpeg2_decoder::{Decoder, Demuxer, Frame, Packet, StreamType, frame_to_rgba_bt601_limited};
 
 #[derive(Debug)]
 struct MovieDecoder {

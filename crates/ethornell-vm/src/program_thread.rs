@@ -1,4 +1,4 @@
-use crate::{native_call::opcodes, NativeOpcode, SysApi, Value, Vm, VmResult};
+use crate::{NativeOpcode, SysApi, Value, Vm, VmResult, native_call::opcodes};
 use std::sync::Arc;
 
 impl Vm {

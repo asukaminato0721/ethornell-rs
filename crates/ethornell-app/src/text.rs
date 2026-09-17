@@ -1,9 +1,9 @@
-use super::{value_to_i32, RuntimeTraceApi, NATIVE_DISPLAY_Z};
+use super::{NATIVE_DISPLAY_Z, RuntimeTraceApi, value_to_i32};
 use crate::display_tree::NativeDisplayKind;
 use crate::graph::{RuntimeGraphLayer, RuntimeUserControl};
 use crate::text_anim::{
-    normalize_message_text, parse_message_markup_styled, ParsedMessageMarkup, RuntimeRubySpan,
-    RuntimeTextStyleSpan,
+    ParsedMessageMarkup, RuntimeRubySpan, RuntimeTextStyleSpan, normalize_message_text,
+    parse_message_markup_styled,
 };
 use std::collections::BTreeMap;
 
@@ -1749,11 +1749,7 @@ pub(crate) fn ruby_draw_runs(
 
 fn wrap_char_units(ch: char) -> f32 {
     if ch.is_ascii() {
-        if ch.is_ascii_whitespace() {
-            0.35
-        } else {
-            0.55
-        }
+        if ch.is_ascii_whitespace() { 0.35 } else { 0.55 }
     } else {
         1.0
     }
@@ -1769,7 +1765,7 @@ fn value_to_text_string(value: &ethornell_vm::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_and_wrap_message, parse_and_wrap_styled_message, wrap_text_to_state, TextState,
+        TextState, parse_and_wrap_message, parse_and_wrap_styled_message, wrap_text_to_state,
     };
 
     fn narrow_text_state() -> TextState {

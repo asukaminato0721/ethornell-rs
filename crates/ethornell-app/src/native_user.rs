@@ -1426,9 +1426,11 @@ mod tests {
                 .expect("slot should exist");
             assert_eq!(handle as u32, DEBUG_WINDOW_HANDLE_PREFIX | slot as u32);
         }
-        assert!(state
-            .allocate_debug_window(String::new(), 0, 0, 32, 32)
-            .is_none());
+        assert!(
+            state
+                .allocate_debug_window(String::new(), 0, 0, 32, 32)
+                .is_none()
+        );
     }
 
     #[test]

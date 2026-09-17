@@ -3,7 +3,7 @@ use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::tag_utils::SwfMovie;
 use ruffle_core::{FloatDuration, Player, PlayerBuilder};
 use ruffle_render_wgpu::backend::{
-    create_wgpu_instance, request_adapter_and_device, WgpuRenderBackend,
+    WgpuRenderBackend, create_wgpu_instance, request_adapter_and_device,
 };
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::target::TextureTarget;
@@ -11,7 +11,7 @@ use ruffle_render_wgpu::wgpu;
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 const FLASH_BITMAP_SLOT_LIMIT: i32 = 0x4000;
@@ -337,8 +337,8 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        synthetic_movie_url, RuntimeFlashRegistry, FLASH_STATUS_INVALID_BITMAP,
-        FLASH_STATUS_LOAD_FAILURE, FLASH_STATUS_MISSING_CONTROL,
+        FLASH_STATUS_INVALID_BITMAP, FLASH_STATUS_LOAD_FAILURE, FLASH_STATUS_MISSING_CONTROL,
+        RuntimeFlashRegistry, synthetic_movie_url,
     };
 
     #[test]

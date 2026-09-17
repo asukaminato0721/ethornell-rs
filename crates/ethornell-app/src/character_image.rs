@@ -1,7 +1,7 @@
 use crate::resource_lookup::ResolvedResource;
 use ethornell_archive::ResourceManager;
 use ethornell_core::Result;
-use ethornell_image::{decode_image, DecodedImage};
+use ethornell_image::{DecodedImage, decode_image};
 
 pub(crate) fn decode_scenario_resource_image(
     manager: &ResourceManager,

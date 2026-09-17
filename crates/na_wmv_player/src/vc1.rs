@@ -408,8 +408,8 @@ impl PictureHeader {
 
     // ── Legacy parse (no bitplane, backward compat) ─────────────────────────
     pub fn parse_simple(data: &[u8], seq: &SequenceHeader, pts_ms: u32) -> Result<Self> {
-        let mb_w = ((seq.width + 15) / 16).max(1) as usize;
-        let mb_h = ((seq.height + 15) / 16).max(1) as usize;
+        let mb_w = seq.width.div_ceil(16).max(1) as usize;
+        let mb_h = seq.height.div_ceil(16).max(1) as usize;
         Self::parse(data, seq, pts_ms, mb_w, mb_h)
     }
 

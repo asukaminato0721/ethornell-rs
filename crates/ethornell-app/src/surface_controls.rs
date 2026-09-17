@@ -128,14 +128,18 @@ mod tests {
         let owner_a = SurfaceControlOwner::InputObject(100);
         let owner_b = SurfaceControlOwner::InputObject(101);
 
-        assert!(registry
-            .replace(owner_a, 7, descriptor.clone(), BTreeSet::from([1, 2]))
-            .is_empty());
+        assert!(
+            registry
+                .replace(owner_a, 7, descriptor.clone(), BTreeSet::from([1, 2]))
+                .is_empty()
+        );
         assert!(registry.is_unchanged(owner_a, 7, &descriptor));
 
-        assert!(registry
-            .replace(owner_b, 7, descriptor.clone(), BTreeSet::from([8]))
-            .is_empty());
+        assert!(
+            registry
+                .replace(owner_b, 7, descriptor.clone(), BTreeSet::from([8]))
+                .is_empty()
+        );
         assert_eq!(registry.layer_count(7), 3);
         assert_eq!(registry.owner_layer_count(owner_a), 2);
         assert_eq!(registry.owner_layer_count(owner_b), 1);

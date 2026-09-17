@@ -1,5 +1,5 @@
 use crate::{Value, Vm, VmResult};
-use ethornell_script::bcs::{parse_bcs, BcsCommand, BcsValue};
+use ethornell_script::bcs::{BcsCommand, BcsValue, parse_bcs};
 
 const BCS_MAGIC: &[u8] = b"BurikoCompiledScriptVer1.00\0";
 const BCS_RET_OPCODE: u32 = 0x1b;

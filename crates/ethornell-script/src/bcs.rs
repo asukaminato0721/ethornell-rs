@@ -233,12 +233,11 @@ fn parse_commands(
             if command.name == Some("jc") {
                 targets.extend(command.args.iter().filter_map(value_address));
             }
-            if matches!(command.name, Some("jmp" | "call")) {
-                if let Some(previous) = index.checked_sub(1).and_then(|index| chunk.get(index)) {
-                    if previous.name == Some("push_offset") {
-                        targets.extend(previous.args.iter().filter_map(value_address));
-                    }
-                }
+            if matches!(command.name, Some("jmp" | "call"))
+                && let Some(previous) = index.checked_sub(1).and_then(|index| chunk.get(index))
+                && previous.name == Some("push_offset")
+            {
+                targets.extend(previous.args.iter().filter_map(value_address));
             }
         }
         for target in targets {
@@ -676,10 +675,12 @@ mod tests {
             program.code_end,
             program.commands.last().unwrap().file_offset + 4
         );
-        assert!(program
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("outside BCS dispatch range")));
+        assert!(
+            program
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("outside BCS dispatch range"))
+        );
     }
 
     #[test]

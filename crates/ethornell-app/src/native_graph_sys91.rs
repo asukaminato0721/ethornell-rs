@@ -350,8 +350,13 @@ impl RuntimeTraceApi {
             }
             0x1b => {
                 let args = Self::graph91_source_ints(stack, 5);
-                if let [destination, source, concentration_x, concentration_y, attenuation] =
-                    args.as_slice()
+                if let [
+                    destination,
+                    source,
+                    concentration_x,
+                    concentration_y,
+                    attenuation,
+                ] = args.as_slice()
                 {
                     self.graph91_concentrate_bitmap(
                         *destination,
@@ -847,8 +852,14 @@ impl RuntimeTraceApi {
             }
             0x98 => {
                 let args = Self::graph91_source_ints(stack, 6);
-                if let [layout_advance, scale_denominator, character_spacing, font_percent, boundary_offset, mode_flag] =
-                    args.as_slice()
+                if let [
+                    layout_advance,
+                    scale_denominator,
+                    character_spacing,
+                    font_percent,
+                    boundary_offset,
+                    mode_flag,
+                ] = args.as_slice()
                 {
                     let _ = self.graph_defaults.text_layout.configure([
                         *layout_advance,
@@ -1000,8 +1011,17 @@ impl RuntimeTraceApi {
             }
             0x68 => {
                 let args = Self::graph91_source_ints(stack, 9);
-                if let [handle, x, y, rotation, scale_x, scale_y, parameter, alpha, priority] =
-                    args.as_slice()
+                if let [
+                    handle,
+                    x,
+                    y,
+                    rotation,
+                    scale_x,
+                    scale_y,
+                    parameter,
+                    alpha,
+                    priority,
+                ] = args.as_slice()
                 {
                     if *scale_x != 0 && *scale_y != 0 {
                         self.graph91_configure_effector(
@@ -1032,8 +1052,14 @@ impl RuntimeTraceApi {
             }
             0x70 => {
                 let args = Self::graph91_source_ints(stack, 6);
-                let handle = if let [cell_width, row_step, column_step, baseline, row_factor, frame_factor] =
-                    args.as_slice()
+                let handle = if let [
+                    cell_width,
+                    row_step,
+                    column_step,
+                    baseline,
+                    row_factor,
+                    frame_factor,
+                ] = args.as_slice()
                 {
                     self.graph91_create_landscape(
                         *cell_width,
@@ -1206,8 +1232,17 @@ impl RuntimeTraceApi {
             }
             0x40 => {
                 let args = Self::graph91_source_ints(stack, 9);
-                if let [x, y, bitmap, source_x, source_y, rotation, scale_x, scale_y, transparency] =
-                    args.as_slice()
+                if let [
+                    x,
+                    y,
+                    bitmap,
+                    source_x,
+                    source_y,
+                    rotation,
+                    scale_x,
+                    scale_y,
+                    transparency,
+                ] = args.as_slice()
                 {
                     self.graph91_initialize_multilayer_background(
                         *x,
@@ -1864,8 +1899,19 @@ impl RuntimeTraceApi {
     }
 
     fn graph91_composite_rect(&mut self, args: &[i32], conversion_variant: bool) {
-        let [destination, destination_x, destination_y, source, source_x, source_y, _mode, width, height, alpha, source_alpha_gate] =
-            args
+        let [
+            destination,
+            destination_x,
+            destination_y,
+            source,
+            source_x,
+            source_y,
+            _mode,
+            width,
+            height,
+            alpha,
+            source_alpha_gate,
+        ] = args
         else {
             return;
         };

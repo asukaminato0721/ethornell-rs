@@ -1,7 +1,7 @@
 use crate::timing::duration_ms_to_ticks;
 #[cfg(test)]
 use ethornell_script::bcs::BcsSymbol;
-use ethornell_script::bcs::{parse_bcs, BcsCommand, BcsProgram, BcsValue};
+use ethornell_script::bcs::{BcsCommand, BcsProgram, BcsValue, parse_bcs};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]

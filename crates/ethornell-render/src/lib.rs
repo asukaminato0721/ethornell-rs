@@ -1,5 +1,5 @@
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use ethornell_core::{classify_native_blend, EthornellError, NativeBlendPath, Result};
+use ethornell_core::{EthornellError, NativeBlendPath, Result, classify_native_blend};
 use ethornell_image::DecodedImage;
 use std::collections::{BTreeMap, BTreeSet};
 use winit::window::Window;
@@ -452,7 +452,12 @@ impl<'w> Renderer<'w> {
                 .ok_or_else(|| EthornellError::Parse("unknown texture handle".into()))?;
             self.write_texture(&record.texture, image);
             if let Some(record) = self.textures.get_mut(&handle.id) {
-                record.opaque = image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255);
+                record.opaque = image
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 255);
             }
         } else {
             let record = self.create_texture_record(image);
@@ -515,7 +520,12 @@ impl<'w> Renderer<'w> {
             nearest_bind_group,
             width: image.width,
             height: image.height,
-            opaque: image.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255),
+            opaque: image
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255),
         }
     }
 
@@ -899,7 +909,7 @@ fn surface_to_virtual_point(
 
 #[cfg(test)]
 mod native_blend_tests {
-    use super::{native_pipeline_kind, NativePipelineKind};
+    use super::{NativePipelineKind, native_pipeline_kind};
 
     #[test]
     fn opaque_copy_uses_replace_pipeline() {
@@ -1013,7 +1023,7 @@ fn rasterize_text(
         .max(px_height.ceil()) as u32;
     let widths: Vec<u32> = lines
         .iter()
-        .map(|line| measure_line(font, *line, px_height))
+        .map(|line| measure_line(font, line, px_height))
         .collect();
     let style_overhang = styles
         .iter()
@@ -1153,14 +1163,18 @@ mod font_tests {
                 italic: true,
             }],
         );
-        assert!(image
-            .rgba
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 && pixel[3] > 0));
-        assert!(image
-            .rgba
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0));
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 && pixel[3] > 0)
+        );
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0)
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::{
-    GraphApi, SoundApi, SysApi, Value, Vm, VmRunOptions, VmStopReason, ADDRESS_MASK,
-    LOCAL_MEMORY_BASE,
+    ADDRESS_MASK, GraphApi, LOCAL_MEMORY_BASE, SoundApi, SysApi, Value, Vm, VmRunOptions,
+    VmStopReason,
 };
 use ethornell_script::BpProgram;
 use std::sync::Arc;

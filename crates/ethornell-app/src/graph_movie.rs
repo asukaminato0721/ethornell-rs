@@ -146,7 +146,7 @@ fn parse_buriko_movie_header(bytes: &[u8]) -> Option<[i32; 5]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_buriko_movie_header, BurikoMovieRegistry, BURIKO_MOVIE_MAGIC};
+    use super::{BURIKO_MOVIE_MAGIC, BurikoMovieRegistry, parse_buriko_movie_header};
 
     fn movie_bytes() -> Vec<u8> {
         let mut bytes = vec![0u8; 64];

@@ -229,8 +229,7 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         symbol: "div",
         stack_effect: "2 -> 1",
         immediate: "none",
-        description:
-            "Signed integer division; target zero divisor behavior must remain target compatible.",
+        description: "Signed integer division; target zero divisor behavior must remain target compatible.",
         confidence: "medium",
         evidence: "current VM and call corpus",
     },
@@ -420,8 +419,7 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         symbol: "muldiv",
         stack_effect: "3 -> 1",
         immediate: "none",
-        description:
-            "Compute multiplicand times multiplier divided by divisor using a wide intermediate.",
+        description: "Compute multiplicand times multiplier divided by divisor using a wide intermediate.",
         confidence: "medium",
         evidence: "current VM implementation",
     },
@@ -551,8 +549,7 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         symbol: "memory_equal",
         stack_effect: "3 -> 1",
         immediate: "none",
-        description:
-            "Compare two fixed size memory ranges and push boolean equality. It is not libc memcmp.",
+        description: "Compare two fixed size memory ranges and push boolean equality. It is not libc memcmp.",
         confidence: "high",
         evidence: "target opcode table slot 0x63 and native handler",
     },
@@ -652,8 +649,7 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         symbol: "tolower",
         stack_effect: "1 -> 0",
         immediate: "none",
-        description:
-            "Lowercase or normalize a character in place; this opcode has no BP stack output.",
+        description: "Lowercase or normalize a character in place; this opcode has no BP stack output.",
         confidence: "high",
         evidence: "recovered stack contract",
     },

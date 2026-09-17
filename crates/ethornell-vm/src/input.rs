@@ -1,5 +1,5 @@
 use crate::{
-    native_call::opcodes, NativeCallFrame, NativeOpcode, SysApi, Value, Vm, VmError, VmResult,
+    NativeCallFrame, NativeOpcode, SysApi, Value, Vm, VmError, VmResult, native_call::opcodes,
 };
 
 pub(crate) const TITLE_PENDING_CALLBACK_ADDR: u32 = 1856;
