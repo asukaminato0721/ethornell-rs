@@ -248,10 +248,10 @@ impl NativeDisplayTree {
             return false;
         };
         self.display_chain.remove(handle);
-        if let Some(parent) = object.parent {
-            if let Some(parent) = self.objects.get_mut(&parent) {
-                parent.children.retain(|child| *child != handle);
-            }
+        if let Some(parent) = object.parent
+            && let Some(parent) = self.objects.get_mut(&parent)
+        {
+            parent.children.retain(|child| *child != handle);
         }
         for child in object.children {
             if let Some(child) = self.objects.get_mut(&child) {
@@ -283,20 +283,19 @@ impl NativeDisplayTree {
         }
 
         let old_parent = self.objects.get(&child).and_then(|object| object.parent);
-        if let Some(old_parent) = old_parent {
-            if let Some(parent) = self.objects.get_mut(&old_parent) {
-                parent.children.retain(|candidate| *candidate != child);
-            }
+        if let Some(old_parent) = old_parent
+            && let Some(parent) = self.objects.get_mut(&old_parent)
+        {
+            parent.children.retain(|candidate| *candidate != child);
         }
         if let Some(object) = self.objects.get_mut(&child) {
             object.parent = (parent != 0).then_some(parent);
         }
-        if parent != 0 {
-            if let Some(parent) = self.objects.get_mut(&parent) {
-                if !parent.children.contains(&child) {
-                    parent.children.push(child);
-                }
-            }
+        if parent != 0
+            && let Some(parent) = self.objects.get_mut(&parent)
+            && !parent.children.contains(&child)
+        {
+            parent.children.push(child);
         }
         Ok(())
     }

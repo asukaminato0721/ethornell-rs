@@ -239,8 +239,8 @@ pub(super) fn split_native_command_line(command_line: &str) -> Vec<String> {
         match ch {
             '\\' => backslashes += 1,
             '"' => {
-                current.extend(std::iter::repeat('\\').take(backslashes / 2));
-                if backslashes % 2 == 0 {
+                current.extend(std::iter::repeat_n('\\', backslashes / 2));
+                if backslashes.is_multiple_of(2) {
                     quoted = !quoted;
                 } else {
                     current.push('"');
@@ -248,20 +248,20 @@ pub(super) fn split_native_command_line(command_line: &str) -> Vec<String> {
                 backslashes = 0;
             }
             ch if ch.is_whitespace() && !quoted => {
-                current.extend(std::iter::repeat('\\').take(backslashes));
+                current.extend(std::iter::repeat_n('\\', backslashes));
                 backslashes = 0;
                 if !current.is_empty() {
                     args.push(std::mem::take(&mut current));
                 }
             }
             ch => {
-                current.extend(std::iter::repeat('\\').take(backslashes));
+                current.extend(std::iter::repeat_n('\\', backslashes));
                 backslashes = 0;
                 current.push(ch);
             }
         }
     }
-    current.extend(std::iter::repeat('\\').take(backslashes));
+    current.extend(std::iter::repeat_n('\\', backslashes));
     if !current.is_empty() {
         args.push(current);
     }

@@ -1,6 +1,7 @@
 use ethornell_script::{
+    BpInstruction, BpOpcode, BpOperand, BpProgram,
     calls::{known_call_arg_count, known_call_returns_value, known_call_stack_output_count},
-    native_abi, BpInstruction, BpOpcode, BpOperand, BpProgram,
+    native_abi,
 };
 use native_thread::{
     CProcWaitTimingExLayout32, CProcWaitWndMsgLayout32, CProcedure, CProcedureLayout32, CThread,
@@ -8,8 +9,8 @@ use native_thread::{
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
 };
 
 mod async_program;
@@ -34,11 +35,11 @@ mod time;
 mod user_data;
 
 pub use native_call::{
-    display_name as native_display_name, documented_opcode, implementation_level,
-    is_strictly_supported, recovery_level, scheduling_effect, NativeCallFrame,
-    NativeImplementationLevel, NativeMessageProcedureClass, NativeMessageProcedureConfig,
-    NativeOpcode, NativeOpcodeSpec, NativeParameterSpec, NativeRecoveryLevel,
-    NativeSchedulingEffect,
+    NativeCallFrame, NativeImplementationLevel, NativeMessageProcedureClass,
+    NativeMessageProcedureConfig, NativeOpcode, NativeOpcodeSpec, NativeParameterSpec,
+    NativeRecoveryLevel, NativeSchedulingEffect, display_name as native_display_name,
+    documented_opcode, implementation_level, is_strictly_supported, recovery_level,
+    scheduling_effect,
 };
 
 const SYSTEM_PROGRAM_TABLE: u32 = 273_280;
@@ -1830,7 +1831,7 @@ fn portable_local_system_time() -> [u16; 8] {
             gmtoff: c_long,
             zone: *const c_char,
         }
-        extern "C" {
+        unsafe extern "C" {
             fn time(timer: *mut i64) -> i64;
             fn localtime_r(timer: *const i64, result: *mut Tm) -> *mut Tm;
         }
@@ -12234,11 +12235,11 @@ impl SoundApi for TraceApi {
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_loaded_program, ensure_trailing_separator, join_native_path, native_call,
-        strip_native_markup_tags, system80_state, GraphApi, GraphIconRecord, NativeCallFrame,
-        NativeOpcode, ResourceLoadOrigin, SoundApi, SysApi, System92TextFragmentRecord, TraceApi,
-        UserDialogRequest, UserDialogResponse, Value, Vm, VmRunOptions, VmStopReason, ADDRESS_MASK,
-        AUX_MEMORY_SEGMENT_SIZE, LOCAL_MEMORY_BASE, MAX_MEMORY_SIZE,
+        ADDRESS_MASK, AUX_MEMORY_SEGMENT_SIZE, GraphApi, GraphIconRecord, LOCAL_MEMORY_BASE,
+        MAX_MEMORY_SIZE, NativeCallFrame, NativeOpcode, ResourceLoadOrigin, SoundApi, SysApi,
+        System92TextFragmentRecord, TraceApi, UserDialogRequest, UserDialogResponse, Value, Vm,
+        VmRunOptions, VmStopReason, empty_loaded_program, ensure_trailing_separator,
+        join_native_path, native_call, strip_native_markup_tags, system80_state,
     };
     use ethornell_script::{BpInstruction, BpOpcode, BpOperand, BpProgram};
     use std::sync::Arc;
@@ -14360,10 +14361,11 @@ mod tests {
 
         assert_eq!(report.stop_reason, VmStopReason::Completed);
         assert_eq!(vm.stack, [Value::Int(777)]);
-        assert!(vm
-            .calls
-            .keys()
-            .any(|key| key.starts_with("script:0xFF:0x40:")));
+        assert!(
+            vm.calls
+                .keys()
+                .any(|key| key.starts_with("script:0xFF:0x40:"))
+        );
     }
 
     #[test]
@@ -15624,9 +15626,11 @@ mod tests {
         let error = vm
             .try_builtin_sys_with_api(&mut SchedulingApi::default(), 0x80, 0x12)
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("input descriptor array is not zero terminated"));
+        assert!(
+            error
+                .to_string()
+                .contains("input descriptor array is not zero terminated")
+        );
     }
 
     #[test]
@@ -15684,9 +15688,11 @@ mod tests {
         let error = vm
             .try_builtin_sys_with_api(&mut api, 0x80, 0x62)
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("fullscreen hotkey descriptor list exceeds 15 entries"));
+        assert!(
+            error
+                .to_string()
+                .contains("fullscreen hotkey descriptor list exceeds 15 entries")
+        );
         assert!(!api.fullscreen_hotkeys_enabled);
         assert!(api.fullscreen_hotkeys.is_empty());
     }

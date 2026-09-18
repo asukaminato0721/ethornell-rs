@@ -1,21 +1,22 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use ethornell_archive::{
-    archive_paths, detect_archive_format_from_bytes, detect_file_magic, detect_magic,
-    extract_archive_with_options, extract_game_archives, read_archive_index, read_entry_raw,
-    scan_game_root, walk_files, ArchiveFormat, MagicKind, ResourceManager,
+    ArchiveFormat, MagicKind, ResourceManager, archive_paths, detect_archive_format_from_bytes,
+    detect_file_magic, detect_magic, extract_archive_with_options, extract_game_archives,
+    read_archive_index, read_entry_raw, scan_game_root, walk_files,
 };
-use ethornell_core::{init_tracing, GameRoot};
+use ethornell_core::{GameRoot, init_tracing};
 use ethornell_image::{decode_cbg_to_png, decode_image, probe_image, write_rgba_png};
 use ethornell_script::{
-    bcs::{parse_bcs, BcsCommand, BcsValue},
+    BpInstruction,
+    bcs::{BcsCommand, BcsValue, parse_bcs},
     calls::{
-        infer_program_call_arg_counts, instruction_call_key, registered_call_summary,
-        scan_program_calls, summarize_call_sites, summarize_inferred_arg_counts, CallKey, CallSite,
-        DISPATCH_GROUPS,
+        CallKey, CallSite, DISPATCH_GROUPS, infer_program_call_arg_counts, instruction_call_key,
+        registered_call_summary, scan_program_calls, summarize_call_sites,
+        summarize_inferred_arg_counts,
     },
-    decompile::{decompile_bcs, decompile_bp, DecompileOptions},
-    detect_script_format, disassemble_bp, disassemble_file, parse_bp_program, BpInstruction,
+    decompile::{DecompileOptions, decompile_bcs, decompile_bp},
+    detect_script_format, disassemble_bp, disassemble_file, parse_bp_program,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};

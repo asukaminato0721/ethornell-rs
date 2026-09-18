@@ -675,7 +675,7 @@ fn prompt_text_platform(title: &str, prompt: &str, initial: &str) -> Option<Stri
         if output.status.success() {
             return Some(
                 String::from_utf8_lossy(&output.stdout)
-                    .trim_end_matches(|ch| ch == '\r' || ch == '\n')
+                    .trim_end_matches(['\r', '\n'])
                     .to_string(),
             );
         }
@@ -693,7 +693,7 @@ fn prompt_text_platform(title: &str, prompt: &str, initial: &str) -> Option<Stri
         .ok()?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
-            .trim_end_matches(|ch| ch == '\r' || ch == '\n')
+            .trim_end_matches(['\r', '\n'])
             .to_string()
     })
 }
@@ -701,7 +701,7 @@ fn prompt_text_platform(title: &str, prompt: &str, initial: &str) -> Option<Stri
 fn clean_output_preserve_empty(bytes: &[u8]) -> Option<String> {
     Some(
         String::from_utf8_lossy(bytes)
-            .trim_end_matches(|ch| ch == '\r' || ch == '\n')
+            .trim_end_matches(['\r', '\n'])
             .to_string(),
     )
 }

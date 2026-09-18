@@ -1,4 +1,4 @@
-use super::{RuntimeTraceApi, RuntimeUserControl, INPUT_DESCRIPTOR_MOUSE_LEFT};
+use super::{INPUT_DESCRIPTOR_MOUSE_LEFT, RuntimeTraceApi, RuntimeUserControl};
 
 impl RuntimeTraceApi {
     pub(crate) fn maybe_auto_click_user(&mut self) {
@@ -32,7 +32,7 @@ impl RuntimeTraceApi {
                     )
                 })
             })
-            .or_else(|| {
+            .or({
                 if self.scenario_bootstrapped {
                     Some((640.0, 650.0))
                 } else {

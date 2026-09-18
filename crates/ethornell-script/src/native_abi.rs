@@ -269,7 +269,7 @@ pub fn generic_name(group: u8, id: u16) -> Option<&'static str> {
     lookup(group, id)?;
     Some(match group {
         0x80 | 0x81 => "NativeSystemCall",
-        0x90 | 0x91 | 0x92 => "NativeGraphCall",
+        0x90..=0x92 => "NativeGraphCall",
         0xA0 => "NativeSoundCall",
         0xB0 | 0xC0 => "NativeUserCall",
         _ => return None,

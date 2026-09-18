@@ -43,8 +43,8 @@ fn wmv2_idct_row(b: &mut [i16]) {
     let a4 = W0 * b0 - W0 * b4;
 
     // step 2
-    let s1 = ((181i32 * (a1 - a5 + a7 - a3) + 128) >> 8) as i32;
-    let s2 = ((181i32 * (a1 - a5 - a7 + a3) + 128) >> 8) as i32;
+    let s1 = (181i32 * (a1 - a5 + a7 - a3) + 128) >> 8;
+    let s2 = (181i32 * (a1 - a5 - a7 + a3) + 128) >> 8;
 
     // step 3
     b[0] = ((a0 + a2 + a1 + a5 + (1 << 7)) >> 8) as i16;
@@ -58,6 +58,7 @@ fn wmv2_idct_row(b: &mut [i16]) {
 }
 
 #[inline(always)]
+// Keep the stride * row + column layout explicit for every row.
 fn wmv2_idct_col(block: &mut [i16; 64], col: usize) {
     // step 1, with extended precision
     let b1 = block[8 * 1 + col] as i32;

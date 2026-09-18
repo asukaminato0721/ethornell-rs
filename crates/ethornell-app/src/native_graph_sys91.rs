@@ -75,25 +75,13 @@ impl Default for Graph91MultiLayerRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct Graph91MultiLayerBackgroundState {
     pub active: bool,
     pub object_x_16_16: i32,
     pub object_y_16_16: i32,
     pub selected_layer: usize,
     pub layers: [Graph91MultiLayerRecord; 8],
-}
-
-impl Default for Graph91MultiLayerBackgroundState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            object_x_16_16: 0,
-            object_y_16_16: 0,
-            selected_layer: 0,
-            layers: [Graph91MultiLayerRecord::default(); 8],
-        }
-    }
 }
 
 const GRAPH91_EFFECTOR_TAG: u32 = 0x9100_0000;
@@ -304,21 +292,21 @@ impl RuntimeTraceApi {
                 args.reverse();
                 if let [font_number, size, width_percent, bold, field_56, field_60] =
                     args.as_slice()
+                    && (4..=200).contains(size)
+                    && (25..=200).contains(width_percent)
                 {
-                    if (4..=200).contains(size) && (25..=200).contains(width_percent) {
-                        self.graph91_fonts.insert(
-                            *font_number,
-                            Graph91FontConfig {
-                                font_number: *font_number,
-                                size: *size,
-                                width_percent: *width_percent,
-                                bold: *bold,
-                                target_field_56: *field_56,
-                                target_field_60: *field_60,
-                            },
-                        );
-                        self.text_state.font_size = *size as f32;
-                    }
+                    self.graph91_fonts.insert(
+                        *font_number,
+                        Graph91FontConfig {
+                            font_number: *font_number,
+                            size: *size,
+                            width_percent: *width_percent,
+                            bold: *bold,
+                            target_field_56: *field_56,
+                            target_field_60: *field_60,
+                        },
+                    );
+                    self.text_state.font_size = *size as f32;
                 }
                 ethornell_vm::Value::None
             }
@@ -350,8 +338,13 @@ impl RuntimeTraceApi {
             }
             0x1b => {
                 let args = Self::graph91_source_ints(stack, 5);
-                if let [destination, source, concentration_x, concentration_y, attenuation] =
-                    args.as_slice()
+                if let [
+                    destination,
+                    source,
+                    concentration_x,
+                    concentration_y,
+                    attenuation,
+                ] = args.as_slice()
                 {
                     self.graph91_concentrate_bitmap(
                         *destination,
@@ -588,6 +581,8 @@ impl RuntimeTraceApi {
                         })
                         .and_then(|pixels| pixels.checked_mul(4));
                     if let Some(byte_len) = pixels {
+                        // Preserve fallible allocation so failure releases the Flash control.
+                        #[allow(clippy::slow_vector_initialization)]
                         let mut rgba = Vec::new();
                         if rgba.try_reserve_exact(byte_len).is_ok() {
                             rgba.resize(byte_len, 0);
@@ -738,20 +733,20 @@ impl RuntimeTraceApi {
             0x89 => {
                 let spacing = pop_int_value(stack).unwrap_or_default();
                 let window = pop_int_value(stack).unwrap_or_default();
-                if (0..=800).contains(&spacing) {
-                    if let Some(surface) = self.graph_surfaces.get_mut(&window) {
-                        surface.line_spacing_percent = spacing;
-                    }
+                if (0..=800).contains(&spacing)
+                    && let Some(surface) = self.graph_surfaces.get_mut(&window)
+                {
+                    surface.line_spacing_percent = spacing;
                 }
                 ethornell_vm::Value::None
             }
             0x8a => {
                 let variant = pop_int_value(stack).unwrap_or_default();
                 let window = pop_int_value(stack).unwrap_or_default();
-                if (0..=1).contains(&variant) {
-                    if let Some(surface) = self.graph_surfaces.get_mut(&window) {
-                        surface.message_variant = variant;
-                    }
+                if (0..=1).contains(&variant)
+                    && let Some(surface) = self.graph_surfaces.get_mut(&window)
+                {
+                    surface.message_variant = variant;
                 }
                 ethornell_vm::Value::None
             }
@@ -847,8 +842,14 @@ impl RuntimeTraceApi {
             }
             0x98 => {
                 let args = Self::graph91_source_ints(stack, 6);
-                if let [layout_advance, scale_denominator, character_spacing, font_percent, boundary_offset, mode_flag] =
-                    args.as_slice()
+                if let [
+                    layout_advance,
+                    scale_denominator,
+                    character_spacing,
+                    font_percent,
+                    boundary_offset,
+                    mode_flag,
+                ] = args.as_slice()
                 {
                     let _ = self.graph_defaults.text_layout.configure([
                         *layout_advance,
@@ -970,50 +971,59 @@ impl RuntimeTraceApi {
             }
             0x66 => {
                 let args = Self::graph91_source_ints(stack, 4);
-                if let [handle, gradient_type, blend, priority] = args.as_slice() {
-                    if (0..=1).contains(gradient_type) {
-                        self.graph91_configure_effector(
-                            *handle,
-                            1,
-                            [-1, -1],
-                            [*gradient_type, *blend, 0, 0, 0, 0, 0, 0, 0],
-                            *priority,
-                        );
-                    }
+                if let [handle, gradient_type, blend, priority] = args.as_slice()
+                    && (0..=1).contains(gradient_type)
+                {
+                    self.graph91_configure_effector(
+                        *handle,
+                        1,
+                        [-1, -1],
+                        [*gradient_type, *blend, 0, 0, 0, 0, 0, 0, 0],
+                        *priority,
+                    );
                 }
                 ethornell_vm::Value::None
             }
             0x67 => {
                 let args = Self::graph91_source_ints(stack, 6);
-                if let [handle, map, max_distance, ripple, blend, priority] = args.as_slice() {
-                    if *max_distance != 0 {
-                        self.graph91_configure_effector(
-                            *handle,
-                            2,
-                            [*map, -1],
-                            [*max_distance, *ripple, *blend, 0, 0, 0, 0, 0, 0],
-                            *priority,
-                        );
-                    }
+                if let [handle, map, max_distance, ripple, blend, priority] = args.as_slice()
+                    && *max_distance != 0
+                {
+                    self.graph91_configure_effector(
+                        *handle,
+                        2,
+                        [*map, -1],
+                        [*max_distance, *ripple, *blend, 0, 0, 0, 0, 0, 0],
+                        *priority,
+                    );
                 }
                 ethornell_vm::Value::None
             }
             0x68 => {
                 let args = Self::graph91_source_ints(stack, 9);
-                if let [handle, x, y, rotation, scale_x, scale_y, parameter, alpha, priority] =
-                    args.as_slice()
+                if let [
+                    handle,
+                    x,
+                    y,
+                    rotation,
+                    scale_x,
+                    scale_y,
+                    parameter,
+                    alpha,
+                    priority,
+                ] = args.as_slice()
+                    && *scale_x != 0
+                    && *scale_y != 0
                 {
-                    if *scale_x != 0 && *scale_y != 0 {
-                        self.graph91_configure_effector(
-                            *handle,
-                            3,
-                            [-1, -1],
-                            [
-                                *x, *y, *rotation, *scale_x, *scale_y, *parameter, *alpha, 0, 0,
-                            ],
-                            *priority,
-                        );
-                    }
+                    self.graph91_configure_effector(
+                        *handle,
+                        3,
+                        [-1, -1],
+                        [
+                            *x, *y, *rotation, *scale_x, *scale_y, *parameter, *alpha, 0, 0,
+                        ],
+                        *priority,
+                    );
                 }
                 ethornell_vm::Value::None
             }
@@ -1032,8 +1042,14 @@ impl RuntimeTraceApi {
             }
             0x70 => {
                 let args = Self::graph91_source_ints(stack, 6);
-                let handle = if let [cell_width, row_step, column_step, baseline, row_factor, frame_factor] =
-                    args.as_slice()
+                let handle = if let [
+                    cell_width,
+                    row_step,
+                    column_step,
+                    baseline,
+                    row_factor,
+                    frame_factor,
+                ] = args.as_slice()
                 {
                     self.graph91_create_landscape(
                         *cell_width,
@@ -1073,37 +1089,34 @@ impl RuntimeTraceApi {
                     // sub_422AF0 first calls the base priority virtual
                     // (sub_41B8B0); an out-of-range value fails before any of
                     // the remaining landscape state is changed.
-                    if (0..0x1_0000).contains(priority) {
-                        if let Some(state) = self.graph91_landscapes.get_mut(handle) {
-                            state.x = *x;
-                            state.y = *y;
-                            state.blend_mode = *blend_mode;
-                            state.alpha = *alpha;
-                            state.priority = *priority;
-                            let properties =
-                                self.graph_object_properties.entry(*handle).or_default();
-                            properties.native.priority = *priority as u32;
-                            self.display_tree.set_chain_depth(*handle, *priority);
-                            self.graph90_refresh_native_sort_key(*handle);
-                        }
+                    if (0..0x1_0000).contains(priority)
+                        && let Some(state) = self.graph91_landscapes.get_mut(handle)
+                    {
+                        state.x = *x;
+                        state.y = *y;
+                        state.blend_mode = *blend_mode;
+                        state.alpha = *alpha;
+                        state.priority = *priority;
+                        let properties = self.graph_object_properties.entry(*handle).or_default();
+                        properties.native.priority = *priority as u32;
+                        self.display_tree.set_chain_depth(*handle, *priority);
+                        self.graph90_refresh_native_sort_key(*handle);
                     }
                 }
                 ethornell_vm::Value::None
             }
             0x76 => {
                 let args = Self::graph91_source_ints(stack, 6);
-                if let [handle, line, column, silhouette_type, level, value] = args.as_slice() {
-                    if (0..=2).contains(silhouette_type) && (0..=256).contains(level) {
-                        if let Some(state) = self.graph91_landscapes.get_mut(handle) {
-                            if let Some(index) = state.cell_index(*line, *column) {
-                                if let Some(cell) = state.cells.get_mut(index) {
-                                    cell.silhouette_type = *silhouette_type;
-                                    cell.silhouette_level = *level;
-                                    cell.silhouette_value = *value;
-                                }
-                            }
-                        }
-                    }
+                if let [handle, line, column, silhouette_type, level, value] = args.as_slice()
+                    && (0..=2).contains(silhouette_type)
+                    && (0..=256).contains(level)
+                    && let Some(state) = self.graph91_landscapes.get_mut(handle)
+                    && let Some(index) = state.cell_index(*line, *column)
+                    && let Some(cell) = state.cells.get_mut(index)
+                {
+                    cell.silhouette_type = *silhouette_type;
+                    cell.silhouette_level = *level;
+                    cell.silhouette_value = *value;
                 }
                 ethornell_vm::Value::None
             }
@@ -1206,8 +1219,17 @@ impl RuntimeTraceApi {
             }
             0x40 => {
                 let args = Self::graph91_source_ints(stack, 9);
-                if let [x, y, bitmap, source_x, source_y, rotation, scale_x, scale_y, transparency] =
-                    args.as_slice()
+                if let [
+                    x,
+                    y,
+                    bitmap,
+                    source_x,
+                    source_y,
+                    rotation,
+                    scale_x,
+                    scale_y,
+                    transparency,
+                ] = args.as_slice()
                 {
                     self.graph91_initialize_multilayer_background(
                         *x,
@@ -1224,53 +1246,53 @@ impl RuntimeTraceApi {
                 ethornell_vm::Value::None
             }
             0x41 => {
-                if let Some(layer) = Self::graph91_source_ints(stack, 1).first().copied() {
-                    if (0..8).contains(&layer) && self.graph91_multilayer_background.active {
-                        self.graph91_multilayer_background.selected_layer = layer as usize;
-                    }
+                if let Some(layer) = Self::graph91_source_ints(stack, 1).first().copied()
+                    && (0..8).contains(&layer)
+                    && self.graph91_multilayer_background.active
+                {
+                    self.graph91_multilayer_background.selected_layer = layer as usize;
                 }
                 ethornell_vm::Value::None
             }
             0x42 => {
                 let args = Self::graph91_source_ints(stack, 2);
-                if let [layer, enabled] = args.as_slice() {
-                    if let Some(record) = self.graph91_multilayer_record_mut(*layer) {
-                        record.enabled = *enabled != 0;
-                        self.graph91_sync_multilayer_render_layer(*layer as usize);
-                    }
+                if let [layer, enabled] = args.as_slice()
+                    && let Some(record) = self.graph91_multilayer_record_mut(*layer)
+                {
+                    record.enabled = *enabled != 0;
+                    self.graph91_sync_multilayer_render_layer(*layer as usize);
                 }
                 ethornell_vm::Value::None
             }
             0x43 => {
                 let args = Self::graph91_source_ints(stack, 3);
-                if let [layer, x, y] = args.as_slice() {
-                    if let Some(record) = self.graph91_multilayer_record_mut(*layer) {
-                        record.x_16_16 = *x;
-                        record.y_16_16 = *y;
-                        self.graph91_sync_multilayer_render_layer(*layer as usize);
-                    }
+                if let [layer, x, y] = args.as_slice()
+                    && let Some(record) = self.graph91_multilayer_record_mut(*layer)
+                {
+                    record.x_16_16 = *x;
+                    record.y_16_16 = *y;
+                    self.graph91_sync_multilayer_render_layer(*layer as usize);
                 }
                 ethornell_vm::Value::None
             }
             0x44 => {
                 let args = Self::graph91_source_ints(stack, 2);
-                if let [layer, blend_mode] = args.as_slice() {
-                    if let Some(record) = self.graph91_multilayer_record_mut(*layer) {
-                        record.blend_mode = *blend_mode;
-                        self.graph91_sync_multilayer_render_layer(*layer as usize);
-                    }
+                if let [layer, blend_mode] = args.as_slice()
+                    && let Some(record) = self.graph91_multilayer_record_mut(*layer)
+                {
+                    record.blend_mode = *blend_mode;
+                    self.graph91_sync_multilayer_render_layer(*layer as usize);
                 }
                 ethornell_vm::Value::None
             }
             0x45 => {
                 let args = Self::graph91_source_ints(stack, 2);
-                if let [layer, blend_parameter] = args.as_slice() {
-                    if (0..=256).contains(blend_parameter) {
-                        if let Some(record) = self.graph91_multilayer_record_mut(*layer) {
-                            record.blend_parameter = *blend_parameter;
-                            self.graph91_sync_multilayer_render_layer(*layer as usize);
-                        }
-                    }
+                if let [layer, blend_parameter] = args.as_slice()
+                    && (0..=256).contains(blend_parameter)
+                    && let Some(record) = self.graph91_multilayer_record_mut(*layer)
+                {
+                    record.blend_parameter = *blend_parameter;
+                    self.graph91_sync_multilayer_render_layer(*layer as usize);
                 }
                 ethornell_vm::Value::None
             }
@@ -1296,32 +1318,32 @@ impl RuntimeTraceApi {
             }
             0x48 => {
                 let args = Self::graph91_source_ints(stack, 3);
-                if let [layer, value_a, value_b] = args.as_slice() {
-                    if let Some(record) = self.graph91_multilayer_record_mut(*layer) {
-                        record.auxiliary_a = *value_a;
-                        record.auxiliary_b = *value_b;
-                    }
+                if let [layer, value_a, value_b] = args.as_slice()
+                    && let Some(record) = self.graph91_multilayer_record_mut(*layer)
+                {
+                    record.auxiliary_a = *value_a;
+                    record.auxiliary_b = *value_b;
                 }
                 ethornell_vm::Value::None
             }
             0x49 => {
                 let args = Self::graph91_source_ints(stack, 3);
-                if let [layer, delta_x, delta_y] = args.as_slice() {
-                    if let Some(record) = self.graph91_multilayer_record_mut(*layer) {
-                        record.source_delta_x = *delta_x;
-                        record.source_delta_y = *delta_y;
-                    }
+                if let [layer, delta_x, delta_y] = args.as_slice()
+                    && let Some(record) = self.graph91_multilayer_record_mut(*layer)
+                {
+                    record.source_delta_x = *delta_x;
+                    record.source_delta_y = *delta_y;
                 }
                 ethornell_vm::Value::None
             }
             0x4a => {
                 let args = Self::graph91_source_ints(stack, 4);
-                if let [layer, rotation_delta, scale_delta_x, scale_delta_y] = args.as_slice() {
-                    if let Some(record) = self.graph91_multilayer_record_mut(*layer) {
-                        record.rotation_delta = *rotation_delta;
-                        record.scale_delta_x = *scale_delta_x;
-                        record.scale_delta_y = *scale_delta_y;
-                    }
+                if let [layer, rotation_delta, scale_delta_x, scale_delta_y] = args.as_slice()
+                    && let Some(record) = self.graph91_multilayer_record_mut(*layer)
+                {
+                    record.rotation_delta = *rotation_delta;
+                    record.scale_delta_x = *scale_delta_x;
+                    record.scale_delta_y = *scale_delta_y;
                 }
                 ethornell_vm::Value::None
             }
@@ -1864,8 +1886,19 @@ impl RuntimeTraceApi {
     }
 
     fn graph91_composite_rect(&mut self, args: &[i32], conversion_variant: bool) {
-        let [destination, destination_x, destination_y, source, source_x, source_y, _mode, width, height, alpha, source_alpha_gate] =
-            args
+        let [
+            destination,
+            destination_x,
+            destination_y,
+            source,
+            source_x,
+            source_y,
+            _mode,
+            width,
+            height,
+            alpha,
+            source_alpha_gate,
+        ] = args
         else {
             return;
         };
@@ -2273,11 +2306,15 @@ impl RuntimeTraceApi {
         state.source_bitmap = bitmap;
         state.part_spacing = part_spacing;
         state.parts = part_words
-            .chunks_exact(5)
+            .as_chunks::<5>()
+            .0
+            .iter()
             .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]])
             .collect();
         state.columns = column_words
-            .chunks_exact(34)
+            .as_chunks::<34>()
+            .0
+            .iter()
             .map(|chunk| chunk.to_vec())
             .collect();
         true
@@ -2338,7 +2375,9 @@ impl RuntimeTraceApi {
         };
         state.guide_bitmap = bitmap;
         state.guides = words
-            .chunks_exact(5)
+            .as_chunks::<5>()
+            .0
+            .iter()
             .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]])
             .collect();
         true
@@ -2352,7 +2391,7 @@ impl RuntimeTraceApi {
         guide: i32,
         value: i32,
     ) -> bool {
-        if pairs.len() % 2 != 0 || !(0..4).contains(&layer) {
+        if !pairs.len().is_multiple_of(2) || !(0..4).contains(&layer) {
             return false;
         }
         let Some(state) = self.graph91_landscapes.get_mut(&handle) else {
@@ -2361,7 +2400,7 @@ impl RuntimeTraceApi {
         if guide < -1 || guide >= state.guides.len() as i32 {
             return false;
         }
-        for pair in pairs.chunks_exact(2) {
+        for pair in pairs.as_chunks::<2>().0 {
             let column = pair[0];
             let line = pair[1];
             let Some(index) = state.cell_index(line, column) else {

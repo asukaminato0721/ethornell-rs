@@ -169,7 +169,7 @@ pub fn composite_native_rgba(
 
 #[cfg(test)]
 mod native_blend_tests {
-    use super::{classify_native_blend, composite_native_rgba, NativeBlendPath};
+    use super::{NativeBlendPath, classify_native_blend, composite_native_rgba};
 
     #[test]
     fn recovered_blend_selectors_keep_one_shared_cpu_gpu_classification() {

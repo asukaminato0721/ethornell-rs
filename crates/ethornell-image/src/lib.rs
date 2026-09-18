@@ -339,7 +339,9 @@ mod tests {
         assert_eq!((image.width, image.height), (2, 2));
         assert_eq!(
             image.rgba,
-            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255
+            ]
         );
         assert!(decode_image(&data[..54]).is_err());
     }

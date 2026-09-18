@@ -1,4 +1,4 @@
-use crate::{candidate_call_name, BpInstruction, BpOperand, BpProgram};
+use crate::{BpInstruction, BpOperand, BpProgram, candidate_call_name};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,7 +16,7 @@ impl CallDomain {
     pub fn from_group(group: u8) -> Option<Self> {
         match group {
             0x80 | 0x81 => Some(Self::System),
-            0x90 | 0x91 | 0x92 => Some(Self::Graph),
+            0x90..=0x92 => Some(Self::Graph),
             0xa0 => Some(Self::Sound),
             0xb0 | 0xc0 => Some(Self::User),
             _ => None,

@@ -36,7 +36,7 @@ fn idct_row_cond_dc_int16_8bit(row: &mut [i16; 8]) {
         && row[6] == 0
         && row[7] == 0
     {
-        let t: i16 = (((row[0] as i32) << DC_SHIFT) as i16);
+        let t: i16 = ((row[0] as i32) << DC_SHIFT) as i16;
         *row = [t; 8];
         return;
     }
@@ -90,6 +90,7 @@ fn idct_row_cond_dc_int16_8bit(row: &mut [i16; 8]) {
 }
 
 #[inline(always)]
+// Keep the column + stride * row layout explicit for every row.
 fn idct_sparse_col_int16_8bit(block: &mut [i16; 64], col: usize) {
     // Column elements are block[col + 8*r]
     let c0 = block[col + 8 * 0] as i64;
@@ -153,6 +154,7 @@ fn idct_sparse_col_int16_8bit(block: &mut [i16; 64], col: usize) {
 }
 
 #[inline(always)]
+// Keep the column + stride * row layout explicit for every row.
 fn idct_sparse_col_add_int16_8bit(
     dest: &mut [u8],
     dest_off: usize,
@@ -289,6 +291,7 @@ const R2: i64 = 12540;
 const R3: i64 = 23170;
 
 #[inline(always)]
+// Keep the column + stride * row layout explicit for every row.
 fn idct4col_add(
     dest: &mut [u8],
     dest_off: usize,

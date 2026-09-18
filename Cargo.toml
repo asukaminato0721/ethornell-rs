@@ -12,12 +12,17 @@ members = [
   "crates/na_mpeg2_decoder",
   "crates/na_wmv_player",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "MPL-2.0"
 repository = ""
+
+[workspace.lints.clippy]
+# Preserve explicit offsets and row/column formulas in indexed data layouts.
+identity_op = "allow"
+erasing_op = "allow"
 
 [workspace.dependencies]
 anyhow = "1"

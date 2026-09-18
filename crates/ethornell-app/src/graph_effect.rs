@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use ethornell_image::DecodedImage;
-use na_mpeg2_decoder::{frame_to_rgba_bt601_limited, Decoder, Demuxer, Frame, Packet, StreamType};
+use na_mpeg2_decoder::{Decoder, Demuxer, Frame, Packet, StreamType, frame_to_rgba_bt601_limited};
 
 #[derive(Debug)]
 struct MovieDecoder {
@@ -60,7 +60,7 @@ impl MovieDecoder {
         if self.frame_index.is_some_and(|index| target < index) {
             self.reset();
         }
-        while self.frame_index.map_or(true, |index| index < target) {
+        while self.frame_index.is_none_or(|index| index < target) {
             if let Some(frame) = self.next_frame() {
                 self.frame_index = Some(self.frame_index.map_or(0, |index| index + 1));
                 self.current_frame = Some(frame);

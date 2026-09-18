@@ -283,7 +283,7 @@ fn native_knob_step(extent: i32, available: i32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_knob_limit, native_knob_logical_from_pixel, native_knob_offset, GraphKnobState,
+        GraphKnobState, native_knob_limit, native_knob_logical_from_pixel, native_knob_offset,
     };
 
     #[test]

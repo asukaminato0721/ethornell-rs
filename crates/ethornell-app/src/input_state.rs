@@ -98,7 +98,7 @@ pub(crate) fn target_default_input_classes() -> BTreeMap<i32, Vec<i32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{target_default_input_classes, NativeInputScopeRegistry, TARGET_EVENT_CLASS_MASKS};
+    use super::{NativeInputScopeRegistry, TARGET_EVENT_CLASS_MASKS, target_default_input_classes};
 
     #[test]
     fn exact_target_default_descriptor_tables_are_complete() {

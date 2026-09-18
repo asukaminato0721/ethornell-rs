@@ -1157,8 +1157,8 @@ fn native_clock_mut<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::{
-        native_audio_fixed, native_mixer_volume, native_se_audio_channel,
-        parse_native_cd_track_number, OWNED_A0_IDS,
+        OWNED_A0_IDS, native_audio_fixed, native_mixer_volume, native_se_audio_channel,
+        parse_native_cd_track_number,
     };
 
     #[test]

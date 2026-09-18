@@ -57,17 +57,16 @@ impl BurikoMovieRegistry {
         let Some(resource) = self.resources.remove(&handle) else {
             return 3;
         };
-        if let Some(parent) = resource.parent {
-            if let Some(parent_resource) = self.resources.get_mut(&parent) {
-                if parent_resource.child == Some(handle) {
-                    parent_resource.child = resource.child;
-                }
-            }
+        if let Some(parent) = resource.parent
+            && let Some(parent_resource) = self.resources.get_mut(&parent)
+            && parent_resource.child == Some(handle)
+        {
+            parent_resource.child = resource.child;
         }
-        if let Some(child) = resource.child {
-            if let Some(child_resource) = self.resources.get_mut(&child) {
-                child_resource.parent = resource.parent;
-            }
+        if let Some(child) = resource.child
+            && let Some(child_resource) = self.resources.get_mut(&child)
+        {
+            child_resource.parent = resource.parent;
         }
         0
     }
@@ -146,7 +145,7 @@ fn parse_buriko_movie_header(bytes: &[u8]) -> Option<[i32; 5]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_buriko_movie_header, BurikoMovieRegistry, BURIKO_MOVIE_MAGIC};
+    use super::{BURIKO_MOVIE_MAGIC, BurikoMovieRegistry, parse_buriko_movie_header};
 
     fn movie_bytes() -> Vec<u8> {
         let mut bytes = vec![0u8; 64];

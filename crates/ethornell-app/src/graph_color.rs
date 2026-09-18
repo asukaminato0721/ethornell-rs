@@ -35,7 +35,7 @@ impl RuntimeColorLut {
         let amount_before = amount_before.clamp(0, 256);
         let amount_after = amount_after.clamp(0, 256);
 
-        for pixel in output.rgba.chunks_exact_mut(4) {
+        for pixel in output.rgba.as_chunks_mut::<4>().0 {
             let luminance =
                 (i32::from(pixel[0]) * 77 + i32::from(pixel[1]) * 150 + i32::from(pixel[2]) * 29)
                     >> 8;
@@ -62,7 +62,7 @@ fn packed_color(value: i32) -> [u8; 3] {
 }
 
 fn lerp_256(from: i32, to: i32, amount: i32) -> i32 {
-    from + ((to - from) * amount >> 8)
+    from + (((to - from) * amount) >> 8)
 }
 
 fn spline_channel(control_x: i32, control_y: i32) -> [u8; 256] {

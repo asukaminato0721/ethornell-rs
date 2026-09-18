@@ -35,13 +35,13 @@ pub(crate) fn find_scenario_image(
 fn scenario_image_aliases(requested: &str) -> Vec<String> {
     let lower = requested.to_ascii_lowercase();
     let mut aliases = Vec::new();
-    if let Some(suffix) = lower.strip_prefix("ef_soft") {
-        if let Ok(number) = suffix.parse::<u32>() {
-            for candidate in (2..number).rev() {
-                aliases.push(format!("ef_soft{candidate}"));
-            }
-            aliases.push("ef_soft".to_string());
+    if let Some(suffix) = lower.strip_prefix("ef_soft")
+        && let Ok(number) = suffix.parse::<u32>()
+    {
+        for candidate in (2..number).rev() {
+            aliases.push(format!("ef_soft{candidate}"));
         }
+        aliases.push("ef_soft".to_string());
     }
     aliases.extend(character_sprite_aliases(&lower));
     aliases

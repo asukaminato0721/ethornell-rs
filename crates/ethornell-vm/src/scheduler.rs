@@ -1,6 +1,6 @@
 use crate::{
-    native_call::opcodes, native_thread::InstalledCProcedure, NativeCallFrame, NativeOpcode,
-    SchedulerSignal, SysApi, Value, Vm, VmResult,
+    NativeCallFrame, NativeOpcode, SchedulerSignal, SysApi, Value, Vm, VmResult,
+    native_call::opcodes, native_thread::InstalledCProcedure,
 };
 use ethornell_script::BpInstruction;
 

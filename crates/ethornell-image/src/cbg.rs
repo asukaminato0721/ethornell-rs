@@ -1,4 +1,4 @@
-use crate::{parse_cbg_metadata, DecodedImage};
+use crate::{DecodedImage, parse_cbg_metadata};
 use ethornell_core::{EthornellError, Result};
 
 pub fn decode_cbg(data: &[u8]) -> Result<DecodedImage> {
@@ -14,7 +14,7 @@ pub fn decode_cbg(data: &[u8]) -> Result<DecodedImage> {
         bpp => {
             return Err(EthornellError::UnsupportedFormat(format!(
                 "CBG version/bpp {bpp:?} is not supported"
-            )))
+            )));
         }
     }
 

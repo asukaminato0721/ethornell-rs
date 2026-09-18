@@ -2,7 +2,7 @@ use crate::error::{AvError, Result};
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{
-    CodecParameters, Decoder, DecoderOptions, CODEC_TYPE_MP1, CODEC_TYPE_MP2, CODEC_TYPE_MP3,
+    CODEC_TYPE_MP1, CODEC_TYPE_MP2, CODEC_TYPE_MP3, CodecParameters, Decoder, DecoderOptions,
 };
 use symphonia::core::errors::Error as SymphError;
 use symphonia::core::formats::Packet;

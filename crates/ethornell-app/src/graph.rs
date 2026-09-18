@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::native_background::NativeBackgroundState;
 use crate::native_display::CDspObjLayout32;
@@ -1404,11 +1404,11 @@ impl NativeMode5NodeArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        backf_mask_weight, blend_decoded_image_parameter, blit_decoded_image,
-        blit_decoded_image_format1_to_format2, blit_decoded_image_parameter,
-        crossfade_decoded_images, native_draw_order, scale_decoded_image_fixed,
         NativeMode5DynamicState, NativeMode5NodeArgs, RuntimeGraphDrawItem,
-        RuntimeGraphObjectProperties, RuntimeGraphResource,
+        RuntimeGraphObjectProperties, RuntimeGraphResource, backf_mask_weight,
+        blend_decoded_image_parameter, blit_decoded_image, blit_decoded_image_format1_to_format2,
+        blit_decoded_image_parameter, crossfade_decoded_images, native_draw_order,
+        scale_decoded_image_fixed,
     };
     use ethornell_image::DecodedImage;
 

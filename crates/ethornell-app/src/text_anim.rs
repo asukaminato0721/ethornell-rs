@@ -149,7 +149,7 @@ impl TextRuntime {
             .iter()
             .filter_map(|span| {
                 let end_char = span.end_char.min(self.visible_chars);
-                (span.start_char < end_char).then(|| RuntimeTextStyleSpan {
+                (span.start_char < end_char).then_some(RuntimeTextStyleSpan {
                     start_char: span.start_char,
                     end_char,
                     style: span.style,
@@ -423,8 +423,8 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_message_text, parse_message_markup, parse_message_markup_styled, RuntimeRubySpan,
-        RuntimeTextStyle, RuntimeTextStyleSpan, TextRuntime,
+        RuntimeRubySpan, RuntimeTextStyle, RuntimeTextStyleSpan, TextRuntime,
+        normalize_message_text, parse_message_markup, parse_message_markup_styled,
     };
 
     #[test]

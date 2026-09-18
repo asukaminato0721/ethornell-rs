@@ -185,21 +185,17 @@ impl PortablePlatformStore {
 
     pub(crate) fn remove(&mut self, key: &str) -> bool {
         let removed = self.values.remove(&normalize_platform_key(key)).is_some();
-        if removed {
-            self.save()
-        } else {
-            false
-        }
+        if removed { self.save() } else { false }
     }
 
     fn save(&self) -> bool {
         let Some(path) = self.path.as_deref() else {
             return true;
         };
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                return false;
-            }
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return false;
         }
         let mut text = String::new();
         for (key, value) in &self.values {
@@ -225,7 +221,7 @@ fn normalize_platform_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_platform_key, PortablePlatformStore};
+    use super::{PortablePlatformStore, normalize_platform_key};
     use std::collections::BTreeMap;
 
     #[test]

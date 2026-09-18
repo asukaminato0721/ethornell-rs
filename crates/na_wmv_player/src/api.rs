@@ -1,8 +1,8 @@
 //! Public library API.
 
+use std::collections::HashMap;
 #[cfg(target_os = "uefi")]
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
 #[cfg(target_os = "uefi")]
 use std::hash::BuildHasherDefault;
 use std::io::{Read, Seek, SeekFrom};
@@ -214,11 +214,11 @@ impl FrameAssembly {
 
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.ranges.len());
         for (s, e) in self.ranges.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                if s <= last.1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && s <= last.1
+            {
+                last.1 = last.1.max(e);
+                continue;
             }
             merged.push((s, e));
         }

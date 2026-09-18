@@ -1,10 +1,10 @@
 use crate::{
-    graph::{RuntimeGraphDrawItem, RuntimeGraphLayer},
     RuntimeTraceApi,
+    graph::{RuntimeGraphDrawItem, RuntimeGraphLayer},
 };
-use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
-use ethornell_core::{composite_native_rgba, Result};
-use ethornell_image::{write_rgba_png, DecodedImage};
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
+use ethornell_core::{Result, composite_native_rgba};
+use ethornell_image::{DecodedImage, write_rgba_png};
 use std::{path::Path, sync::OnceLock};
 
 const SNAPSHOT_WIDTH: u32 = 1280;
@@ -114,7 +114,7 @@ pub(crate) fn compose_runtime_frame_through_priority(
         height,
         rgba: vec![0; width as usize * height as usize * 4],
     };
-    for px in out.rgba.chunks_exact_mut(4) {
+    for px in out.rgba.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[0, 0, 0, 255]);
     }
 
@@ -248,41 +248,39 @@ pub(crate) fn compose_graph_object(
         rgba: vec![0; width.max(1) as usize * height.max(1) as usize * 4],
     };
 
-    if let Some(surface) = surface {
-        if let Some(resource_id) = surface.resource_id {
-            if let Some((key, region)) = api.resource_image_region(resource_id) {
-                if let Some(source) = api.graph_images.get(key) {
-                    let viewport_x = surface.viewport_x.max(0.0);
-                    let viewport_y = surface.viewport_y.max(0.0);
-                    let draw_width = surface
-                        .viewport_width
-                        .min(region.width - viewport_x)
-                        .max(0.0);
-                    let draw_height = surface
-                        .viewport_height
-                        .min(region.height - viewport_y)
-                        .max(0.0);
-                    composite_nearest(
-                        &mut out,
-                        source,
-                        0.0,
-                        0.0,
-                        draw_width,
-                        draw_height,
-                        region.x + viewport_x,
-                        region.y + viewport_y,
-                        draw_width,
-                        draw_height,
-                        surface.opacity,
-                        api.graph_object_properties
-                            .get(&surface.id)
-                            .map(|properties| properties.blend_mode)
-                            .unwrap_or(128),
-                        None,
-                    );
-                }
-            }
-        }
+    if let Some(surface) = surface
+        && let Some(resource_id) = surface.resource_id
+        && let Some((key, region)) = api.resource_image_region(resource_id)
+        && let Some(source) = api.graph_images.get(key)
+    {
+        let viewport_x = surface.viewport_x.max(0.0);
+        let viewport_y = surface.viewport_y.max(0.0);
+        let draw_width = surface
+            .viewport_width
+            .min(region.width - viewport_x)
+            .max(0.0);
+        let draw_height = surface
+            .viewport_height
+            .min(region.height - viewport_y)
+            .max(0.0);
+        composite_nearest(
+            &mut out,
+            source,
+            0.0,
+            0.0,
+            draw_width,
+            draw_height,
+            region.x + viewport_x,
+            region.y + viewport_y,
+            draw_width,
+            draw_height,
+            surface.opacity,
+            api.graph_object_properties
+                .get(&surface.id)
+                .map(|properties| properties.blend_mode)
+                .unwrap_or(128),
+            None,
+        );
     }
 
     let mut draw_items = selected_layers
@@ -1221,13 +1219,17 @@ mod styled_text_snapshot_tests {
             rgba: vec![0; 128 * 64 * 4],
         };
         draw_text_node(&mut image, &node, layout, None, None);
-        assert!(image
-            .rgba
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 && pixel[3] > 0));
-        assert!(image
-            .rgba
-            .chunks_exact(4)
-            .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0));
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 && pixel[3] > 0)
+        );
+        assert!(
+            image
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20 && pixel[3] > 0)
+        );
     }
 }

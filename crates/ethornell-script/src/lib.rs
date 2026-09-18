@@ -817,7 +817,7 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
                     operands.push(BpOperand::U32(value));
                 }
             }
-            0x04 | 0x05 | 0x06 => {
+            0x04..=0x06 => {
                 if let Some(value) = read_u16_operand(&mut cursor, &mut raw, &mut warning) {
                     if opcode_byte == 0x04 {
                         operands.push(BpOperand::U16(value));
@@ -906,13 +906,13 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
     let mut functions = Vec::new();
     for inst in &instructions {
         for operand in &inst.operands {
-            if let BpOperand::Offset(offset) = operand {
-                if labels.contains_key(offset) {
-                    functions.push(BpFunction {
-                        name: Some(format!("sub_{offset:08X}")),
-                        offset: *offset,
-                    });
-                }
+            if let BpOperand::Offset(offset) = operand
+                && labels.contains_key(offset)
+            {
+                functions.push(BpFunction {
+                    name: Some(format!("sub_{offset:08X}")),
+                    offset: *offset,
+                });
             }
         }
     }
@@ -1052,9 +1052,11 @@ mod tests {
     #[test]
     fn names_every_opcode_registered_by_the_native_interpreter() {
         assert_eq!(NATIVE_REGISTERED_OPCODES.len(), 89);
-        assert!(NATIVE_REGISTERED_OPCODES
-            .iter()
-            .all(|opcode| opcode_name(*opcode).is_some()));
+        assert!(
+            NATIVE_REGISTERED_OPCODES
+                .iter()
+                .all(|opcode| opcode_name(*opcode).is_some())
+        );
     }
 
     #[test]

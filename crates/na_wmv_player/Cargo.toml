@@ -1,12 +1,15 @@
 [package]
 name = "wmv-decoder"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 name = "wmv_decoder"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib", "staticlib"]
+
+[lints]
+workspace = true
 
 [dependencies]
 byteorder = "1.5"

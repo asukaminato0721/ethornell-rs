@@ -1,8 +1,8 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -16,8 +16,8 @@ use winit::{
 };
 
 use wmv_decoder::{
-    asf::{AsfFile, AudioStreamInfo, VideoStreamInfo},
     AsfWmaDecoder, AsfWmv2Decoder,
+    asf::{AsfFile, AudioStreamInfo, VideoStreamInfo},
 };
 
 fn main() {

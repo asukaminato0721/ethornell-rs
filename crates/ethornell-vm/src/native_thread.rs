@@ -1,6 +1,6 @@
 use crate::{
-    native_call::{NativeMessageProcedureClass, NativeMessageProcedureConfig},
     NativeOpcode, Value,
+    native_call::{NativeMessageProcedureClass, NativeMessageProcedureConfig},
 };
 use std::collections::VecDeque;
 

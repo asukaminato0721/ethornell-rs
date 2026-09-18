@@ -155,7 +155,7 @@ impl RuntimeEffects {
             for index in 0..count {
                 let seed = mix64(effect.handle as u64 ^ (index as u64).wrapping_mul(0x9E37_79B9));
                 let x_fraction = (seed & 0xffff) as f32 / 65535.0;
-                let start = ((seed >> 16) & 0xffff) as u64;
+                let start = (seed >> 16) & 0xffff;
                 let travel = self
                     .rain_tick
                     .wrapping_mul(speed)
@@ -191,8 +191,15 @@ impl RuntimeEffects {
     ///  amplitude, quarter_period, slot].
     pub(crate) fn configure_wave_table(&mut self, popped: &[Value]) -> bool {
         let values = popped.iter().map(value_to_i32).collect::<Vec<_>>();
-        let [block_count, block_height, trail_levels, lead_levels, amplitude, quarter_period, slot] =
-            values.as_slice()
+        let [
+            block_count,
+            block_height,
+            trail_levels,
+            lead_levels,
+            amplitude,
+            quarter_period,
+            slot,
+        ] = values.as_slice()
         else {
             return false;
         };
@@ -297,17 +304,17 @@ impl RuntimeEffects {
         y: i32,
     ) -> bool {
         let mut copied = false;
-        if let Some(source) = self.vector_maps.get(&source).cloned() {
-            if let Some(destination) = self.vector_maps.get_mut(&destination) {
-                destination.blit(&source, x, y);
-                copied = true;
-            }
+        if let Some(source) = self.vector_maps.get(&source).cloned()
+            && let Some(destination) = self.vector_maps.get_mut(&destination)
+        {
+            destination.blit(&source, x, y);
+            copied = true;
         }
-        if let Some(source) = self.displacement_maps.get(&source).cloned() {
-            if let Some(destination) = self.displacement_maps.get_mut(&destination) {
-                destination.blit(&source, x, y);
-                copied = true;
-            }
+        if let Some(source) = self.displacement_maps.get(&source).cloned()
+            && let Some(destination) = self.displacement_maps.get_mut(&destination)
+        {
+            destination.blit(&source, x, y);
+            copied = true;
         }
         copied
     }
@@ -622,7 +629,15 @@ impl DisplacementMap {
     }
 
     fn wave(&mut self, parameters: &[i32]) {
-        let [x_period, x_phase, x_amplitude, y_period, y_phase, y_amplitude, ..] = parameters
+        let [
+            x_period,
+            x_phase,
+            x_amplitude,
+            y_period,
+            y_phase,
+            y_amplitude,
+            ..,
+        ] = parameters
         else {
             return;
         };
@@ -654,8 +669,14 @@ impl DisplacementMap {
     }
 
     fn radial_warp(&mut self, parameters: &[i32]) {
-        let [source_origin_x, source_origin_y, warp_center_x, warp_center_y, radius_bias, ..] =
-            parameters
+        let [
+            source_origin_x,
+            source_origin_y,
+            warp_center_x,
+            warp_center_y,
+            radius_bias,
+            ..,
+        ] = parameters
         else {
             return;
         };
@@ -1064,12 +1085,14 @@ mod tests {
             Value::Int(9),
         ];
         assert!(effects.configure_displacement_map(0x14, &curvature));
-        assert!(effects
-            .displacement_map(9)
-            .unwrap()
-            .samples
-            .iter()
-            .any(|sample| *sample != [0, 0]));
+        assert!(
+            effects
+                .displacement_map(9)
+                .unwrap()
+                .samples
+                .iter()
+                .any(|sample| *sample != [0, 0])
+        );
 
         let radial_warp = [
             Value::Int(4),
@@ -1080,12 +1103,14 @@ mod tests {
             Value::Int(9),
         ];
         assert!(effects.configure_displacement_map(0x17, &radial_warp));
-        assert!(effects
-            .displacement_map(9)
-            .unwrap()
-            .samples
-            .iter()
-            .any(|sample| *sample != [0, 0]));
+        assert!(
+            effects
+                .displacement_map(9)
+                .unwrap()
+                .samples
+                .iter()
+                .any(|sample| *sample != [0, 0])
+        );
     }
 
     #[test]

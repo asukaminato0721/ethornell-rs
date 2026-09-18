@@ -152,7 +152,7 @@ impl RuntimeTraceApi {
         };
         let needle_rgba = unpack(needle);
         let replacement_rgba = unpack(replacement);
-        for pixel in image.rgba.chunks_exact_mut(4) {
+        for pixel in image.rgba.as_chunks_mut::<4>().0 {
             if format == 1 {
                 if pixel[..3] == needle_rgba[..3] {
                     pixel[..3].copy_from_slice(&replacement_rgba[..3]);
@@ -162,7 +162,7 @@ impl RuntimeTraceApi {
                 if pixel[..3] == needle_rgba[..3] {
                     pixel[..3].copy_from_slice(&replacement_rgba[..3]);
                 }
-            } else if pixel == needle_rgba {
+            } else if *pixel == needle_rgba {
                 pixel.copy_from_slice(&replacement_rgba);
             }
         }

@@ -1454,10 +1454,9 @@ impl LayerAnimationSystem {
 
     pub(crate) fn clear_layers<'a>(&mut self, layer_ids: impl IntoIterator<Item = &'a i32>) {
         let ids = layer_ids.into_iter().copied().collect::<Vec<_>>();
-        self.tracks
-            .retain(|track| !ids.iter().any(|id| *id == track.layer_id));
+        self.tracks.retain(|track| !ids.contains(&track.layer_id));
         self.spline_tracks
-            .retain(|track| !ids.iter().any(|id| *id == track.layer_id));
+            .retain(|track| !ids.contains(&track.layer_id));
     }
 
     pub(crate) fn active_count(&self) -> usize {

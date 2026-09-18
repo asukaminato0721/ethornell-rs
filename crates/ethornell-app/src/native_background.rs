@@ -10,7 +10,7 @@ pub(crate) enum NativeBackgroundSecondaryResource {
     Sentinel(i32),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct NativeBackFState {
     pub(crate) secondary_x: i32,
     pub(crate) secondary_y: i32,
@@ -21,19 +21,6 @@ pub(crate) struct NativeBackFState {
     // exact constructor state here rather than inventing mask semantics.
     pub(crate) mask_control_enabled: i32,
     pub(crate) mask_control_mode: i32,
-}
-
-impl Default for NativeBackFState {
-    fn default() -> Self {
-        Self {
-            secondary_x: 0,
-            secondary_y: 0,
-            mask_resource_binding: None,
-            mask_parameter: 0,
-            mask_control_enabled: 0,
-            mask_control_mode: 0,
-        }
-    }
 }
 
 /// `CDspObjBack` class selector returned by target `sub_4207A0` and consumed
