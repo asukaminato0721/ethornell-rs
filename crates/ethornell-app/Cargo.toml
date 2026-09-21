@@ -22,3 +22,5 @@ encoding_rs.workspace = true
 pollster.workspace = true
 tracing.workspace = true
 winit.workspace = true
+image = { workspace = true, features = ["ico"] }
+pelite = { version = "0.10", default-features = false, features = ["std"] }
