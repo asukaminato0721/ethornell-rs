@@ -3484,6 +3484,13 @@ impl Vm {
                     self.sys80_30_read_file_bytes(api)?
                 } else if (code, id) == (0x80, 0x31) {
                     self.sys80_31_read_file_range(api)?
+                } else if (code, id) == (0x80, 0x32) {
+                    // Arguments are pushed as path, source, then byte count.
+                    let length = self.pop_int()? as u32 as usize;
+                    let source = self.pop_ptr()?;
+                    let path = self.pop_string_lossy()?;
+                    let range = self.resolve_range(source, length)?;
+                    Value::Int(i32::from(api.write_file_bytes(&path, &self.memory[range])))
                 } else if (code, id) == (0x80, 0x34) {
                     // Target 0x4888C0 pops file first and archive/root second,
                     // then passes both to sub_4665C0 (ECX=file, stack=archive).
@@ -16431,6 +16438,86 @@ mod tests {
         vm.dispatch(&instruction, &mut api).unwrap();
 
         assert_eq!(vm.stack, [Value::Int(1)]);
+    }
+
+    #[test]
+    fn sys80_32_writes_caller_bytes_and_returns_host_status() {
+        let instruction =
+            test_instruction(0, 0x80, "sys1", vec![0x80, 0x32], vec![BpOperand::U8(0x32)]);
+        let mut vm = Vm::new();
+        let mut api = WriteFileApi::default();
+        let path = 0x1200_1200;
+        vm.write_c_string(path, "UserData/slot.sud").unwrap();
+        let source = vm.alloc_heap(8);
+        let range = vm.resolve_write_range(source, 8).unwrap();
+        vm.memory[range].copy_from_slice(b"\0save\xff!!");
+        for success in [true, false] {
+            api.success = success;
+            vm.stack.extend([
+                Value::Int(123),
+                Value::Ptr(path),
+                Value::Ptr(source),
+                Value::Int(6),
+            ]);
+            vm.dispatch(&instruction, &mut api).unwrap();
+            assert_eq!(vm.stack, [Value::Int(123), Value::Int(i32::from(success))]);
+            assert_eq!(
+                api.writes.last(),
+                Some(&("UserData/slot.sud".into(), b"\0save\xff".to_vec()))
+            );
+            vm.stack.clear();
+        }
+        assert_eq!(api.writes.len(), 2);
+    }
+
+    #[test]
+    fn sys80_32_rejects_out_of_bounds_before_writing() {
+        let instruction =
+            test_instruction(0, 0x80, "sys1", vec![0x80, 0x32], vec![BpOperand::U8(0x32)]);
+        let mut vm = Vm::new();
+        let mut api = WriteFileApi::default();
+        for (source, length) in [(vm.memory.len() as u32 - 1, 2), (0x1800, -1)] {
+            vm.stack.extend([
+                Value::Str("UserData/slot.sud".into()),
+                Value::Ptr(source),
+                Value::Int(length),
+            ]);
+            assert!(matches!(
+                vm.dispatch(&instruction, &mut api),
+                Err(super::VmError::MemoryOutOfBounds { .. })
+            ));
+            assert!(vm.stack.is_empty());
+        }
+        assert!(api.writes.is_empty());
+    }
+
+    #[derive(Default)]
+    struct WriteFileApi {
+        success: bool,
+        writes: Vec<(String, Vec<u8>)>,
+    }
+
+    impl SysApi for WriteFileApi {
+        fn call_sys(&mut self, _call: &mut NativeCallFrame) -> super::VmResult<Value> {
+            panic!("WriteFileBytes must not fall through to host dispatch");
+        }
+
+        fn write_file_bytes(&mut self, path: &str, bytes: &[u8]) -> bool {
+            self.writes.push((path.into(), bytes.to_vec()));
+            self.success
+        }
+    }
+
+    impl GraphApi for WriteFileApi {
+        fn call_graph(&mut self, _call: &mut NativeCallFrame) -> super::VmResult<Value> {
+            unreachable!()
+        }
+    }
+
+    impl SoundApi for WriteFileApi {
+        fn call_sound(&mut self, _call: &mut NativeCallFrame) -> super::VmResult<Value> {
+            unreachable!()
+        }
     }
 
     #[test]

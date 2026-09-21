@@ -12,6 +12,9 @@ cargo run -p ethornell-cli -- run --game /path/to/sun_flower
 
 `--game` locates the resource archives, loose files, and user data.
 
+The window uses the game's icon from `icon.png`, an `.ico` file, or the icon
+resources embedded in its Windows executable, in that order.
+
 For a GBK Chinese translation, also set `ETHORNELL_TEXT_ENCODING=gbk`.
 This selects the encoding of text buffers passed to the graphics API, including
 dialogue and speaker names. The default is Shift-JIS (`cp932`). It does not
