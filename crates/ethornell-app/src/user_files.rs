@@ -291,6 +291,46 @@ mod tests {
     }
 
     #[test]
+    fn writing_a_save_refreshes_all_cached_path_aliases() {
+        use ethornell_vm::SysApi;
+
+        let root = temporary_root("save-cache");
+        let native_root = root.join("native");
+        std::fs::create_dir(&native_root).unwrap();
+        let manager = ResourceManager::open_game(&root).unwrap();
+        let mut api =
+            super::super::RuntimeTraceApi::new_with_native_root(manager, native_root.clone());
+        let absolute = native_root
+            .join("UserData/slot.sud")
+            .to_string_lossy()
+            .into_owned();
+        let aliases = [
+            (String::new(), "UserData\\slot.sud".to_owned()),
+            (String::new(), absolute.clone()),
+            (
+                native_root.to_string_lossy().into_owned(),
+                "UserData/slot.sud".to_owned(),
+            ),
+        ];
+        for (archive, file) in &aliases {
+            assert!(!api.file_exists(archive, file));
+            assert_eq!(api.file_size(archive, file), -1);
+        }
+        for bytes in [
+            b"first save".as_slice(),
+            b"overwritten save with a new size".as_slice(),
+        ] {
+            assert!(api.write_file_bytes(&absolute, bytes));
+            for (archive, file) in &aliases {
+                assert!(api.file_exists(archive, file));
+                assert_eq!(api.file_size(archive, file), bytes.len() as i32);
+            }
+            assert_eq!(api.load_file_bytes("", &absolute), Some(bytes.to_vec()));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn empty_entry_name_reads_the_first_entry_from_a_named_arc20_archive() {
         let root = temporary_root("first-archive-entry");
         let archive = root.join("data10000.arc");

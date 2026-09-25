@@ -16578,19 +16578,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             std::fs::write(&path, bytes)
         })();
         let ok = result.is_ok();
-        let file_key = path
-            .strip_prefix(self.manager.archives().root.as_path())
-            .ok()
-            .map(|relative| {
-                relative
-                    .to_string_lossy()
-                    .replace(std::path::MAIN_SEPARATOR, "/")
-            });
-        if let Some(file) = file_key.as_deref() {
-            let key = runtime_file_cache_key("", file);
-            self.file_exists_cache.remove(&key);
-            self.file_size_cache.remove(&key);
-        }
+        // Scripts probe saves through absolute paths and configured roots as
+        // well as relative paths. Invalidate all aliases, including cached
+        // misses, so a newly written slot is visible immediately.
+        self.file_exists_cache.clear();
+        self.file_size_cache.clear();
         match result {
             Ok(()) => tracing::info!(
                 path = %path.display(),
