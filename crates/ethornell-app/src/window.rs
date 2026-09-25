@@ -26,6 +26,7 @@ struct WindowApp {
     runtime: Option<RuntimeEngine>,
     graphics: Option<Graphics>,
     audio: AudioSystem,
+    cursor_surface_pos: Option<(f32, f32)>,
     pending_input_events: VecDeque<RuntimeInputEvent>,
     pending_drop: Option<winit::event_loop::AsyncRequestSerial>,
     frame_pacing: RuntimeFramePacing,
@@ -63,6 +64,7 @@ impl ApplicationHandler for WindowApp {
             text,
             image_size,
             audio,
+            cursor_surface_pos,
             pending_input_events,
             pending_drop,
             frame_pacing,
@@ -150,6 +152,7 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::PointerMoved { position, .. } => {
+                *cursor_surface_pos = Some((position.x as f32, position.y as f32));
                 let cursor_game_pos =
                     renderer.surface_to_game_point(position.x as f32, position.y as f32);
                 if runtime.is_some()
@@ -242,6 +245,7 @@ impl ApplicationHandler for WindowApp {
                 position,
                 ..
             } => {
+                *cursor_surface_pos = Some((position.x as f32, position.y as f32));
                 let cursor_game_pos =
                     renderer.surface_to_game_point(position.x as f32, position.y as f32);
                 if let Some(runtime) = runtime.as_mut() {
@@ -264,6 +268,7 @@ impl ApplicationHandler for WindowApp {
                 position,
                 ..
             } => {
+                *cursor_surface_pos = Some((position.x as f32, position.y as f32));
                 let cursor_game_pos =
                     renderer.surface_to_game_point(position.x as f32, position.y as f32);
                 if let Some(runtime) = runtime.as_mut() {
@@ -348,6 +353,8 @@ impl ApplicationHandler for WindowApp {
                         let position = PhysicalPosition::new(surface_x as f64, surface_y as f64);
                         if let Err(error) = window.set_cursor_position(position.into()) {
                             tracing::warn!(%error, x, y, "failed to apply target cursor motion to host cursor");
+                        } else {
+                            *cursor_surface_pos = Some((surface_x, surface_y));
                         }
                     }
                     if runtime.api.debug_graph {
@@ -782,6 +789,7 @@ pub(super) fn run_window(
         runtime,
         audio,
         graphics: None,
+        cursor_surface_pos: None,
         pending_input_events: VecDeque::new(),
         pending_drop: None,
         frame_pacing: RuntimeFramePacing::from_env(),
