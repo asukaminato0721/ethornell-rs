@@ -183,8 +183,8 @@ pub struct Renderer<'w> {
 }
 
 impl<'w> Renderer<'w> {
-    pub async fn new(window: &'w Window) -> Result<Self> {
-        let size = window.inner_size();
+    pub async fn new(window: std::sync::Arc<dyn Window>) -> Result<Self> {
+        let size = window.surface_size();
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window)
