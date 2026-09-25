@@ -1869,8 +1869,7 @@ pub fn default_graphics_capability_record() -> [u32; 16] {
         use std::arch::x86::{__cpuid, __cpuid_count};
         #[cfg(target_arch = "x86_64")]
         use std::arch::x86_64::{__cpuid, __cpuid_count};
-        // SAFETY: CPUID is available on x86_64 and on every supported x86 target.
-        let vendor = unsafe { __cpuid(0) };
+        let vendor = __cpuid(0);
         let mut vendor_bytes = Vec::with_capacity(12);
         vendor_bytes.extend_from_slice(&vendor.ebx.to_le_bytes());
         vendor_bytes.extend_from_slice(&vendor.edx.to_le_bytes());
@@ -1883,7 +1882,7 @@ pub fn default_graphics_capability_record() -> [u32; 16] {
             "GenuineTMx86" => 3,
             _ => 4,
         };
-        let signature = unsafe { __cpuid(1) };
+        let signature = __cpuid(1);
         let base_family = (signature.eax >> 8) & 0x0f;
         let ext_family = (signature.eax >> 20) & 0xff;
         let base_model = (signature.eax >> 4) & 0x0f;
@@ -1901,8 +1900,8 @@ pub fn default_graphics_capability_record() -> [u32; 16] {
         };
         record[2] = if record[3] == 0 {
             signature.ebx & 0xff
-        } else if unsafe { __cpuid(0x8000_0000) }.eax >= 0x8000_0001 {
-            unsafe { __cpuid_count(0x8000_0001, 0) }.ebx & 0xffff
+        } else if __cpuid(0x8000_0000).eax >= 0x8000_0001 {
+            __cpuid_count(0x8000_0001, 0).ebx & 0xffff
         } else {
             0
         };
@@ -1921,15 +1920,13 @@ fn target_cpu_brand_string() -> Option<String> {
         #[cfg(target_arch = "x86_64")]
         use std::arch::x86_64::{__cpuid, __cpuid_count};
 
-        // SAFETY: CPUID is available on every x86_64 CPU and the target itself
-        // gates the extended leaves before reading the brand string.
-        let maximum = unsafe { __cpuid(0x8000_0000).eax };
+        let maximum = __cpuid(0x8000_0000).eax;
         if maximum < 0x8000_0004 {
             return None;
         }
         let mut bytes = Vec::with_capacity(48);
         for leaf in 0x8000_0002..=0x8000_0004 {
-            let result = unsafe { __cpuid_count(leaf, 0) };
+            let result = __cpuid_count(leaf, 0);
             bytes.extend_from_slice(&result.eax.to_le_bytes());
             bytes.extend_from_slice(&result.ebx.to_le_bytes());
             bytes.extend_from_slice(&result.ecx.to_le_bytes());
@@ -1953,7 +1950,7 @@ fn target_cpu_signature_words() -> [u32; 4] {
         use std::arch::x86::__cpuid;
         #[cfg(target_arch = "x86_64")]
         use std::arch::x86_64::__cpuid;
-        let result = unsafe { __cpuid(1) };
+        let result = __cpuid(1);
         return [
             result.eax & 0xffff,
             (result.eax >> 16) & 0xffff,
