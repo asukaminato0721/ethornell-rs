@@ -1736,7 +1736,7 @@ fn portable_physical_memory_bytes() -> (u64, u64) {
             avail_extended_virtual: u64,
         }
         #[link(name = "kernel32")]
-        extern "system" {
+        unsafe extern "system" {
             fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
         }
         let mut status = MemoryStatusEx {
@@ -1788,7 +1788,7 @@ fn portable_local_system_time() -> [u16; 8] {
             milliseconds: u16,
         }
         #[link(name = "kernel32")]
-        extern "system" {
+        unsafe extern "system" {
             fn GetLocalTime(system_time: *mut SystemTime);
         }
         let mut value = SystemTime {

@@ -12,6 +12,12 @@ cargo run -p ethornell-cli -- run --game /path/to/sun_flower
 
 `--game` locates the resource archives, loose files, and user data.
 
+Desktop builds for Linux (x86_64 and AArch64), macOS (Apple Silicon and Intel),
+and Windows (x86_64) are published on
+[GitHub Releases](https://github.com/asukaminato0721/ethornell-rs/releases).
+The `pre-release` entry is updated after successful branch pushes; `v*` tags
+publish versioned releases.
+
 The window uses the game's icon from `icon.png`, an `.ico` file, or the icon
 resources embedded in its Windows executable, in that order.
 
